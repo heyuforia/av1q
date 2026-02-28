@@ -796,8 +796,20 @@ def process_videos(cfg):
             out_dir.mkdir(parents=True, exist_ok=True)
             dst_path = lambda cq: out_dir / f"{filepath.stem}_CQ{cq}{ext}"
 
+            cache, cp = load_cache(cache_dir, partial_hash(filepath), "svt4")
+
+            # Skip only if output exists AND has verified full VMAF in cache
             if cfg["skip_existing"]:
-                if any(dst_path(c).exists() for c in range(cfg["min_cq"], cfg["max_cq"] + 1)):
+                verified = False
+                for c in range(cfg["min_cq"], cfg["max_cq"] + 1):
+                    d = dst_path(c)
+                    if d.exists():
+                        entry = cache["entries"].get(str(c))
+                        if (entry and "full" in entry
+                                and entry.get("size") == d.stat().st_size):
+                            verified = True
+                            break
+                if verified:
                     print(f"{PURPLE}{filepath.name:<30}{RESET} {CHECK} exists")
                     continue
 
@@ -809,8 +821,6 @@ def process_videos(cfg):
             if meta["codec"] == "av1":
                 print(f" {CHECK} Already AV1, skipping")
                 continue
-
-            cache, cp = load_cache(cache_dir, partial_hash(filepath), "svt5")
 
             target = cfg.get("target_vmaf") or max(
                 v for k, v in TARGET_VMAF_BY_RES.items() if meta["h"] >= k
