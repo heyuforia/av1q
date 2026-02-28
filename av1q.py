@@ -193,7 +193,11 @@ def probe_video(filepath):
 
 
 def get_fps(filepath):
-    """Get average frame rate of a video."""
+    """Get average frame rate as a rational string (e.g., '24000/1001').
+
+    Returns the raw fraction from ffprobe to avoid float truncation
+    that can cause frame misalignment in VMAF comparisons.
+    """
     try:
         r = run_cmd([
             "ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -201,10 +205,15 @@ def get_fps(filepath):
             "-of", "default=nw=1:nk=1", str(filepath),
         ])
         v = r.stdout.strip()
+        if not v or v in ("0/0", "N/A"):
+            return None
         if "/" in v:
             a, b = v.split("/", 1)
-            return float(a) / float(b) if float(b) else None
-        return float(v) if v else None
+            if float(b) == 0 or float(a) / float(b) <= 0:
+                return None
+        elif float(v) <= 0:
+            return None
+        return v
     except (RuntimeError, ValueError):
         return None
 
@@ -328,7 +337,7 @@ def get_keyframes(source):
              "-skip_frame", "nokey", "-show_entries", "frame=pts_time",
              "-of", "csv=p=0", str(source)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, timeout=120,
+            text=True, timeout=600,
         )
         return sorted(float(l.strip()) for l in r.stdout.splitlines() if l.strip())
     except (subprocess.TimeoutExpired, Exception):
@@ -474,20 +483,28 @@ def extract_samples(source, scenes, keyframes, cfg):
 def measure_vmaf(ref, dist, meta, scenes, subsample, threads, cache_dir):
     """Compute VMAF score between reference and distorted video."""
     filters = []
+    fps = get_fps(dist)
+
     if scenes:
+        # Scene-based: fps normalizes rate (using original timestamps),
+        # select picks scenes, setpts resets PTS for contiguous output
+        if fps:
+            filters.append(f"fps={fps}")
         expr = "+".join(
             f"between(t,{s['time']:.3f},{s['time'] + s['duration']:.3f})"
             for s in scenes
         )
         filters.append(f"select='{expr}',setpts=PTS-STARTPTS")
+    else:
+        # Full-file: normalize start PTS to zero first (handles MP4 edit
+        # lists / non-zero start times), then normalize frame rate
+        filters.append("setpts=PTS-STARTPTS")
+        if fps:
+            filters.append(f"fps={fps}")
 
     if meta["hdr"] or "10le" in meta["pix_fmt"]:
         filters += ["zscale=t=bt709:m=bt709:r=tv:p=709", "tonemap=hable:desat=0"]
     filters.append("format=yuv420p")
-
-    fps = get_fps(dist)
-    if fps and fps > 0:
-        filters.insert(0, f"fps={fps:.3f}")
 
     pf = ",".join(filters)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -793,7 +810,7 @@ def process_videos(cfg):
                 print(f" {CHECK} Already AV1, skipping")
                 continue
 
-            cache, cp = load_cache(cache_dir, partial_hash(filepath), "svt4")
+            cache, cp = load_cache(cache_dir, partial_hash(filepath), "svt5")
 
             target = cfg.get("target_vmaf") or max(
                 v for k, v in TARGET_VMAF_BY_RES.items() if meta["h"] >= k
