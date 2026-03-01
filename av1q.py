@@ -37,7 +37,7 @@ BOLD = "\033[1m"
 DIM = "\033[2m"
 CHECK = f"{GREEN}✓{RESET}"
 CROSS = f"{RED}✗{RESET}"
-SEP = lambda: f"{DIM}{'─' * 48}{RESET}"
+SEP = f"{DIM}{'─' * 48}{RESET}"
 
 # ── Constants ────────────────────────────────────────────────
 
@@ -67,7 +67,9 @@ def run_cmd(cmd):
     if p.returncode:
         tail = "\n".join((p.stderr or "").splitlines()[-80:])
         raise RuntimeError(
-            f"exit {p.returncode}\n{' '.join(map(shlex.quote, cmd))}\n{tail}"
+            f"exit {p.returncode}\n"
+            f"{subprocess.list2cmdline(cmd) if os.name == 'nt' else ' '.join(map(shlex.quote, cmd))}"
+            f"\n{tail}"
         )
     return p
 
@@ -84,7 +86,7 @@ def cleanup_temp():
 
 def partial_hash(filepath, block=1 << 16):
     """Fast file identity hash: size + first/last 64KB."""
-    h = hashlib.sha1()
+    h = hashlib.sha256()
     st = filepath.stat()
     h.update(st.st_size.to_bytes(8, "little"))
     with open(filepath, "rb") as f:
@@ -103,9 +105,9 @@ def res_tier(height):
 
 
 def calc_kbps(size_bytes, duration):
-    if duration <= 0:
+    if duration < 1.0:
         return None
-    return int((size_bytes * 8) / 1000 / max(1.0, duration))
+    return int((size_bytes * 8) / 1000 / duration)
 
 
 def clamp(val, lo, hi):
@@ -272,7 +274,7 @@ def detect_scenes(source, cfg):
             )
         return scenes
 
-    except (subprocess.TimeoutExpired, Exception):
+    except Exception:
         return []
 
 
@@ -325,7 +327,7 @@ def analyze_complexity(source):
             })
         return results
 
-    except (subprocess.TimeoutExpired, Exception):
+    except Exception:
         return []
 
 
@@ -340,7 +342,7 @@ def get_keyframes(source):
             text=True, timeout=600,
         )
         return sorted(float(l.strip()) for l in r.stdout.splitlines() if l.strip())
-    except (subprocess.TimeoutExpired, Exception):
+    except Exception:
         return []
 
 
@@ -588,7 +590,7 @@ def vmaf_cached(ref, dist, meta, cq, scenes, cache, cache_path, threads, tag=Non
             "t": time.time(),
         })
         tmp = cache_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(cache))
+        tmp.write_text(json.dumps(cache), encoding="utf-8")
         tmp.replace(cache_path)
 
     return result
@@ -710,7 +712,7 @@ def encode_av1(source, dest, meta, cq, cfg):
     if meta["cr"]:
         color_args += ["-color_range", meta["cr"]]
 
-    # Rate control
+    # Rate control — map user-facing CQ (min_cq..max_cq) to SVT-AV1 CRF (10..50)
     bitrate = meta.get("bitrate") or FALLBACK_MAXRATE[res_tier(meta["h"])]
     maxrate = min(int(bitrate * cfg["maxrate_factor"]), 100_000_000)
     crf = clamp(
@@ -765,7 +767,7 @@ def process_videos(cfg):
         print(f"{CROSS} ffmpeg/ffprobe not found in PATH")
         return 1
 
-    print(f"{PURPLE}{BOLD}av1q{RESET}\n{SEP()}")
+    print(f"{PURPLE}{BOLD}av1q{RESET}\n{SEP}")
     input_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -814,7 +816,7 @@ def process_videos(cfg):
                     continue
 
             if idx > 1:
-                print(SEP())
+                print(SEP)
             print(f"{PURPLE}{BOLD}[{idx}/{total}]{RESET} {PURPLE}{filepath.name}{RESET}")
 
             meta = probe_video(filepath)
@@ -838,7 +840,9 @@ def process_videos(cfg):
             sample_scenes = sample_src = None
 
             if existing_cq is None and meta["duration"] >= cfg["short_threshold"]:
-                if all(k in cache for k in ("scenes", "complexity", "keyframes")):
+                scene_cfg = {"scene_threshold": cfg["scene_threshold"]}
+                if (all(k in cache for k in ("scenes", "complexity", "keyframes"))
+                        and cache.get("scene_cfg") == scene_cfg):
                     print(f" {ORANGE}cache{RESET} Using cached scene data")
                     scenes = cache["scenes"]
                     complexity = cache["complexity"]
@@ -848,9 +852,10 @@ def process_videos(cfg):
                     scenes = detect_scenes(filepath, cfg)
                     complexity = analyze_complexity(filepath)
                     keyframes = get_keyframes(filepath)
-                    cache.update(scenes=scenes, complexity=complexity, keyframes=keyframes)
+                    cache.update(scenes=scenes, complexity=complexity,
+                                 keyframes=keyframes, scene_cfg=scene_cfg)
                     tmp = cp.with_suffix(".json.tmp")
-                    tmp.write_text(json.dumps(cache))
+                    tmp.write_text(json.dumps(cache), encoding="utf-8")
                     tmp.replace(cp)
 
                 sample_scenes = select_samples(
@@ -1103,7 +1108,7 @@ def process_videos(cfg):
 
     # ── Summary ──
     if total > 0:
-        print(SEP())
+        print(SEP)
     if stats["proc"] > 0:
         avg = stats["vmaf_sum"] / stats["vmaf_n"] if stats["vmaf_n"] else 0
         pct = stats["saved"] / stats["orig"] * 100 if stats["orig"] else 0
@@ -1119,7 +1124,7 @@ def process_videos(cfg):
     else:
         print(f"{CHECK} No files processed")
 
-    print(f"{SEP()}\n{CHECK} Done")
+    print(f"{SEP}\n{CHECK} Done")
     return 0
 
 
