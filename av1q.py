@@ -943,6 +943,18 @@ def process_videos(cfg):
                 print(f" {CROSS} No valid CQ found")
                 continue
 
+            if cfg["dry_run"]:
+                entry = cache["entries"].get(str(best_cq), {})
+                vmaf_str = ""
+                sv = entry.get("sample_full") or entry.get("full")
+                if isinstance(sv, dict):
+                    vmaf_str = f" VMAF={BOLD}{sv['mean']:.2f}{RESET} P5={BOLD}{sv['p5']:.2f}{RESET}"
+                elif isinstance(sv, (int, float)):
+                    vmaf_str = f" VMAF={BOLD}{sv:.2f}{RESET}"
+                print(f" {CHECK} Recommended CQ={BOLD}{best_cq}{RESET}{vmaf_str}")
+                print(f"   Run without --dry-run to encode")
+                continue
+
             # ── Full encode + verification ──
             if sample_src or existing_cq is not None:
                 if not dst_path(best_cq).exists():
@@ -1166,6 +1178,10 @@ def main():
         "--samples", type=int, default=8,
         help="Number of sample segments for estimation (default: 8)",
     )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Find optimal CQ but skip final encoding",
+    )
 
     args = parser.parse_args()
 
@@ -1186,6 +1202,7 @@ def main():
         "target_vmaf": args.vmaf,
         "vmaf_p5_margin": 5.0,
         "vmaf_tolerance": 0.1,
+        "dry_run": args.dry_run,
         "sample_count": args.samples,
         "sample_duration": 6.0,
         "min_scene_duration": 2.0,
