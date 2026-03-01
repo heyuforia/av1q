@@ -715,8 +715,9 @@ def encode_av1(source, dest, meta, cq, cfg):
     # Rate control — map user-facing CQ (min_cq..max_cq) to SVT-AV1 CRF (10..50)
     bitrate = meta.get("bitrate") or FALLBACK_MAXRATE[res_tier(meta["h"])]
     maxrate = min(int(bitrate * cfg["maxrate_factor"]), 100_000_000)
+    cq_range = cfg["max_cq"] - cfg["min_cq"]
     crf = clamp(
-        10 + int(round((cq - cfg["min_cq"]) * 40 / (cfg["max_cq"] - cfg["min_cq"]))),
+        10 + int(round((cq - cfg["min_cq"]) * 40 / cq_range)) if cq_range > 0 else cq,
         0, 63,
     )
 
@@ -1189,6 +1190,9 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.min_cq > args.max_cq:
+        parser.error("--min-cq must be <= --max-cq")
 
     cfg = {
         "input_dir": args.input,
