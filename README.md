@@ -74,6 +74,7 @@ python av1q.py --vmaf 95 --preset 6
 | `--no-10bit` | — | Disable forced 10-bit encoding |
 | `--no-recurse` | — | Don't process subdirectories |
 | `--overwrite` | — | Re-encode even if output exists |
+| `--dry-run` | — | Find optimal CQ but skip final encoding |
 
 ## How it works
 
