@@ -827,10 +827,17 @@ def process_videos(cfg):
             )
             min_p5 = target - cfg["vmaf_p5_margin"]
 
+            # ── Check for existing output needing verification ──
+            existing_cq = None
+            for c in range(cfg["min_cq"], cfg["max_cq"] + 1):
+                if dst_path(c).exists():
+                    existing_cq = c
+                    break
+
             # ── Scene analysis ──
             sample_scenes = sample_src = None
 
-            if meta["duration"] >= cfg["short_threshold"]:
+            if existing_cq is None and meta["duration"] >= cfg["short_threshold"]:
                 if all(k in cache for k in ("scenes", "complexity", "keyframes")):
                     print(f" {ORANGE}cache{RESET} Using cached scene data")
                     scenes = cache["scenes"]
@@ -863,7 +870,7 @@ def process_videos(cfg):
                         sample_scenes = None
                 else:
                     print(f" {ORANGE}scenes{RESET} Using full VMAF")
-            else:
+            elif existing_cq is None:
                 print(f" {ORANGE}short{RESET} <{cfg['short_threshold']}s, full VMAF")
 
             # ── CQ search ──
@@ -904,7 +911,10 @@ def process_videos(cfg):
                 f" (P5>={BOLD}{min_p5:.1f}{RESET})"
             )
 
-            if sample_src:
+            if existing_cq is not None:
+                best_cq = existing_cq
+                print(f" {ORANGE}reuse{RESET} Found existing CQ={BOLD}{existing_cq}{RESET} encode")
+            elif sample_src:
                 best_cq, _, _, vt = search_cq(
                     sample_src, meta, None, target, cache, cp,
                     do_enc_sample, vmaf_threads, cfg, tag="sample",
@@ -934,11 +944,14 @@ def process_videos(cfg):
                 continue
 
             # ── Full encode + verification ──
-            if sample_src:
-                print(f" {ORANGE}encode{RESET} Final encode at CQ={BOLD}{best_cq}{RESET}...")
-                t0 = time.time()
-                encode_av1(filepath, dst_path(best_cq), meta, best_cq, cfg)
-                t_enc += time.time() - t0
+            if sample_src or existing_cq is not None:
+                if not dst_path(best_cq).exists():
+                    print(f" {ORANGE}encode{RESET} Final encode at CQ={BOLD}{best_cq}{RESET}...")
+                    t0 = time.time()
+                    encode_av1(filepath, dst_path(best_cq), meta, best_cq, cfg)
+                    t_enc += time.time() - t0
+                else:
+                    print(f" {ORANGE}reuse{RESET} CQ={BOLD}{best_cq}{RESET} encode exists")
 
                 print(f" {ORANGE}verify{RESET} Full VMAF...")
                 t0 = time.time()
@@ -959,9 +972,10 @@ def process_videos(cfg):
                         break
                     try_cq = best_cq - 1
                     print(f" {ORANGE}adjust{RESET} Trying CQ={BOLD}{try_cq}{RESET}")
-                    t0 = time.time()
-                    encode_av1(filepath, dst_path(try_cq), meta, try_cq, cfg)
-                    t_enc += time.time() - t0
+                    if not dst_path(try_cq).exists():
+                        t0 = time.time()
+                        encode_av1(filepath, dst_path(try_cq), meta, try_cq, cfg)
+                        t_enc += time.time() - t0
                     t0 = time.time()
                     adj = vmaf_cached(
                         filepath, dst_path(try_cq), meta, try_cq, None,
