@@ -825,9 +825,8 @@ def process_videos(cfg):
                 print(f" {CHECK} Already AV1, skipping")
                 continue
 
-            target = cfg.get("target_vmaf") or max(
-                v for k, v in TARGET_VMAF_BY_RES.items() if meta["h"] >= k
-            )
+            tier = max(k for k in TARGET_VMAF_BY_RES if meta["h"] >= k)
+            target = cfg.get("target_vmaf") or TARGET_VMAF_BY_RES[tier]
             min_p5 = target - cfg["vmaf_p5_margin"]
 
             # ── Check for existing output needing verification ──
