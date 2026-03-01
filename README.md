@@ -2,7 +2,7 @@
 
 Automatically encode videos to AV1 at the best quality-to-size ratio, using VMAF to find the optimal settings for each file.
 
-
+![AV1Q-Cli-Screenshot](https://raw.githubusercontent.com/heyuforia/av1q/refs/heads/main/av1q-cli.png)
 
 ## What it does
 
