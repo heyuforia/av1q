@@ -68,8 +68,8 @@ python av1q.py --vmaf 95 --preset 6
 | `-o`, `--output` | `./AV1 Output` | Output directory |
 | `--vmaf` | Auto by resolution | Target VMAF score |
 | `--preset` | `4` | SVT-AV1 preset (0-13, lower = slower + better) |
-| `--min-cq` | `16` | Minimum CQ (highest quality bound) |
-| `--max-cq` | `40` | Maximum CQ (lowest quality bound) |
+| `--min-cq` | `18` | Minimum CQ (highest quality bound) |
+| `--max-cq` | `38` | Maximum CQ (lowest quality bound) |
 | `--film-grain` | `24` | Film grain synthesis level (0-50) |
 | `--samples` | `8` | Number of sample segments for estimation |
 | `--no-10bit` | — | Disable forced 10-bit encoding |
