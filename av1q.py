@@ -116,19 +116,22 @@ def video_kbps(filepath, duration):
     """Get video-only bitrate in kbps via ffprobe, excluding audio/subs."""
     if duration < 1.0:
         return None
-    try:
-        r = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=bit_rate",
-             "-of", "default=nw=1:nk=1", str(filepath)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30,
-        )
-        val = r.stdout.strip()
-        if val and val not in ("N/A", "0"):
-            return int(int(val) / 1000)
-    except (subprocess.TimeoutExpired, OSError, ValueError):
-        pass
-    # Fallback: total file bitrate (close enough if probe fails)
+    fp = str(filepath)
+    # Try stream bit_rate first, then MKV BPS tag (stream bit_rate is N/A in MKV)
+    for entries in ("stream=bit_rate", "stream_tags=BPS"):
+        try:
+            r = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", entries,
+                 "-of", "default=nw=1:nk=1", fp],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30,
+            )
+            val = r.stdout.strip()
+            if val and val not in ("N/A", "0"):
+                return int(int(val) / 1000)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            pass
+    # Fallback: total file bitrate (close enough if no audio track)
     return calc_kbps(filepath.stat().st_size, duration)
 
 
@@ -195,9 +198,14 @@ def probe_video(filepath):
     s = (data.get("streams") or [{}])[0]
     fmt = data.get("format") or {}
 
-    bitrate = next(
-        (int(v) for v in (fmt.get("bit_rate"), s.get("bit_rate")) if v), None
-    )
+    bitrate = None
+    for v in (fmt.get("bit_rate"), s.get("bit_rate")):
+        if v:
+            try:
+                bitrate = int(v)
+                break
+            except (ValueError, TypeError):
+                pass
     cp = (s.get("color_primaries") or "").lower()
     ct = (s.get("color_transfer") or "").lower()
     cs = (s.get("color_space") or "").lower()
@@ -648,8 +656,10 @@ def search_cq(source, meta, scenes, target, cache, cache_path,
         except Exception:
             pass
 
+    floor_cap = max_cq  # Never search above a CQ that violated the bitrate floor
+
     def test(cq):
-        nonlocal enc_time, vmaf_time
+        nonlocal enc_time, vmaf_time, floor_cap
         cq = clamp(cq, min_cq, max_cq)
         if cq in tested:
             return cq, tested[cq]
@@ -675,6 +685,15 @@ def search_cq(source, meta, scenes, target, cache, cache_path,
             f" P5={BOLD}{vm['p5']:.2f}{RESET}"
             f" {DIM}{sz_mb:.1f}MB{kbps_str}{RESET}"
         )
+
+        # If this CQ violated the bitrate floor, cap future search below it
+        if min_kbps and src_duration > 1 and kbps and kbps <= min_kbps:
+            floor_cap = min(floor_cap, cq - 1)
+            print(
+                f" {ORANGE}bitrate{RESET} {kbps}kbps at CQ={cq}"
+                f" below floor ({min_kbps}kbps), capping search at CQ={BOLD}{floor_cap}{RESET}"
+            )
+
         return cq, vm
 
     cq, vm = test(28)
@@ -685,24 +704,12 @@ def search_cq(source, meta, scenes, target, cache, cache_path,
         if target - tol <= vm["mean"] <= target + 1.0:
             break
         delta = (vm["mean"] - target) / slope
-        next_cq = clamp(int(round(cq + delta)), min_cq, max_cq)
+        next_cq = clamp(int(round(cq + delta)), min_cq, min(max_cq, floor_cap))
         if next_cq == cq:
             next_cq = cq + (1 if vm["mean"] > target else -1)
-        next_cq = clamp(next_cq, min_cq, max_cq)
-        if next_cq in tested:
+        next_cq = clamp(next_cq, min_cq, min(max_cq, floor_cap))
+        if next_cq == cq or next_cq in tested:
             break
-
-        # If going higher CQ but bitrate is already at/below floor, search down instead
-        if min_kbps and next_cq > cq and src_duration > 1 and cq in tested_paths:
-            curr_kbps = video_kbps(tested_paths[cq], src_duration)
-            if curr_kbps and curr_kbps <= min_kbps:
-                next_cq = cq - 1
-                if next_cq < min_cq or next_cq in tested:
-                    break
-                print(
-                    f" {ORANGE}bitrate{RESET} {curr_kbps}kbps at CQ={cq}"
-                    f" below floor ({min_kbps}kbps), trying CQ={BOLD}{next_cq}{RESET}"
-                )
 
         prev_cq, prev_vm = cq, vm
         cq, vm = test(next_cq)
@@ -774,14 +781,10 @@ def encode_av1(source, dest, meta, cq, cfg):
     if meta["cr"]:
         color_args += ["-color_range", meta["cr"]]
 
-    # Rate control — map user-facing CQ (min_cq..max_cq) to SVT-AV1 CRF (18..38)
+    # Rate control — CQ value is used directly as SVT-AV1 CRF
     bitrate = meta.get("bitrate") or FALLBACK_MAXRATE[res_tier(meta["h"])]
     maxrate = min(int(bitrate * cfg["maxrate_factor"]), 100_000_000)
-    cq_range = cfg["max_cq"] - cfg["min_cq"]
-    crf = clamp(
-        18 + int(round((cq - cfg["min_cq"]) * 20 / cq_range)) if cq_range > 0 else cq,
-        0, 63,
-    )
+    crf = clamp(cq, 0, 63)
 
     # Threading
     threads = os.cpu_count() or 1
@@ -906,7 +909,9 @@ def process_videos(cfg):
                 rec = cache.get("recommended")
                 if (rec and rec.get("target") == target
                         and rec.get("min_cq") == cfg["min_cq"]
-                        and rec.get("max_cq") == cfg["max_cq"]):
+                        and rec.get("max_cq") == cfg["max_cq"]
+                        and rec.get("preset") == cfg["preset"]
+                        and rec.get("film_grain") == cfg["film_grain"]):
                     existing_cq = rec["cq"]
                     print(f" {ORANGE}resume{RESET} Using CQ={BOLD}{existing_cq}{RESET} from previous search")
 
@@ -957,6 +962,7 @@ def process_videos(cfg):
             sample_enc_dir = cache_dir / "_sample_enc"
             sample_enc_dir.mkdir(parents=True, exist_ok=True)
             sample_enc_cache = {}
+            enc_tag = f"p{cfg['preset']}g{cfg['film_grain']}"
 
             def do_enc_sample(cq):
                 nonlocal t_enc
@@ -965,8 +971,10 @@ def process_videos(cfg):
                     return sample_enc_cache[cq]
                 if not sample_src or not sample_src.exists():
                     raise RuntimeError("Sample source missing")
-                d = sample_enc_dir / f"sample_enc_{os.getpid()}_{cq}.mkv"
-                _temp_files.add(d)
+                d = sample_enc_dir / f"sample_enc_{file_hash[:8]}_{enc_tag}_{cq}.mkv"
+                if d.exists() and d.stat().st_size > 0:
+                    sample_enc_cache[cq] = d
+                    return d
                 t0 = time.time()
                 encode_av1(sample_src, d, meta, cq, cfg)
                 t_enc += time.time() - t0
@@ -1004,6 +1012,7 @@ def process_videos(cfg):
                     cache["recommended"] = {
                         "cq": best_cq, "target": target,
                         "min_cq": cfg["min_cq"], "max_cq": cfg["max_cq"],
+                        "preset": cfg["preset"], "film_grain": cfg["film_grain"],
                     }
                     tmp = cp.with_suffix(".json.tmp")
                     tmp.write_text(json.dumps(cache), encoding="utf-8")
@@ -1011,7 +1020,6 @@ def process_videos(cfg):
                 for p in sample_enc_cache.values():
                     try:
                         p.unlink()
-                        _temp_files.discard(p)
                     except OSError:
                         pass
             else:
@@ -1081,39 +1089,6 @@ def process_videos(cfg):
                     else:
                         break
 
-            elif sample_scenes is not None:
-                print(f" {ORANGE}verify{RESET} Full VMAF at CQ={BOLD}{best_cq}{RESET}...")
-                t0 = time.time()
-                full_vm = vmaf_cached(
-                    filepath, dst_path(best_cq), meta, best_cq, None,
-                    cache, cp, vmaf_threads,
-                )
-                t_vmaf += time.time() - t0
-                print(
-                    f" {ORANGE}full{RESET} VMAF={BOLD}{full_vm['mean']:.2f}{RESET}"
-                    f" P5={BOLD}{full_vm['p5']:.2f}{RESET}"
-                )
-
-                for _ in range(3):
-                    if full_vm["mean"] >= target - cfg["vmaf_tolerance"]:
-                        break
-                    if best_cq <= cfg["min_cq"]:
-                        break
-                    try_cq = best_cq - 1
-                    print(f" {ORANGE}adjust{RESET} Trying CQ={BOLD}{try_cq}{RESET}")
-                    do_enc_full(try_cq)
-                    t0 = time.time()
-                    adj = vmaf_cached(
-                        filepath, dst_path(try_cq), meta, try_cq, None,
-                        cache, cp, vmaf_threads,
-                    )
-                    t_vmaf += time.time() - t0
-                    if math.isfinite(adj["mean"]) and adj["mean"] > full_vm["mean"]:
-                        best_cq, full_vm = try_cq, adj
-                    else:
-                        break
-                best_vmaf = full_vm
-
             # ── P5 safety check ──
             for _ in range(3):
                 if best_vmaf["p5"] >= min_p5 or best_cq <= cfg["min_cq"]:
@@ -1133,7 +1108,7 @@ def process_videos(cfg):
                     break
 
             # ── Bitrate floor check ──
-            min_kbps = MIN_BITRATE_KBPS.get(tier, 0)
+            min_kbps = MIN_BITRATE_KBPS.get(res_tier(meta["h"]), 0)
             if min_kbps and dst_path(best_cq).exists():
                 actual_kbps = video_kbps(dst_path(best_cq), meta["duration"])
                 for _ in range(5):
@@ -1207,6 +1182,9 @@ def process_videos(cfg):
             stats["saved"] += in_sz - out_sz
             stats["orig"] += in_sz
 
+        except KeyboardInterrupt:
+            _file_error = True
+            raise
         except Exception as e:
             _file_error = True
             print(f" {CROSS} {e}")
@@ -1271,12 +1249,12 @@ def main():
         help="SVT-AV1 preset 0-13, lower=slower+better (default: 4)",
     )
     parser.add_argument(
-        "--min-cq", type=int, default=16,
-        help="Minimum CQ / highest quality (default: 16)",
+        "--min-cq", type=int, default=18,
+        help="Minimum CQ / highest quality (default: 18)",
     )
     parser.add_argument(
-        "--max-cq", type=int, default=40,
-        help="Maximum CQ / lowest quality (default: 40)",
+        "--max-cq", type=int, default=38,
+        help="Maximum CQ / lowest quality (default: 38)",
     )
     parser.add_argument(
         "--film-grain", type=int, default=24,
