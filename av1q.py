@@ -52,7 +52,7 @@ FALLBACK_MAXRATE = {
 
 VMAF_SUBSAMPLE = {0: 15, 720: 20, 1080: 30, 1440: 40, 2160: 60, 4320: 80}
 
-MIN_BITRATE_KBPS = {0: 0, 720: 0, 1080: 0, 1440: 0, 2160: 4000, 4320: 8000}
+MIN_BITRATE_KBPS = {0: 0, 720: 1000, 1080: 1500, 1440: 2500, 2160: 4000, 4320: 8000}
 
 # ── Global State ─────────────────────────────────────────────
 
@@ -110,6 +110,26 @@ def calc_kbps(size_bytes, duration):
     if duration < 1.0:
         return None
     return int((size_bytes * 8) / 1000 / duration)
+
+
+def video_kbps(filepath, duration):
+    """Get video-only bitrate in kbps via ffprobe, excluding audio/subs."""
+    if duration < 1.0:
+        return None
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=bit_rate",
+             "-of", "default=nw=1:nk=1", str(filepath)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30,
+        )
+        val = r.stdout.strip()
+        if val and val not in ("N/A", "0"):
+            return int(int(val) / 1000)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        pass
+    # Fallback: total file bitrate (close enough if probe fails)
+    return calc_kbps(filepath.stat().st_size, duration)
 
 
 def clamp(val, lo, hi):
@@ -415,13 +435,21 @@ def select_samples(scenes, complexity, duration, count, keyframes, cfg):
     return selected or None
 
 
-def extract_samples(source, scenes, keyframes, cfg):
+def extract_samples(source, scenes, keyframes, cfg, file_hash=None):
     """Extract and concatenate sample clips from the source video."""
     if not scenes:
         return None
 
     sample_dir = cfg["cache_dir"] / "_samples"
     sample_dir.mkdir(parents=True, exist_ok=True)
+
+    # Deterministic name so samples survive interrupts and can be reused
+    tag = file_hash or f"{os.getpid()}_{int(time.time() * 1000)}"
+    concat_out = sample_dir / f"samples_{tag}.mkv"
+    if concat_out.exists() and concat_out.stat().st_size > 0:
+        print(f" {DIM}Samples: {concat_out.stat().st_size / 1e6:.1f}MB (cached){RESET}")
+        return concat_out
+
     ts = int(time.time() * 1000)
     clips = []
     keyframes = keyframes or get_keyframes(source)
@@ -456,8 +484,8 @@ def extract_samples(source, scenes, keyframes, cfg):
         "\n".join(f"file '{c.as_posix()}'" for c in clips), encoding="utf-8"
     )
 
-    concat_out = sample_dir / f"samples_{ts}.mkv"
-    _temp_files.add(concat_out)
+    # concat_out defined above with deterministic name; not added to
+    # _temp_files so it survives interrupts for reuse on next run
     try:
         run_cmd([
             "ffmpeg", "-y", "-hide_banner", "-v", "error",
@@ -609,6 +637,16 @@ def search_cq(source, meta, scenes, target, cache, cache_path,
     slope = 0.5
     enc_time = vmaf_time = 0.0
     tested = {}
+    tested_paths = {}
+
+    # Get bitrate floor and actual source duration for bitrate checks
+    min_kbps = MIN_BITRATE_KBPS.get(res_tier(meta["h"]), 0)
+    src_duration = 0.0
+    if min_kbps:
+        try:
+            src_duration = probe_video(source)["duration"]
+        except Exception:
+            pass
 
     def test(cq):
         nonlocal enc_time, vmaf_time
@@ -627,12 +665,15 @@ def search_cq(source, meta, scenes, target, cache, cache_path,
         vmaf_time += time.time() - t0
 
         tested[cq] = vm
-        sz = dst.stat().st_size / 1e6 if dst.exists() else 0
+        tested_paths[cq] = dst
+        sz_mb = dst.stat().st_size / 1e6 if dst.exists() else 0
+        kbps = video_kbps(dst, src_duration) if src_duration > 1 else None
+        kbps_str = f" {kbps}kbps" if kbps else ""
         print(
             f" {ORANGE}search{RESET} CQ={BOLD}{cq}{RESET}"
             f" VMAF={BOLD}{vm['mean']:.2f}{RESET}"
             f" P5={BOLD}{vm['p5']:.2f}{RESET}"
-            f" {DIM}{sz:.1f}MB{RESET}"
+            f" {DIM}{sz_mb:.1f}MB{kbps_str}{RESET}"
         )
         return cq, vm
 
@@ -651,6 +692,18 @@ def search_cq(source, meta, scenes, target, cache, cache_path,
         if next_cq in tested:
             break
 
+        # If going higher CQ but bitrate is already at/below floor, search down instead
+        if min_kbps and next_cq > cq and src_duration > 1 and cq in tested_paths:
+            curr_kbps = video_kbps(tested_paths[cq], src_duration)
+            if curr_kbps and curr_kbps <= min_kbps:
+                next_cq = cq - 1
+                if next_cq < min_cq or next_cq in tested:
+                    break
+                print(
+                    f" {ORANGE}bitrate{RESET} {curr_kbps}kbps at CQ={cq}"
+                    f" below floor ({min_kbps}kbps), trying CQ={BOLD}{next_cq}{RESET}"
+                )
+
         prev_cq, prev_vm = cq, vm
         cq, vm = test(next_cq)
         if not math.isfinite(vm["mean"]):
@@ -660,12 +713,17 @@ def search_cq(source, meta, scenes, target, cache, cache_path,
                 abs(prev_vm["mean"] - vm["mean"]) / abs(prev_cq - cq), 0.1, 1.5
             )
 
-    # Pick highest CQ (smallest file) that meets target
-    best = max(
-        (c for c in tested
-         if math.isfinite(tested[c]["mean"]) and tested[c]["mean"] >= target - tol),
-        default=None,
-    )
+    # Pick highest CQ (smallest file) that meets target AND bitrate floor
+    def valid_cq(c):
+        if not math.isfinite(tested[c]["mean"]) or tested[c]["mean"] < target - tol:
+            return False
+        if min_kbps and src_duration > 1 and c in tested_paths:
+            kbps = video_kbps(tested_paths[c], src_duration)
+            if kbps and kbps < min_kbps:
+                return False
+        return True
+
+    best = max((c for c in tested if valid_cq(c)), default=None)
     if best is None:
         best = max(
             (c for c in tested if math.isfinite(tested[c]["mean"])),
@@ -796,6 +854,8 @@ def process_videos(cfg):
     t_start = time.time()
 
     for idx, filepath in enumerate(files, 1):
+        sample_src = None
+        _file_error = False
         try:
             # Output path mirrors input subdirectory structure
             rel = filepath.parent.relative_to(input_dir)
@@ -803,7 +863,8 @@ def process_videos(cfg):
             out_dir.mkdir(parents=True, exist_ok=True)
             dst_path = lambda cq: out_dir / f"{filepath.stem}_CQ{cq}{ext}"
 
-            cache, cp = load_cache(cache_dir, partial_hash(filepath), "svt4")
+            file_hash = partial_hash(filepath)
+            cache, cp = load_cache(cache_dir, file_hash, "svt4")
 
             # Skip only if output exists AND has verified full VMAF in cache
             if cfg["skip_existing"]:
@@ -840,6 +901,15 @@ def process_videos(cfg):
                     existing_cq = c
                     break
 
+            # Resume from cached search result (interrupted after sample search)
+            if existing_cq is None:
+                rec = cache.get("recommended")
+                if (rec and rec.get("target") == target
+                        and rec.get("min_cq") == cfg["min_cq"]
+                        and rec.get("max_cq") == cfg["max_cq"]):
+                    existing_cq = rec["cq"]
+                    print(f" {ORANGE}resume{RESET} Using CQ={BOLD}{existing_cq}{RESET} from previous search")
+
             # ── Scene analysis ──
             sample_scenes = sample_src = None
 
@@ -873,7 +943,7 @@ def process_videos(cfg):
                     )
                     print(f" {ORANGE}scenes{RESET} {BOLD}{len(sample_scenes)}{RESET} {info}")
                     print(f" {ORANGE}extract{RESET} Extracting samples...")
-                    sample_src = extract_samples(filepath, sample_scenes, keyframes, cfg)
+                    sample_src = extract_samples(filepath, sample_scenes, keyframes, cfg, file_hash=file_hash)
                     if not sample_src:
                         print(f" {ORANGE}fallback{RESET} Extraction failed, using full encode")
                         sample_scenes = None
@@ -929,16 +999,19 @@ def process_videos(cfg):
                     do_enc_sample, vmaf_threads, cfg, tag="sample",
                 )
                 t_vmaf += vt
+                # Cache recommended CQ so interrupted runs can resume
+                if best_cq is not None:
+                    cache["recommended"] = {
+                        "cq": best_cq, "target": target,
+                        "min_cq": cfg["min_cq"], "max_cq": cfg["max_cq"],
+                    }
+                    tmp = cp.with_suffix(".json.tmp")
+                    tmp.write_text(json.dumps(cache), encoding="utf-8")
+                    tmp.replace(cp)
                 for p in sample_enc_cache.values():
                     try:
                         p.unlink()
                         _temp_files.discard(p)
-                    except OSError:
-                        pass
-                if sample_src.exists():
-                    try:
-                        sample_src.unlink()
-                        _temp_files.discard(sample_src)
                     except OSError:
                         pass
             else:
@@ -1059,12 +1132,10 @@ def process_videos(cfg):
                 else:
                     break
 
-            # ── Bitrate floor check (4K+) ──
+            # ── Bitrate floor check ──
             min_kbps = MIN_BITRATE_KBPS.get(tier, 0)
             if min_kbps and dst_path(best_cq).exists():
-                actual_kbps = calc_kbps(
-                    dst_path(best_cq).stat().st_size, meta["duration"]
-                )
+                actual_kbps = video_kbps(dst_path(best_cq), meta["duration"])
                 for _ in range(5):
                     if not actual_kbps or actual_kbps >= min_kbps:
                         break
@@ -1084,8 +1155,8 @@ def process_videos(cfg):
                     )
                     t_vmaf += time.time() - t0
                     best_cq, best_vmaf = try_cq, adj
-                    actual_kbps = calc_kbps(
-                        dst_path(best_cq).stat().st_size, meta["duration"]
+                    actual_kbps = video_kbps(
+                        dst_path(best_cq), meta["duration"]
                     )
 
             # ── Finalize ──
@@ -1115,7 +1186,7 @@ def process_videos(cfg):
                 continue
 
             saved = (1.0 - out_sz / in_sz) * 100
-            out_kbps = calc_kbps(out_sz, meta["duration"])
+            out_kbps = video_kbps(final, meta["duration"])
             kbps_str = f" ({BOLD}{out_kbps}kbps{RESET})" if out_kbps else ""
             hdr_tag = f" {ORANGE}[HDR]{RESET}" if meta["hdr"] else ""
             print(
@@ -1137,9 +1208,18 @@ def process_videos(cfg):
             stats["orig"] += in_sz
 
         except Exception as e:
+            _file_error = True
             print(f" {CROSS} {e}")
         finally:
             cleanup_temp()
+            # Clean up sample source after successful processing;
+            # preserve on error/interrupt for reuse on next run
+            if not _file_error and sample_src:
+                try:
+                    if sample_src.exists():
+                        sample_src.unlink()
+                except OSError:
+                    pass
 
     # ── Summary ──
     if total > 0:
