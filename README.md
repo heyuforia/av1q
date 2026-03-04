@@ -87,7 +87,7 @@ The script uses an adaptive search (similar to Newton's method) to converge on t
 4. **Encode** — full video is encoded at the best CQ found
 5. **Verify** — full-file VMAF is measured. If it falls short, CQ is stepped down and re-encoded (up to 3 attempts)
 6. **P5 safety** — if the 5th percentile VMAF (worst frames) is below the floor, CQ is stepped down further
-7. **Bitrate floor** — if the output video bitrate falls below the per-resolution minimum, CQ is stepped down until the floor is met
+7. **Bitrate floor** — if the output bitrate falls below the per-resolution minimum, CQ is stepped down until the floor is met
 
 Files that end up *larger* after encoding are automatically deleted.
 
