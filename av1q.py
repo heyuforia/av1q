@@ -52,6 +52,8 @@ FALLBACK_MAXRATE = {
 
 VMAF_SUBSAMPLE = {0: 15, 720: 20, 1080: 30, 1440: 40, 2160: 60, 4320: 80}
 
+MIN_BITRATE_KBPS = {0: 0, 720: 0, 1080: 0, 1440: 0, 2160: 4000, 4320: 8000}
+
 # ── Global State ─────────────────────────────────────────────
 
 _temp_files = set()
@@ -625,10 +627,12 @@ def search_cq(source, meta, scenes, target, cache, cache_path,
         vmaf_time += time.time() - t0
 
         tested[cq] = vm
+        sz = dst.stat().st_size / 1e6 if dst.exists() else 0
         print(
             f" {ORANGE}search{RESET} CQ={BOLD}{cq}{RESET}"
             f" VMAF={BOLD}{vm['mean']:.2f}{RESET}"
             f" P5={BOLD}{vm['p5']:.2f}{RESET}"
+            f" {DIM}{sz:.1f}MB{RESET}"
         )
         return cq, vm
 
@@ -712,12 +716,12 @@ def encode_av1(source, dest, meta, cq, cfg):
     if meta["cr"]:
         color_args += ["-color_range", meta["cr"]]
 
-    # Rate control — map user-facing CQ (min_cq..max_cq) to SVT-AV1 CRF (10..50)
+    # Rate control — map user-facing CQ (min_cq..max_cq) to SVT-AV1 CRF (18..38)
     bitrate = meta.get("bitrate") or FALLBACK_MAXRATE[res_tier(meta["h"])]
     maxrate = min(int(bitrate * cfg["maxrate_factor"]), 100_000_000)
     cq_range = cfg["max_cq"] - cfg["min_cq"]
     crf = clamp(
-        10 + int(round((cq - cfg["min_cq"]) * 40 / cq_range)) if cq_range > 0 else cq,
+        18 + int(round((cq - cfg["min_cq"]) * 20 / cq_range)) if cq_range > 0 else cq,
         0, 63,
     )
 
@@ -1055,6 +1059,35 @@ def process_videos(cfg):
                 else:
                     break
 
+            # ── Bitrate floor check (4K+) ──
+            min_kbps = MIN_BITRATE_KBPS.get(tier, 0)
+            if min_kbps and dst_path(best_cq).exists():
+                actual_kbps = calc_kbps(
+                    dst_path(best_cq).stat().st_size, meta["duration"]
+                )
+                for _ in range(5):
+                    if not actual_kbps or actual_kbps >= min_kbps:
+                        break
+                    if best_cq <= cfg["min_cq"]:
+                        break
+                    try_cq = best_cq - 1
+                    print(
+                        f" {ORANGE}bitrate{RESET} {actual_kbps}kbps"
+                        f" < {min_kbps}kbps floor,"
+                        f" trying CQ={BOLD}{try_cq}{RESET}"
+                    )
+                    do_enc_full(try_cq)
+                    t0 = time.time()
+                    adj = vmaf_cached(
+                        filepath, dst_path(try_cq), meta, try_cq, None,
+                        cache, cp, vmaf_threads,
+                    )
+                    t_vmaf += time.time() - t0
+                    best_cq, best_vmaf = try_cq, adj
+                    actual_kbps = calc_kbps(
+                        dst_path(best_cq).stat().st_size, meta["duration"]
+                    )
+
             # ── Finalize ──
             final = dst_path(best_cq)
             if not final.exists():
@@ -1082,6 +1115,8 @@ def process_videos(cfg):
                 continue
 
             saved = (1.0 - out_sz / in_sz) * 100
+            out_kbps = calc_kbps(out_sz, meta["duration"])
+            kbps_str = f" ({BOLD}{out_kbps}kbps{RESET})" if out_kbps else ""
             hdr_tag = f" {ORANGE}[HDR]{RESET}" if meta["hdr"] else ""
             print(
                 f" {CHECK} CQ={BOLD}{best_cq}{RESET}"
@@ -1089,7 +1124,7 @@ def process_videos(cfg):
                 f" P5={BOLD}{best_vmaf['p5']:.2f}{RESET}"
             )
             print(
-                f" {CHECK} Size={BOLD}{out_sz / 1e6:.1f}MB{RESET}"
+                f" {CHECK} Size={BOLD}{out_sz / 1e6:.1f}MB{RESET}{kbps_str}"
                 f" Saved={BOLD}{saved:.1f}%{RESET}{hdr_tag}"
             )
             print(f" {DIM}Enc:{fmt_time(t_enc)} VMAF:{fmt_time(t_vmaf)}{RESET}")
