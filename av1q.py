@@ -50,8 +50,6 @@ FALLBACK_MAXRATE = {
     1440: 35_000_000, 2160: 45_000_000, 4320: 60_000_000,
 }
 
-VMAF_SUBSAMPLE = {0: 15, 720: 20, 1080: 30, 1440: 40, 2160: 60, 4320: 80}
-
 MIN_BITRATE_KBPS = {0: 0, 720: 1000, 1080: 1500, 1440: 2500, 2160: 4000, 4320: 8000}
 
 # ── Global State ─────────────────────────────────────────────
@@ -110,29 +108,6 @@ def calc_kbps(size_bytes, duration):
     if duration < 1.0:
         return None
     return int((size_bytes * 8) / 1000 / duration)
-
-
-def video_kbps(filepath, duration):
-    """Get video-only bitrate in kbps via ffprobe, excluding audio/subs."""
-    if duration < 1.0:
-        return None
-    fp = str(filepath)
-    # Try stream bit_rate first, then MKV BPS tag (stream bit_rate is N/A in MKV)
-    for entries in ("stream=bit_rate", "stream_tags=BPS"):
-        try:
-            r = subprocess.run(
-                ["ffprobe", "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", entries,
-                 "-of", "default=nw=1:nk=1", fp],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30,
-            )
-            val = r.stdout.strip()
-            if val and val not in ("N/A", "0"):
-                return int(int(val) / 1000)
-        except (subprocess.TimeoutExpired, OSError, ValueError):
-            pass
-    # Fallback: total file bitrate (close enough if no audio track)
-    return calc_kbps(filepath.stat().st_size, duration)
 
 
 def clamp(val, lo, hi):
@@ -520,27 +495,16 @@ def extract_samples(source, scenes, keyframes, cfg, file_hash=None):
 # ── VMAF Measurement ─────────────────────────────────────────
 
 
-def measure_vmaf(ref, dist, meta, scenes, subsample, threads, cache_dir):
+def measure_vmaf(ref, dist, meta, subsample, threads, cache_dir):
     """Compute VMAF score between reference and distorted video."""
     filters = []
     fps = get_fps(dist)
 
-    if scenes:
-        # Scene-based: fps normalizes rate (using original timestamps),
-        # select picks scenes, setpts resets PTS for contiguous output
-        if fps:
-            filters.append(f"fps={fps}")
-        expr = "+".join(
-            f"between(t,{s['time']:.3f},{s['time'] + s['duration']:.3f})"
-            for s in scenes
-        )
-        filters.append(f"select='{expr}',setpts=PTS-STARTPTS")
-    else:
-        # Full-file: normalize start PTS to zero first (handles MP4 edit
-        # lists / non-zero start times), then normalize frame rate
-        filters.append("setpts=PTS-STARTPTS")
-        if fps:
-            filters.append(f"fps={fps}")
+    # Normalize start PTS to zero first (handles MP4 edit lists /
+    # non-zero start times), then normalize frame rate
+    filters.append("setpts=PTS-STARTPTS")
+    if fps:
+        filters.append(f"fps={fps}")
 
     if meta["hdr"] or "10le" in meta["pix_fmt"]:
         filters += ["zscale=t=bt709:m=bt709:r=tv:p=709", "tonemap=hable:desat=0"]
@@ -597,7 +561,7 @@ def measure_vmaf(ref, dist, meta, scenes, subsample, threads, cache_dir):
         return {"mean": float("nan"), "p5": float("nan")}
 
 
-def vmaf_cached(ref, dist, meta, cq, scenes, cache, cache_path, threads, tag=None):
+def vmaf_cached(ref, dist, meta, cq, cache, cache_path, threads, tag=None):
     """Compute VMAF with file-based caching."""
     if not dist.exists() or not ref.exists():
         return {"mean": float("nan"), "p5": float("nan")}
@@ -606,8 +570,7 @@ def vmaf_cached(ref, dist, meta, cq, scenes, cache, cache_path, threads, tag=Non
     except OSError:
         return {"mean": float("nan"), "p5": float("nan")}
 
-    base_key = "full" if scenes is None else f"S{len(scenes)}"
-    key = f"{tag}_{base_key}" if tag else base_key
+    key = f"{tag}_full" if tag else "full"
     entry = cache["entries"].get(str(cq))
 
     if entry and key in entry and entry.get("size") == dist_size:
@@ -616,15 +579,12 @@ def vmaf_cached(ref, dist, meta, cq, scenes, cache, cache_path, threads, tag=Non
             "p5": float(entry.get(f"{key}_p5", entry[key])),
         }
 
-    tier = res_tier(meta["h"])
-    sub = 1 if scenes is None else (VMAF_SUBSAMPLE.get(tier) or 30)
-    result = measure_vmaf(ref, dist, meta, scenes, sub, threads, cache_path.parent)
+    result = measure_vmaf(ref, dist, meta, 1, threads, cache_path.parent)
 
     if math.isfinite(result["mean"]) and 0 <= result["mean"] <= 100:
         cache["entries"].setdefault(str(cq), {}).update({
             key: result["mean"], f"{key}_p5": result["p5"],
             "size": dist_size,
-            "kbps": calc_kbps(dist_size, meta["duration"]),
             "t": time.time(),
         })
         tmp = cache_path.with_suffix(".json.tmp")
@@ -637,7 +597,7 @@ def vmaf_cached(ref, dist, meta, cq, scenes, cache, cache_path, threads, tag=Non
 # ── CQ Search ────────────────────────────────────────────────
 
 
-def search_cq(source, meta, scenes, target, cache, cache_path,
+def search_cq(source, meta, target, cache, cache_path,
               enc_func, threads, cfg, tag=None):
     """Find the optimal CQ that hits the target VMAF using adaptive search."""
     min_cq, max_cq = cfg["min_cq"], cfg["max_cq"]
@@ -670,14 +630,14 @@ def search_cq(source, meta, scenes, target, cache, cache_path,
 
         t0 = time.time()
         vm = vmaf_cached(
-            source, dst, meta, cq, scenes, cache, cache_path, threads, tag=tag
+            source, dst, meta, cq, cache, cache_path, threads, tag=tag
         )
         vmaf_time += time.time() - t0
 
         tested[cq] = vm
         tested_paths[cq] = dst
         sz_mb = dst.stat().st_size / 1e6 if dst.exists() else 0
-        kbps = video_kbps(dst, src_duration) if src_duration > 1 else None
+        kbps = calc_kbps(dst.stat().st_size, src_duration) if src_duration > 1 else None
         kbps_str = f" {kbps}kbps" if kbps else ""
         print(
             f" {ORANGE}search{RESET} CQ={BOLD}{cq}{RESET}"
@@ -725,7 +685,7 @@ def search_cq(source, meta, scenes, target, cache, cache_path,
         if not math.isfinite(tested[c]["mean"]) or tested[c]["mean"] < target - tol:
             return False
         if min_kbps and src_duration > 1 and c in tested_paths:
-            kbps = video_kbps(tested_paths[c], src_duration)
+            kbps = calc_kbps(tested_paths[c].stat().st_size, src_duration)
             if kbps and kbps < min_kbps:
                 return False
         return True
@@ -899,7 +859,7 @@ def process_videos(cfg):
 
             # ── Check for existing output needing verification ──
             existing_cq = None
-            for c in range(cfg["min_cq"], cfg["max_cq"] + 1):
+            for c in range(cfg["max_cq"], cfg["min_cq"] - 1, -1):
                 if dst_path(c).exists():
                     existing_cq = c
                     break
@@ -1003,7 +963,7 @@ def process_videos(cfg):
                 print(f" {ORANGE}reuse{RESET} Found existing CQ={BOLD}{existing_cq}{RESET} encode")
             elif sample_src:
                 best_cq, _, _, vt = search_cq(
-                    sample_src, meta, None, target, cache, cp,
+                    sample_src, meta, target, cache, cp,
                     do_enc_sample, vmaf_threads, cfg, tag="sample",
                 )
                 t_vmaf += vt
@@ -1024,7 +984,7 @@ def process_videos(cfg):
                         pass
             else:
                 best_cq, best_vmaf, _, vt = search_cq(
-                    filepath, meta, sample_scenes, target, cache, cp,
+                    filepath, meta, target, cache, cp,
                     do_enc_full, vmaf_threads, cfg,
                 )
                 t_vmaf += vt
@@ -1058,7 +1018,7 @@ def process_videos(cfg):
                 print(f" {ORANGE}verify{RESET} Full VMAF...")
                 t0 = time.time()
                 best_vmaf = vmaf_cached(
-                    filepath, dst_path(best_cq), meta, best_cq, None,
+                    filepath, dst_path(best_cq), meta, best_cq,
                     cache, cp, vmaf_threads,
                 )
                 t_vmaf += time.time() - t0
@@ -1080,7 +1040,7 @@ def process_videos(cfg):
                         t_enc += time.time() - t0
                     t0 = time.time()
                     adj = vmaf_cached(
-                        filepath, dst_path(try_cq), meta, try_cq, None,
+                        filepath, dst_path(try_cq), meta, try_cq,
                         cache, cp, vmaf_threads,
                     )
                     t_vmaf += time.time() - t0
@@ -1098,7 +1058,7 @@ def process_videos(cfg):
                 do_enc_full(try_cq)
                 t0 = time.time()
                 safe = vmaf_cached(
-                    filepath, dst_path(try_cq), meta, try_cq, None,
+                    filepath, dst_path(try_cq), meta, try_cq,
                     cache, cp, vmaf_threads,
                 )
                 t_vmaf += time.time() - t0
@@ -1110,7 +1070,7 @@ def process_videos(cfg):
             # ── Bitrate floor check ──
             min_kbps = MIN_BITRATE_KBPS.get(res_tier(meta["h"]), 0)
             if min_kbps and dst_path(best_cq).exists():
-                actual_kbps = video_kbps(dst_path(best_cq), meta["duration"])
+                actual_kbps = calc_kbps(dst_path(best_cq).stat().st_size, meta["duration"])
                 for _ in range(5):
                     if not actual_kbps or actual_kbps >= min_kbps:
                         break
@@ -1125,13 +1085,13 @@ def process_videos(cfg):
                     do_enc_full(try_cq)
                     t0 = time.time()
                     adj = vmaf_cached(
-                        filepath, dst_path(try_cq), meta, try_cq, None,
+                        filepath, dst_path(try_cq), meta, try_cq,
                         cache, cp, vmaf_threads,
                     )
                     t_vmaf += time.time() - t0
                     best_cq, best_vmaf = try_cq, adj
-                    actual_kbps = video_kbps(
-                        dst_path(best_cq), meta["duration"]
+                    actual_kbps = calc_kbps(
+                        dst_path(best_cq).stat().st_size, meta["duration"]
                     )
 
             # ── Finalize ──
@@ -1161,7 +1121,7 @@ def process_videos(cfg):
                 continue
 
             saved = (1.0 - out_sz / in_sz) * 100
-            out_kbps = video_kbps(final, meta["duration"])
+            out_kbps = calc_kbps(final.stat().st_size, meta["duration"])
             kbps_str = f" ({BOLD}{out_kbps}kbps{RESET})" if out_kbps else ""
             hdr_tag = f" {ORANGE}[HDR]{RESET}" if meta["hdr"] else ""
             print(
