@@ -17,7 +17,7 @@ Drop videos into a folder, run the script, and each file gets encoded to AV1 at 
 
 - **VMAF-targeted encoding** — hits a perceptual quality target instead of using a fixed CRF
 - **Resolution-aware defaults** — auto-selects VMAF targets (94 for HD, 93 for SD, 90 for 4K)
-- **4K bitrate floor** — enforces a minimum bitrate for 4K+ content (4 Mbps for 2160p, 8 Mbps for 4320p) to prevent VMAF-misleading low-bitrate encodes
+- **Bitrate floors** — per-resolution minimum bitrates (1 Mbps 720p, 1.5 Mbps 1080p, 2.5 Mbps 1440p, 4 Mbps 2160p, 8 Mbps 4320p) prevent VMAF-misleading low-bitrate encodes
 - **Scene-based sampling** — fast quality estimation without encoding the whole file during search
 - **P5 safety floor** — ensures even the worst frames meet a minimum quality
 - **HDR & color preservation** — carries over color primaries, transfer, matrix, and range
@@ -87,7 +87,7 @@ The script uses an adaptive search (similar to Newton's method) to converge on t
 4. **Encode** — full video is encoded at the best CQ found
 5. **Verify** — full-file VMAF is measured. If it falls short, CQ is stepped down and re-encoded (up to 3 attempts)
 6. **P5 safety** — if the 5th percentile VMAF (worst frames) is below the floor, CQ is stepped down further
-7. **Bitrate floor** — for 4K+ content, if the output bitrate falls below the minimum threshold (4 Mbps for 2160p), CQ is stepped down until the floor is met
+7. **Bitrate floor** — if the output video bitrate falls below the per-resolution minimum, CQ is stepped down until the floor is met
 
 Files that end up *larger* after encoding are automatically deleted.
 
