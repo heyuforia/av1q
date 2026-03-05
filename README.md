@@ -83,7 +83,7 @@ The script uses an adaptive search (similar to Newton's method) to converge on t
 
 1. **Analyze** — scene detection identifies visually distinct segments; frame complexity analysis ranks them
 2. **Sample** — the most complex scenes are extracted as short clips and concatenated
-3. **Search** — the sample is encoded at CQ=28, VMAF is measured, and the next CQ is estimated from the slope of quality-vs-CQ. Repeats until the target is bracketed
+3. **Search** — the sample is encoded at CQ 28, VMAF is measured, and the next CQ is estimated from the slope of quality-vs-CQ. The search estimates a bitrate ceiling from measured data (using the +-6 CRF = 2x bitrate rule, refined with actual measurements) to avoid jumping past the bitrate floor. When the bitrate floor is the binding constraint rather than VMAF, the search switches to bitrate targeting mode — testing additional sample CQs to compute the exact decay rate for the content and interpolating to the CQ that hits the floor. Repeats until the target is bracketed
 4. **Encode** — full video is encoded at the best CQ found
 5. **Verify** — full-file VMAF is measured. If it falls short, CQ is stepped down and re-encoded (up to 3 attempts)
 6. **P5 safety** — if the 5th percentile VMAF (worst frames) is below the floor, CQ is stepped down further
