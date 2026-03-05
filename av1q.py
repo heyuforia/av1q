@@ -95,9 +95,11 @@ def partial_hash(filepath, block=1 << 16):
     return h.hexdigest()
 
 
-def res_tier(height):
+def res_tier(w, h):
+    """Resolution tier based on the short dimension (handles vertical video)."""
+    short = min(w, h)
     for t in (4320, 2160, 1440, 1080, 720):
-        if height >= t:
+        if short >= t:
             return t
     return 0
 
@@ -613,7 +615,7 @@ def search_cq(source, meta, target, cache, cache_path,
     tested = {}
     tested_paths = {}
 
-    min_kbps = MIN_BITRATE_KBPS.get(res_tier(meta["h"]), 0)
+    min_kbps = MIN_BITRATE_KBPS.get(res_tier(meta["w"], meta["h"]), 0)
     src_duration = 0.0
     if min_kbps:
         try:
@@ -826,7 +828,7 @@ def encode_av1(source, dest, meta, cq, cfg):
     if meta["cr"]:
         color_args += ["-color_range", meta["cr"]]
 
-    bitrate = meta.get("bitrate") or FALLBACK_MAXRATE[res_tier(meta["h"])]
+    bitrate = meta.get("bitrate") or FALLBACK_MAXRATE[res_tier(meta["w"], meta["h"])]
     maxrate = min(int(bitrate * cfg["maxrate_factor"]), 100_000_000)
     crf = clamp(cq, 0, 63)
 
@@ -950,7 +952,7 @@ def process_videos(cfg):
                 print(f" {CHECK} Already AV1, skipping")
                 continue
 
-            tier = max(k for k in TARGET_VMAF_BY_RES if meta["h"] >= k)
+            tier = max(k for k in TARGET_VMAF_BY_RES if min(meta["w"], meta["h"]) >= k)
             target = cfg.get("target_vmaf") or TARGET_VMAF_BY_RES[tier]
             min_p5 = target - cfg["vmaf_p5_margin"]
 
@@ -1046,7 +1048,7 @@ def process_videos(cfg):
                     t_enc += time.time() - t0
                 return d
 
-            floor_kbps = MIN_BITRATE_KBPS.get(res_tier(meta["h"]), 0)
+            floor_kbps = MIN_BITRATE_KBPS.get(res_tier(meta["w"], meta["h"]), 0)
             floor_str = f" {DIM}\u00b7{RESET} floor {BOLD}{floor_kbps}kbps{RESET}" if floor_kbps else ""
             print(
                 f"{lbl('target')}VMAF {BOLD}{target:.1f}{RESET}"
@@ -1159,7 +1161,7 @@ def process_videos(cfg):
                 else:
                     break
 
-            min_kbps = MIN_BITRATE_KBPS.get(res_tier(meta["h"]), 0)
+            min_kbps = MIN_BITRATE_KBPS.get(res_tier(meta["w"], meta["h"]), 0)
             if min_kbps and dst_path(best_cq).exists():
                 actual_kbps = calc_kbps(dst_path(best_cq).stat().st_size, meta["duration"])
                 for _ in range(5):
