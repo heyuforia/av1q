@@ -423,7 +423,7 @@ def extract_samples(source, scenes, keyframes, cfg, file_hash=None):
     tag = file_hash or f"{os.getpid()}_{int(time.time() * 1000)}"
     concat_out = sample_dir / f"samples_{tag}.mkv"
     if concat_out.exists() and concat_out.stat().st_size > 0:
-        print(f" {DIM}Samples: {concat_out.stat().st_size / 1e6:.1f}MB (cached){RESET}")
+        print(f"{'':>11}{DIM}Samples: {concat_out.stat().st_size / 1e6:.1f}MB (cached){RESET}")
         return concat_out
 
     ts = int(time.time() * 1000)
@@ -476,7 +476,7 @@ def extract_samples(source, scenes, keyframes, cfg, file_hash=None):
         _temp_files.discard(concat_list)
 
         if concat_out.exists():
-            print(f" {DIM}Samples: {concat_out.stat().st_size / 1e6:.1f}MB{RESET}")
+            print(f"{'':>11}{DIM}Samples: {concat_out.stat().st_size / 1e6:.1f}MB{RESET}")
             return concat_out
     except RuntimeError as e:
         print(f" {RED}Concat error: {e}{RESET}")
@@ -651,10 +651,13 @@ def search_cq(source, meta, target, cache, cache_path,
 
         ref_cq = cqs[0]
         ref_kbps = bitrate_points[ref_cq]
-        if ref_kbps <= min_kbps or decay <= 0:
+        # Target 8% above the floor to account for sample bitrate
+        # overestimating full encode bitrate (samples are complex scenes)
+        effective_floor = min_kbps * 1.08
+        if ref_kbps <= effective_floor or decay <= 0:
             return ref_cq
 
-        delta = math.log(ref_kbps / min_kbps) / decay
+        delta = math.log(ref_kbps / effective_floor) / decay
         return int(math.floor(ref_cq + delta))
 
     def test(cq):
@@ -679,10 +682,10 @@ def search_cq(source, meta, target, cache, cache_path,
         kbps = calc_kbps(dst.stat().st_size, src_duration) if src_duration > 1 else None
         kbps_str = f" {kbps}kbps" if kbps else ""
         print(
-            f" {ORANGE}search{RESET} CQ={BOLD}{cq}{RESET}"
-            f" VMAF={BOLD}{vm['mean']:.2f}{RESET}"
-            f" P5={BOLD}{vm['p5']:.2f}{RESET}"
-            f" {DIM}{sz_mb:.1f}MB{kbps_str}{RESET}"
+            f" {ORANGE}{'search':<10}{RESET}CQ {BOLD}{cq}{RESET}"
+            f"  VMAF {BOLD}{vm['mean']:.2f}{RESET}"
+            f"  P5 {BOLD}{vm['p5']:.2f}{RESET}"
+            f"  {DIM}{sz_mb:.1f}MB{kbps_str}{RESET}"
         )
 
         if kbps:
@@ -691,8 +694,8 @@ def search_cq(source, meta, target, cache, cache_path,
         if min_kbps and src_duration > 1 and kbps and kbps <= min_kbps:
             floor_cap = min(floor_cap, cq - 1)
             print(
-                f" {ORANGE}bitrate{RESET} {kbps}kbps at CQ={cq}"
-                f" below floor ({min_kbps}kbps), capping search at CQ={BOLD}{floor_cap}{RESET}"
+                f" {ORANGE}{'bitrate':<10}{RESET}{kbps}kbps at CQ {cq}"
+                f" below floor ({min_kbps}kbps), capping at CQ {BOLD}{floor_cap}{RESET}"
             )
 
         return cq, vm
@@ -701,6 +704,33 @@ def search_cq(source, meta, target, cache, cache_path,
     if not math.isfinite(vm["mean"]):
         return None, None, enc_time, vmaf_time
 
+    # Bitrate targeting: when VMAF passes but bitrate is at/near the floor,
+    # the VMAF-based search can't help — we need bitrate data to find the
+    # right CQ. Proactively test one step lower to get a second data point,
+    # then interpolate to the CQ that hits the floor exactly.
+    if (min_kbps and vm["mean"] >= target - tol
+            and cq in bitrate_points
+            and bitrate_points[cq] < min_kbps * 1.10
+            and cq - 1 >= min_cq):
+        prev_cq, prev_vm = cq, vm
+        cq, vm = test(cq - 1)
+        if math.isfinite(vm["mean"]):
+            if prev_cq != cq:
+                slope = clamp(
+                    abs(prev_vm["mean"] - vm["mean"]) / abs(prev_cq - cq), 0.1, 1.5
+                )
+            # With two data points, estimate the CQ that hits the floor
+            if len(bitrate_points) >= 2:
+                floor_cq = clamp(estimate_max_cq_for_floor(), min_cq, max_cq)
+                if floor_cq not in tested and floor_cq != cq:
+                    prev_cq, prev_vm = cq, vm
+                    cq, vm = test(floor_cq)
+                    if math.isfinite(vm["mean"]) and prev_cq != cq:
+                        slope = clamp(
+                            abs(prev_vm["mean"] - vm["mean"]) / abs(prev_cq - cq),
+                            0.1, 1.5,
+                        )
+
     for _ in range(4):
         if target - tol <= vm["mean"] <= target + 1.0:
             break
@@ -708,10 +738,15 @@ def search_cq(source, meta, target, cache, cache_path,
         effective_max = min(max_cq, floor_cap, estimate_max_cq_for_floor())
 
         # VMAF is close enough to target and we can't push CQ higher
-        # without hitting the bitrate floor — accept current result
-        if vm["mean"] >= target - tol and vm["mean"] <= target + 2.0 and cq >= effective_max:
+        # without hitting the bitrate floor — accept current result.
+        # Don't accept if the current CQ already violates the floor.
+        cq_violates_floor = (
+            min_kbps and cq in bitrate_points and bitrate_points[cq] < min_kbps
+        )
+        if (vm["mean"] >= target - tol and vm["mean"] <= target + 2.0
+                and cq >= effective_max and not cq_violates_floor):
             print(
-                f" {ORANGE}accept{RESET} VMAF passes and CQ={BOLD}{cq}{RESET}"
+                f" {ORANGE}{'accept':<10}{RESET}VMAF passes and CQ {BOLD}{cq}{RESET}"
                 f" is at bitrate ceiling"
             )
             break
@@ -841,6 +876,10 @@ def process_videos(cfg):
         print(f"{CROSS} ffmpeg/ffprobe not found in PATH")
         return 1
 
+    LBL = 10  # label column width for aligned output
+    def lbl(tag):
+        return f" {ORANGE}{tag:<{LBL}}{RESET}"
+
     print(f"{PURPLE}{BOLD}av1q{RESET}\n{SEP}")
     input_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -887,7 +926,7 @@ def process_videos(cfg):
                             verified = True
                             break
                 if verified:
-                    print(f"{PURPLE}{filepath.name:<30}{RESET} {CHECK} exists")
+                    print(f" {PURPLE}{filepath.name:<30}{RESET} {CHECK} exists")
                     continue
 
             if idx > 1:
@@ -895,6 +934,18 @@ def process_videos(cfg):
             print(f"{PURPLE}{BOLD}[{idx}/{total}]{RESET} {PURPLE}{filepath.name}{RESET}")
 
             meta = probe_video(filepath)
+
+            # File info line
+            in_sz = filepath.stat().st_size
+            res_str = f"{meta['w']}x{meta['h']}" if meta["w"] and meta["h"] else "?"
+            codec_str = (meta["codec"] or "?").upper()
+            sz_str = f"{in_sz / 1e9:.2f}GB" if in_sz >= 1e9 else f"{in_sz / 1e6:.1f}MB"
+            src_kbps = f"{meta['bitrate'] // 1000}kbps" if meta.get("bitrate") else ""
+            dur_str = fmt_time(meta["duration"]) if meta["duration"] > 0 else ""
+            hdr_str = "HDR" if meta["hdr"] else ""
+            info_parts = [p for p in [res_str, codec_str, sz_str, src_kbps, dur_str, hdr_str] if p]
+            print(f"      {DIM}{' \u00b7 '.join(info_parts)}{RESET}")
+
             if meta["codec"] == "av1":
                 print(f" {CHECK} Already AV1, skipping")
                 continue
@@ -917,7 +968,7 @@ def process_videos(cfg):
                         and rec.get("preset") == cfg["preset"]
                         and rec.get("film_grain") == cfg["film_grain"]):
                     existing_cq = rec["cq"]
-                    print(f" {ORANGE}resume{RESET} Using CQ={BOLD}{existing_cq}{RESET} from previous search")
+                    print(f"{lbl('resume')}CQ {BOLD}{existing_cq}{RESET} from previous search")
 
             sample_scenes = sample_src = None
 
@@ -925,12 +976,12 @@ def process_videos(cfg):
                 scene_cfg = {"scene_threshold": cfg["scene_threshold"]}
                 if (all(k in cache for k in ("scenes", "complexity", "keyframes"))
                         and cache.get("scene_cfg") == scene_cfg):
-                    print(f" {ORANGE}cache{RESET} Using cached scene data")
+                    print(f"{lbl('cache')}Using cached scene data")
                     scenes = cache["scenes"]
                     complexity = cache["complexity"]
                     keyframes = cache["keyframes"]
                 else:
-                    print(f" {ORANGE}analyze{RESET} Detecting scenes...")
+                    print(f"{lbl('analyze')}Detecting scenes...")
                     scenes = detect_scenes(filepath, cfg)
                     complexity = analyze_complexity(filepath)
                     keyframes = get_keyframes(filepath)
@@ -949,16 +1000,16 @@ def process_videos(cfg):
                         f"samples from {BOLD}{len(scenes)}{RESET} scenes"
                         if scenes else "keyframe-aligned samples"
                     )
-                    print(f" {ORANGE}scenes{RESET} {BOLD}{len(sample_scenes)}{RESET} {info}")
-                    print(f" {ORANGE}extract{RESET} Extracting samples...")
+                    print(f"{lbl('scenes')}{BOLD}{len(sample_scenes)}{RESET} {info}")
+                    print(f"{lbl('extract')}Extracting samples...")
                     sample_src = extract_samples(filepath, sample_scenes, keyframes, cfg, file_hash=file_hash)
                     if not sample_src:
-                        print(f" {ORANGE}fallback{RESET} Extraction failed, using full encode")
+                        print(f"{lbl('fallback')}Extraction failed, using full encode")
                         sample_scenes = None
                 else:
-                    print(f" {ORANGE}scenes{RESET} Using full VMAF")
+                    print(f"{lbl('scenes')}Using full VMAF")
             elif existing_cq is None:
-                print(f" {ORANGE}short{RESET} <{cfg['short_threshold']}s, full VMAF")
+                print(f"{lbl('short')}<{cfg['short_threshold']}s, full VMAF")
 
             t_enc = t_vmaf = 0.0
             sample_enc_dir = cache_dir / "_sample_enc"
@@ -995,14 +1046,16 @@ def process_videos(cfg):
                     t_enc += time.time() - t0
                 return d
 
+            floor_kbps = MIN_BITRATE_KBPS.get(res_tier(meta["h"]), 0)
+            floor_str = f" {DIM}\u00b7{RESET} floor {BOLD}{floor_kbps}kbps{RESET}" if floor_kbps else ""
             print(
-                f" {ORANGE}target{RESET} VMAF={BOLD}{target:.1f}{RESET}"
-                f" (P5>={BOLD}{min_p5:.1f}{RESET})"
+                f"{lbl('target')}VMAF {BOLD}{target:.1f}{RESET}"
+                f" (P5 >= {BOLD}{min_p5:.1f}{RESET}){floor_str}"
             )
 
             if existing_cq is not None:
                 best_cq = existing_cq
-                print(f" {ORANGE}reuse{RESET} Found existing CQ={BOLD}{existing_cq}{RESET} encode")
+                print(f"{lbl('reuse')}Found existing CQ {BOLD}{existing_cq}{RESET} encode")
             elif sample_src:
                 best_cq, _, _, vt = search_cq(
                     sample_src, meta, target, cache, cp,
@@ -1039,23 +1092,23 @@ def process_videos(cfg):
                 vmaf_str = ""
                 sv = entry.get("sample_full") or entry.get("full")
                 if isinstance(sv, dict):
-                    vmaf_str = f" VMAF={BOLD}{sv['mean']:.2f}{RESET} P5={BOLD}{sv['p5']:.2f}{RESET}"
+                    vmaf_str = f" VMAF {BOLD}{sv['mean']:.2f}{RESET}  P5 {BOLD}{sv['p5']:.2f}{RESET}"
                 elif isinstance(sv, (int, float)):
-                    vmaf_str = f" VMAF={BOLD}{sv:.2f}{RESET}"
-                print(f" {CHECK} Recommended CQ={BOLD}{best_cq}{RESET}{vmaf_str}")
+                    vmaf_str = f" VMAF {BOLD}{sv:.2f}{RESET}"
+                print(f" {CHECK} Recommended CQ {BOLD}{best_cq}{RESET}{vmaf_str}")
                 print(f"   Run without --dry-run to encode")
                 continue
 
             if sample_src or existing_cq is not None:
                 if not dst_path(best_cq).exists():
-                    print(f" {ORANGE}encode{RESET} Final encode at CQ={BOLD}{best_cq}{RESET}...")
+                    print(f"{lbl('encode')}CQ {BOLD}{best_cq}{RESET} final encode...")
                     t0 = time.time()
                     encode_av1(filepath, dst_path(best_cq), meta, best_cq, cfg)
                     t_enc += time.time() - t0
                 else:
-                    print(f" {ORANGE}reuse{RESET} CQ={BOLD}{best_cq}{RESET} encode exists")
+                    print(f"{lbl('reuse')}CQ {BOLD}{best_cq}{RESET} encode exists")
 
-                print(f" {ORANGE}verify{RESET} Full VMAF...")
+                print(f"{lbl('verify')}Full VMAF...")
                 t0 = time.time()
                 best_vmaf = vmaf_cached(
                     filepath, dst_path(best_cq), meta, best_cq,
@@ -1063,8 +1116,8 @@ def process_videos(cfg):
                 )
                 t_vmaf += time.time() - t0
                 print(
-                    f" {ORANGE}full{RESET} VMAF={BOLD}{best_vmaf['mean']:.2f}{RESET}"
-                    f" P5={BOLD}{best_vmaf['p5']:.2f}{RESET}"
+                    f"{'':>{LBL + 1}}VMAF {BOLD}{best_vmaf['mean']:.2f}{RESET}"
+                    f"  P5 {BOLD}{best_vmaf['p5']:.2f}{RESET}"
                 )
 
                 for _ in range(3):
@@ -1073,7 +1126,7 @@ def process_videos(cfg):
                     if best_cq <= cfg["min_cq"]:
                         break
                     try_cq = best_cq - 1
-                    print(f" {ORANGE}adjust{RESET} Trying CQ={BOLD}{try_cq}{RESET}")
+                    print(f"{lbl('adjust')}Trying CQ {BOLD}{try_cq}{RESET}")
                     if not dst_path(try_cq).exists():
                         t0 = time.time()
                         encode_av1(filepath, dst_path(try_cq), meta, try_cq, cfg)
@@ -1093,7 +1146,7 @@ def process_videos(cfg):
                 if best_vmaf["p5"] >= min_p5 or best_cq <= cfg["min_cq"]:
                     break
                 try_cq = best_cq - 1
-                print(f" {ORANGE}safety{RESET} P5 low, trying CQ={BOLD}{try_cq}{RESET}")
+                print(f"{lbl('safety')}P5 low, trying CQ {BOLD}{try_cq}{RESET}")
                 do_enc_full(try_cq)
                 t0 = time.time()
                 safe = vmaf_cached(
@@ -1116,9 +1169,9 @@ def process_videos(cfg):
                         break
                     try_cq = best_cq - 1
                     print(
-                        f" {ORANGE}bitrate{RESET} {actual_kbps}kbps"
+                        f"{lbl('bitrate')}{actual_kbps}kbps"
                         f" < {min_kbps}kbps floor,"
-                        f" trying CQ={BOLD}{try_cq}{RESET}"
+                        f" trying CQ {BOLD}{try_cq}{RESET}"
                     )
                     do_enc_full(try_cq)
                     t0 = time.time()
@@ -1145,7 +1198,6 @@ def process_videos(cfg):
                         pass
 
             out_sz = final.stat().st_size
-            in_sz = filepath.stat().st_size
 
             if out_sz >= in_sz:
                 final.unlink()
@@ -1159,17 +1211,19 @@ def process_videos(cfg):
             saved = (1.0 - out_sz / in_sz) * 100
             out_kbps = calc_kbps(final.stat().st_size, meta["duration"])
             kbps_str = f" ({BOLD}{out_kbps}kbps{RESET})" if out_kbps else ""
-            hdr_tag = f" {ORANGE}[HDR]{RESET}" if meta["hdr"] else ""
+            in_str = f"{in_sz / 1e9:.2f}GB" if in_sz >= 1e9 else f"{in_sz / 1e6:.1f}MB"
+            out_str = f"{out_sz / 1e9:.2f}GB" if out_sz >= 1e9 else f"{out_sz / 1e6:.1f}MB"
+            print(SEP)
             print(
-                f" {CHECK} CQ={BOLD}{best_cq}{RESET}"
-                f" VMAF={BOLD}{best_vmaf['mean']:.2f}{RESET}"
-                f" P5={BOLD}{best_vmaf['p5']:.2f}{RESET}"
+                f" {CHECK} CQ {BOLD}{best_cq}{RESET}"
+                f"  VMAF {BOLD}{best_vmaf['mean']:.2f}{RESET}"
+                f"  P5 {BOLD}{best_vmaf['p5']:.2f}{RESET}"
             )
             print(
-                f" {CHECK} Size={BOLD}{out_sz / 1e6:.1f}MB{RESET}{kbps_str}"
-                f" Saved={BOLD}{saved:.1f}%{RESET}{hdr_tag}"
+                f" {CHECK} {in_str} -> {BOLD}{out_str}{RESET}{kbps_str}"
+                f" saved {BOLD}{saved:.1f}%{RESET}"
             )
-            print(f" {DIM}Enc:{fmt_time(t_enc)} VMAF:{fmt_time(t_vmaf)}{RESET}")
+            print(f"   {DIM}Enc {fmt_time(t_enc)} \u00b7 VMAF {fmt_time(t_vmaf)}{RESET}")
 
             stats["proc"] += 1
             if math.isfinite(best_vmaf["mean"]):
