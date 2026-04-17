@@ -42,6 +42,7 @@ SEP = f"{DIM}{'─' * 48}{RESET}"
 # ── Constants ────────────────────────────────────────────────
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".mov", ".m4v", ".ts", ".avi", ".webm"}
+INTRA_ONLY_CODECS = {"prores", "dnxhd", "mjpeg", "rawvideo", "ffv1", "jpeg2000", "cfhd"}
 
 TARGET_VMAF_BY_RES = {0: 93.0, 720: 94.0, 2160: 90.0}
 
@@ -108,6 +109,67 @@ def calc_kbps(size_bytes, duration):
     if duration < 1.0:
         return None
     return int((size_bytes * 8) / 1000 / duration)
+
+
+def video_kbps(filepath, duration=None):
+    """Video-only bitrate by summing video packet sizes.
+
+    File-size / duration counts muxed audio + subs, which breaks floor
+    comparisons against sample bitrates (samples are -an video-only).
+    """
+    try:
+        if duration is None:
+            duration = probe_video(filepath)["duration"]
+        if not duration or duration < 1.0:
+            return None
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "packet=size", "-of", "csv=p=0", str(filepath)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=300,
+        )
+        if r.returncode != 0:
+            return None
+        total = sum(int(l) for l in r.stdout.splitlines() if l.strip())
+        if total <= 0:
+            return None
+        return int(total * 8 / 1000 / duration)
+    except Exception:
+        return None
+
+
+def effective_sample_floor(min_kbps, margin, calibration=None):
+    """Sample-bitrate threshold that predicts full video clears min_kbps.
+
+    Samples are cut from max-complexity scenes, so they encode at a higher
+    bitrate than the full video at the same CQ. When a measured per-file
+    sample→full ratio is cached, use it; otherwise fall back to the default
+    margin.
+    """
+    if calibration:
+        r = calibration.get("ratio")
+        if isinstance(r, (int, float)) and 0.5 <= r <= 1.0:
+            return min_kbps / r
+    return min_kbps * margin
+
+
+def initial_cq_seed(source_kbps, floor_kbps, min_cq, max_cq, default_cq=30):
+    """Starting CQ tuned to source bitrate headroom over the floor.
+
+    High source/floor ratio = lots of compression headroom → start lower.
+    Low ratio or unknown data → fall back to default_cq. Seeding slightly
+    below the optimal CQ is preferred: it costs marginal bitrate, while
+    seeding above costs a full extra encode to step down.
+    """
+    lo = max(min_cq, min(min_cq + 2, max_cq))
+    hi = max(lo, max_cq - 2)
+    if not source_kbps or not floor_kbps or source_kbps <= 0 or floor_kbps <= 0:
+        return max(min_cq, min(default_cq, max_cq))
+    ratio = source_kbps / floor_kbps
+    if ratio < 1.5:
+        return max(min_cq, min(default_cq, max_cq))
+    cq = round(36 - 4 * math.log2(ratio))
+    return max(lo, min(cq, hi))
 
 
 def clamp(val, lo, hi):
@@ -237,8 +299,8 @@ def detect_scenes(source, cfg):
             if accel:
                 cmd += ["-hwaccel", accel]
             cmd += [
-                "-i", str(source),
-                "-vf", f"scdet=t={cfg['scene_threshold']},"
+                "-i", str(source), "-an",
+                "-vf", f"scale=640:-2,scdet=t={cfg['scene_threshold']},"
                        f"metadata=mode=print:file={log.as_posix()}",
                 "-f", "null", "-",
             ]
@@ -430,7 +492,8 @@ def extract_samples(source, scenes, keyframes, cfg, file_hash=None):
 
     ts = int(time.time() * 1000)
     clips = []
-    keyframes = keyframes or get_keyframes(source)
+    if keyframes is None:
+        keyframes = get_keyframes(source)
 
     for i, sc in enumerate(scenes):
         clip = sample_dir / f"sample_{ts}_{i}.mkv"
@@ -625,156 +688,247 @@ def search_cq(source, meta, target, cache, cache_path,
 
     floor_cap = max_cq
     bitrate_points = {}
+    enc_tag = f"p{cfg['preset']}g{cfg['film_grain']}"
+
+    def eff_floor():
+        # Sample path converts the video floor into a sample-bitrate threshold.
+        # Full path already measures video-only kbps, so compare raw.
+        if not tag:
+            return min_kbps
+        return effective_sample_floor(
+            min_kbps, cfg["bitrate_margin"], cache.get("calibration")
+        )
 
     def estimate_max_cq_for_floor():
-        """Estimate the highest CQ that stays above the bitrate floor.
+        """Highest CQ whose sample bitrate predicts full video at/above floor.
 
-        Uses a log-linear model: log(bitrate) ≈ a - b * CQ.
-        With one point, assumes the standard ±6 CRF ≈ 2x bitrate rule
-        (~10.9% drop per step). With two+ points, uses actual measured decay.
+        Log-linear model: log(bitrate) ≈ a - b * CQ. With two+ points uses
+        measured decay; otherwise falls back to ±6 CRF ≈ 2x bitrate. The
+        floor comparison runs on the calibration-adjusted sample threshold,
+        so this extrapolates in both directions (down when samples already
+        undershoot, up when they're above).
         """
         if not min_kbps or not bitrate_points:
             return max_cq
 
         cqs = sorted(bitrate_points)
-        default_decay = math.log(2) / 6  # ±6 CRF ≈ 2x bitrate
+        default_decay = math.log(2) / 6
 
         if len(cqs) >= 2:
             c1, c2 = cqs[0], cqs[-1]
             b1, b2 = bitrate_points[c1], bitrate_points[c2]
             if b1 > 0 and b2 > 0 and c1 != c2:
                 measured = math.log(b1 / b2) / (c2 - c1)
-                # Film-grain can invert the bitrate curve; fall back if so
                 decay = measured if measured > 0 else default_decay
             else:
                 decay = default_decay
         else:
             decay = default_decay
 
+        if decay <= 0:
+            return cqs[0]
+
         ref_cq = cqs[0]
         ref_kbps = bitrate_points[ref_cq]
-        # Target 8% above the floor to account for sample bitrate
-        # overestimating full encode bitrate (samples are complex scenes)
-        effective_floor = min_kbps * 1.08
-        if ref_kbps <= effective_floor or decay <= 0:
-            return ref_cq
-
-        delta = math.log(ref_kbps / effective_floor) / decay
+        delta = math.log(ref_kbps / eff_floor()) / decay
         return int(math.floor(ref_cq + delta))
 
-    def test(cq):
+    def test(cq, measure_vmaf=True):
         nonlocal enc_time, vmaf_time, floor_cap
         cq = clamp(cq, min_cq, max_cq)
         if cq in tested:
+            # Upgrade a previously-skipped VMAF measurement if now needed
+            if measure_vmaf and not math.isfinite(
+                tested[cq].get("mean", float("nan"))
+            ) and cq in tested_paths and tested_paths[cq].exists():
+                t0 = time.time()
+                tested[cq] = vmaf_cached(
+                    source, tested_paths[cq], meta, cq,
+                    cache, cache_path, threads, tag=tag,
+                )
+                vmaf_time += time.time() - t0
             return cq, tested[cq]
 
         t0 = time.time()
         dst = enc_func(cq)
         enc_time += time.time() - t0
 
-        t0 = time.time()
-        vm = vmaf_cached(
-            source, dst, meta, cq, cache, cache_path, threads, tag=tag
-        )
-        vmaf_time += time.time() - t0
+        if measure_vmaf:
+            t0 = time.time()
+            vm = vmaf_cached(
+                source, dst, meta, cq, cache, cache_path, threads, tag=tag
+            )
+            vmaf_time += time.time() - t0
+        else:
+            vm = {"mean": float("nan"), "p5": float("nan")}
 
         tested[cq] = vm
         tested_paths[cq] = dst
         sz_mb = dst.stat().st_size / 1e6 if dst.exists() else 0
-        kbps = calc_kbps(dst.stat().st_size, src_duration) if src_duration > 1 else None
+        # Samples are -an (extract_samples strips audio), so calc_kbps is
+        # already video-only. Full encodes carry muxed audio/subs — use
+        # video_kbps to isolate the video stream for floor comparisons.
+        if src_duration > 1:
+            kbps = calc_kbps(dst.stat().st_size, src_duration) if tag else video_kbps(dst, src_duration)
+        else:
+            kbps = None
         kbps_str = f" {kbps}kbps" if kbps else ""
+        vmaf_field = (
+            f"  VMAF {BOLD}{vm['mean']:.2f}{RESET}  P5 {BOLD}{vm['p5']:.2f}{RESET}"
+            if math.isfinite(vm["mean"])
+            else f"  {DIM}VMAF skipped{RESET}"
+        )
         print(
             f" {ORANGE}{'search':<10}{RESET}CQ {BOLD}{cq}{RESET}"
-            f"  VMAF {BOLD}{vm['mean']:.2f}{RESET}"
-            f"  P5 {BOLD}{vm['p5']:.2f}{RESET}"
+            f"{vmaf_field}"
             f"  {DIM}{sz_mb:.1f}MB{kbps_str}{RESET}"
         )
 
         if kbps:
             bitrate_points[cq] = kbps
+            if tag:
+                cache["entries"].setdefault(str(cq), {})[
+                    f"{tag}_kbps_{enc_tag}"
+                ] = kbps
+                tmp = cache_path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(cache), encoding="utf-8")
+                tmp.replace(cache_path)
 
-        if min_kbps and src_duration > 1 and kbps and kbps <= min_kbps:
-            floor_cap = min(floor_cap, cq - 1)
-            print(
-                f" {ORANGE}{'bitrate':<10}{RESET}{kbps}kbps at CQ {cq}"
-                f" below floor ({min_kbps}kbps), capping at CQ {BOLD}{floor_cap}{RESET}"
-            )
+        if min_kbps and src_duration > 1 and kbps:
+            ef = eff_floor()
+            if kbps <= ef:
+                floor_cap = min(floor_cap, cq - 1)
+                label = "sample" if tag else "video"
+                print(
+                    f" {ORANGE}{'bitrate':<10}{RESET}{kbps}kbps {label} at CQ {cq}"
+                    f" below {min_kbps}kbps floor"
+                    f" (threshold {int(ef)}kbps), capping at CQ {BOLD}{floor_cap}{RESET}"
+                )
 
         return cq, vm
 
-    cq, vm = test(28)
+    # Seed the first CQ from source bitrate instead of a hardcoded 30.
+    # High source/floor ratio has more compression headroom, so we start
+    # closer to the answer. Falls back to 30 when source bitrate or floor
+    # is unknown.
+    src_kbps_hint = None
+    if meta.get("bitrate"):
+        src_kbps_hint = int(meta["bitrate"] / 1000)
+    seed_cq = initial_cq_seed(src_kbps_hint, min_kbps, min_cq, max_cq)
+    if seed_cq != 30:
+        print(
+            f" {ORANGE}{'seed':<10}{RESET}CQ {BOLD}{seed_cq}{RESET}"
+            f" {DIM}(source {src_kbps_hint or '?'}kbps vs floor {min_kbps or '-'}kbps){RESET}"
+        )
+
+    cq, vm = test(seed_cq)
     if not math.isfinite(vm["mean"]):
         return None, None, enc_time, vmaf_time
 
-    # Bitrate targeting: when VMAF passes but bitrate is at/near the floor,
-    # the VMAF-based search can't help — we need bitrate data to find the
-    # right CQ. Proactively test one step lower to get a second data point,
-    # then interpolate to the CQ that hits the floor exactly.
-    if (min_kbps and vm["mean"] >= target - tol
+    # Floor-bound detection: VMAF comfortably above target AND bitrate well
+    # below floor. In this regime VMAF is not binding — it's a pure bitrate
+    # targeting problem. Skip VMAF on intermediate probes; verify once on
+    # the final candidate. Monotonicity (lower CQ → higher VMAF) keeps this
+    # safe as long as the seed test already cleared target.
+    floor_bound = bool(
+        min_kbps and vm["mean"] > target + 2.0
+        and cq in bitrate_points
+        and bitrate_points[cq] < eff_floor() * 0.80
+    )
+    if floor_bound:
+        print(
+            f" {ORANGE}{'mode':<10}{RESET}floor-bound "
+            f"{DIM}(skipping VMAF on intermediate probes){RESET}"
+        )
+
+    # Proactive bitrate jump: go straight to the extrapolated floor CQ.
+    if (min_kbps and (floor_bound or vm["mean"] >= target - tol)
             and cq in bitrate_points
-            and bitrate_points[cq] < min_kbps * 1.10
+            and bitrate_points[cq] < eff_floor() * 1.10
             and cq - 1 >= min_cq):
-        prev_cq, prev_vm = cq, vm
-        cq, vm = test(cq - 1)
-        if math.isfinite(vm["mean"]):
+        floor_cq = clamp(estimate_max_cq_for_floor(), min_cq, cq - 1)
+        if floor_cq != cq and floor_cq not in tested:
+            prev_cq, prev_vm = cq, vm
+            cq, vm = test(floor_cq, measure_vmaf=not floor_bound)
+            if (math.isfinite(vm["mean"]) and math.isfinite(prev_vm["mean"])
+                    and prev_cq != cq):
+                slope = clamp(
+                    abs(prev_vm["mean"] - vm["mean"]) / abs(prev_cq - cq),
+                    0.1, 1.5,
+                )
+
+    if floor_bound:
+        # Bitrate-only convergence: keep picking the estimated floor CQ
+        # until we bracket it; accept when at the ceiling with floor met.
+        for _ in range(4):
+            effective_max = min(max_cq, floor_cap, estimate_max_cq_for_floor())
+            current_kbps = bitrate_points.get(cq, 0)
+            cq_violates_floor = (
+                cq in bitrate_points and bitrate_points[cq] < eff_floor()
+            )
+            if (cq >= effective_max and current_kbps >= min_kbps
+                    and not cq_violates_floor):
+                print(
+                    f" {ORANGE}{'accept':<10}{RESET}bitrate floor met at"
+                    f" CQ {BOLD}{cq}{RESET}"
+                )
+                break
+
+            next_cq = clamp(estimate_max_cq_for_floor(), min_cq, effective_max)
+            if next_cq == cq and current_kbps < min_kbps and cq - 1 >= min_cq:
+                next_cq = cq - 1
+            if next_cq == cq or next_cq in tested:
+                break
+
+            cq, vm = test(next_cq, measure_vmaf=False)
+            if cq not in bitrate_points:
+                break
+    else:
+        for _ in range(4):
+            if target - tol <= vm["mean"] <= target + 1.0:
+                break
+            delta = (vm["mean"] - target) / slope
+            effective_max = min(max_cq, floor_cap, estimate_max_cq_for_floor())
+
+            # At the CQ ceiling (can't go higher without violating floor),
+            # accept any overshoot as long as VMAF meets target and this
+            # CQ's bitrate isn't already below the predicted floor.
+            cq_violates_floor = (
+                min_kbps and cq in bitrate_points
+                and bitrate_points[cq] < eff_floor()
+            )
+            if (vm["mean"] >= target - tol
+                    and cq >= effective_max and not cq_violates_floor):
+                print(
+                    f" {ORANGE}{'accept':<10}{RESET}VMAF passes and CQ"
+                    f" {BOLD}{cq}{RESET} is at bitrate ceiling"
+                )
+                break
+
+            next_cq = clamp(int(round(cq + delta)), min_cq, effective_max)
+            if next_cq == cq:
+                next_cq = cq + (1 if vm["mean"] > target else -1)
+            next_cq = clamp(next_cq, min_cq, effective_max)
+            if next_cq == cq or next_cq in tested:
+                break
+
+            prev_cq, prev_vm = cq, vm
+            cq, vm = test(next_cq)
+            if not math.isfinite(vm["mean"]):
+                break
             if prev_cq != cq:
                 slope = clamp(
                     abs(prev_vm["mean"] - vm["mean"]) / abs(prev_cq - cq), 0.1, 1.5
                 )
-            # With two data points, estimate the CQ that hits the floor
-            if len(bitrate_points) >= 2:
-                floor_cq = clamp(estimate_max_cq_for_floor(), min_cq, max_cq)
-                if floor_cq not in tested and floor_cq != cq:
-                    prev_cq, prev_vm = cq, vm
-                    cq, vm = test(floor_cq)
-                    if math.isfinite(vm["mean"]) and prev_cq != cq:
-                        slope = clamp(
-                            abs(prev_vm["mean"] - vm["mean"]) / abs(prev_cq - cq),
-                            0.1, 1.5,
-                        )
-
-    for _ in range(4):
-        if target - tol <= vm["mean"] <= target + 1.0:
-            break
-        delta = (vm["mean"] - target) / slope
-        effective_max = min(max_cq, floor_cap, estimate_max_cq_for_floor())
-
-        # VMAF is close enough to target and we can't push CQ higher
-        # without hitting the bitrate floor — accept current result.
-        # Don't accept if the current CQ already violates the floor.
-        cq_violates_floor = (
-            min_kbps and cq in bitrate_points and bitrate_points[cq] < min_kbps
-        )
-        if (vm["mean"] >= target - tol and vm["mean"] <= target + 2.0
-                and cq >= effective_max and not cq_violates_floor):
-            print(
-                f" {ORANGE}{'accept':<10}{RESET}VMAF passes and CQ {BOLD}{cq}{RESET}"
-                f" is at bitrate ceiling"
-            )
-            break
-
-        next_cq = clamp(int(round(cq + delta)), min_cq, effective_max)
-        if next_cq == cq:
-            next_cq = cq + (1 if vm["mean"] > target else -1)
-        next_cq = clamp(next_cq, min_cq, effective_max)
-        if next_cq == cq or next_cq in tested:
-            break
-
-        prev_cq, prev_vm = cq, vm
-        cq, vm = test(next_cq)
-        if not math.isfinite(vm["mean"]):
-            break
-        if prev_cq != cq:
-            slope = clamp(
-                abs(prev_vm["mean"] - vm["mean"]) / abs(prev_cq - cq), 0.1, 1.5
-            )
 
     def valid_cq(c):
-        if not math.isfinite(tested[c]["mean"]) or tested[c]["mean"] < target - tol:
+        vm_c = tested[c]
+        if math.isfinite(vm_c["mean"]) and vm_c["mean"] < target - tol:
             return False
         if min_kbps and src_duration > 1 and c in tested_paths:
-            kbps = calc_kbps(tested_paths[c].stat().st_size, src_duration)
-            if kbps and kbps < min_kbps:
+            path = tested_paths[c]
+            kbps = calc_kbps(path.stat().st_size, src_duration) if tag else video_kbps(path, src_duration)
+            if kbps and kbps < eff_floor():
                 return False
         return True
 
@@ -784,6 +938,20 @@ def search_cq(source, meta, target, cache, cache_path,
             (c for c in tested if math.isfinite(tested[c]["mean"])),
             key=lambda c: tested[c]["mean"], default=None,
         )
+
+    # Guarantee a VMAF measurement on the returned candidate (floor-bound
+    # path may have skipped it). Monotonicity makes a failure here very
+    # unlikely — floor-bound only triggers when the seed already cleared
+    # target by 2, and every subsequent probe is at lower CQ (higher VMAF).
+    if (best is not None and not math.isfinite(tested[best]["mean"])
+            and best in tested_paths and tested_paths[best].exists()):
+        t0 = time.time()
+        tested[best] = vmaf_cached(
+            source, tested_paths[best], meta, best,
+            cache, cache_path, threads, tag=tag,
+        )
+        vmaf_time += time.time() - t0
+
     return best, tested.get(best), enc_time, vmaf_time
 
 
@@ -975,23 +1143,29 @@ def process_videos(cfg):
             sample_scenes = sample_src = None
 
             if existing_cq is None and meta["duration"] >= cfg["short_threshold"]:
-                scene_cfg = {"scene_threshold": cfg["scene_threshold"]}
-                if (all(k in cache for k in ("scenes", "complexity", "keyframes"))
-                        and cache.get("scene_cfg") == scene_cfg):
-                    print(f"{lbl('cache')}Using cached scene data")
-                    scenes = cache["scenes"]
-                    complexity = cache["complexity"]
-                    keyframes = cache["keyframes"]
+                if meta["codec"] in INTRA_ONLY_CODECS:
+                    print(f"{lbl('skip')}Intra-only codec ({meta['codec']}), using even samples")
+                    scenes = []
+                    complexity = []
+                    keyframes = []
                 else:
-                    print(f"{lbl('analyze')}Detecting scenes...")
-                    scenes = detect_scenes(filepath, cfg)
-                    complexity = analyze_complexity(filepath)
-                    keyframes = get_keyframes(filepath)
-                    cache.update(scenes=scenes, complexity=complexity,
-                                 keyframes=keyframes, scene_cfg=scene_cfg)
-                    tmp = cp.with_suffix(".json.tmp")
-                    tmp.write_text(json.dumps(cache), encoding="utf-8")
-                    tmp.replace(cp)
+                    scene_cfg = {"scene_threshold": cfg["scene_threshold"]}
+                    if (all(k in cache for k in ("scenes", "complexity", "keyframes"))
+                            and cache.get("scene_cfg") == scene_cfg):
+                        print(f"{lbl('cache')}Using cached scene data")
+                        scenes = cache["scenes"]
+                        complexity = cache["complexity"]
+                        keyframes = cache["keyframes"]
+                    else:
+                        print(f"{lbl('analyze')}Detecting scenes...")
+                        scenes = detect_scenes(filepath, cfg)
+                        complexity = analyze_complexity(filepath)
+                        keyframes = get_keyframes(filepath)
+                        cache.update(scenes=scenes, complexity=complexity,
+                                     keyframes=keyframes, scene_cfg=scene_cfg)
+                        tmp = cp.with_suffix(".json.tmp")
+                        tmp.write_text(json.dumps(cache), encoding="utf-8")
+                        tmp.replace(cp)
 
                 sample_scenes = select_samples(
                     scenes, complexity, meta["duration"],
@@ -1000,7 +1174,7 @@ def process_videos(cfg):
                 if sample_scenes:
                     info = (
                         f"samples from {BOLD}{len(scenes)}{RESET} scenes"
-                        if scenes else "keyframe-aligned samples"
+                        if scenes else "evenly-spaced samples"
                     )
                     print(f"{lbl('scenes')}{BOLD}{len(sample_scenes)}{RESET} {info}")
                     print(f"{lbl('extract')}Extracting samples...")
@@ -1163,15 +1337,53 @@ def process_videos(cfg):
 
             min_kbps = MIN_BITRATE_KBPS.get(res_tier(meta["w"], meta["h"]), 0)
             if min_kbps and dst_path(best_cq).exists():
-                actual_kbps = calc_kbps(dst_path(best_cq).stat().st_size, meta["duration"])
+                actual_kbps = video_kbps(dst_path(best_cq), meta["duration"])
+
+                enc_tag_cfg = f"p{cfg['preset']}g{cfg['film_grain']}"
+                sample_kbps_key = f"sample_kbps_{enc_tag_cfg}"
+                sample_pts = {
+                    int(k): v[sample_kbps_key]
+                    for k, v in cache.get("entries", {}).items()
+                    if isinstance(v, dict) and sample_kbps_key in v
+                }
+                sample_at_best = sample_pts.get(best_cq)
+                if sample_at_best and actual_kbps and sample_at_best > 0:
+                    ratio = actual_kbps / sample_at_best
+                    if 0.5 <= ratio <= 1.0:
+                        cache["calibration"] = {
+                            "ratio": ratio, "at_cq": best_cq,
+                            "enc_tag": enc_tag_cfg, "t": time.time(),
+                        }
+                        tmp = cp.with_suffix(".json.tmp")
+                        tmp.write_text(json.dumps(cache), encoding="utf-8")
+                        tmp.replace(cp)
+                        print(
+                            f"{lbl('calibr')}sample {sample_at_best}kbps ->"
+                            f" video {actual_kbps}kbps (ratio {ratio:.2f})"
+                        )
+
+                default_decay = math.log(2) / 6
                 for _ in range(5):
                     if not actual_kbps or actual_kbps >= min_kbps:
                         break
                     if best_cq <= cfg["min_cq"]:
                         break
-                    try_cq = best_cq - 1
+
+                    decay = default_decay
+                    if len(sample_pts) >= 2:
+                        cqs_s = sorted(sample_pts)
+                        c1, c2 = cqs_s[0], cqs_s[-1]
+                        b1, b2 = sample_pts[c1], sample_pts[c2]
+                        if b1 > 0 and b2 > 0 and c1 != c2:
+                            m = math.log(b1 / b2) / (c2 - c1)
+                            if m > 0:
+                                decay = m
+                    needed = math.log(min_kbps / actual_kbps) / decay
+                    step = max(1, int(math.ceil(needed)))
+                    try_cq = max(cfg["min_cq"], best_cq - step)
+
                     print(
-                        f"{lbl('bitrate')}{actual_kbps}kbps"
+                        f"{lbl('bitrate')}video {actual_kbps}kbps"
                         f" < {min_kbps}kbps floor,"
                         f" trying CQ {BOLD}{try_cq}{RESET}"
                     )
@@ -1183,9 +1395,7 @@ def process_videos(cfg):
                     )
                     t_vmaf += time.time() - t0
                     best_cq, best_vmaf = try_cq, adj
-                    actual_kbps = calc_kbps(
-                        dst_path(best_cq).stat().st_size, meta["duration"]
-                    )
+                    actual_kbps = video_kbps(dst_path(best_cq), meta["duration"])
 
             final = dst_path(best_cq)
             if not final.exists():
@@ -1354,6 +1564,7 @@ def main():
         "target_vmaf": args.vmaf,
         "vmaf_p5_margin": 5.0,
         "vmaf_tolerance": 0.1,
+        "bitrate_margin": 1.20,
         "dry_run": args.dry_run,
         "sample_count": args.samples,
         "sample_duration": 6.0,
