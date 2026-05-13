@@ -185,6 +185,99 @@ def fmt_time(seconds):
     return f"{m}m {s}s" if m else f"{s}s"
 
 
+def _run_ffmpeg_progress(cmd, duration, label):
+    """Run ffmpeg with -progress pipe:1 and render an inline progress bar.
+
+    Parses key=value blocks on stdout; uses out_time_us against the known
+    source duration so the bar stays accurate even when fps/bitrate vary
+    (SVT-AV1 lookahead, scene changes). Falls back to silent run_cmd when
+    stdout is not a TTY (logs, redirected output).
+    """
+    if not sys.stdout.isatty():
+        run_cmd(cmd)
+        return
+
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, bufsize=1,
+    )
+    state = {}
+    last_render = 0.0
+    active = False
+    bar_w = 20
+
+    def render(final=False):
+        nonlocal last_render, active
+        last_render = time.time()
+        try:
+            t = int(state.get("out_time_us", "0")) / 1_000_000
+        except ValueError:
+            t = 0.0
+        pct = max(0.0, min(100.0, t / duration * 100)) if duration > 0 else 0.0
+        if final:
+            pct = 100.0
+        speed_val = None
+        sp = state.get("speed", "").strip()
+        if sp.endswith("x"):
+            try:
+                speed_val = float(sp[:-1])
+            except ValueError:
+                pass
+        filled = int(bar_w * pct / 100)
+        bar = "█" * filled + "░" * (bar_w - filled)
+        parts = [f"{BOLD}{pct:5.1f}%{RESET}"]
+        if not final and speed_val and speed_val > 0 and duration > 0:
+            remaining = max(0, (duration - t) / speed_val)
+            parts.append(f"{fmt_time(remaining)} left")
+            parts.append(f"{speed_val:.2f}x")
+        sys.stdout.write(
+            f"\r\033[K{label} {DIM}[{bar}]{RESET} {'  '.join(parts)}"
+        )
+        sys.stdout.flush()
+        active = True
+
+    def finish():
+        nonlocal active
+        if active:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            active = False
+
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if not line or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            state[key] = val
+            if key != "progress":
+                continue
+            if val == "end":
+                render(final=True)
+                break
+            if time.time() - last_render < 0.2:
+                continue
+            render()
+        proc.wait()
+        if proc.returncode != 0:
+            stderr_data = proc.stderr.read() if proc.stderr else ""
+            tail = "\n".join((stderr_data or "").splitlines()[-80:])
+            raise RuntimeError(
+                f"ffmpeg exit {proc.returncode}\n"
+                f"{subprocess.list2cmdline(cmd) if os.name == 'nt' else ' '.join(map(shlex.quote, cmd))}"
+                f"\n{tail}"
+            )
+    except BaseException:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        proc.wait()
+        raise
+    finally:
+        finish()
+
+
 # ── Hardware Acceleration ────────────────────────────────────
 
 
@@ -972,7 +1065,7 @@ def load_cache(cache_dir, file_hash, sig):
 # ── Encoding ─────────────────────────────────────────────────
 
 
-def encode_av1(source, dest, meta, cq, cfg):
+def encode_av1(source, dest, meta, cq, cfg, show_progress=False):
     """Encode video to AV1 using SVT-AV1 via ffmpeg."""
     pix = (
         "yuv420p10le"
@@ -1024,7 +1117,14 @@ def encode_av1(source, dest, meta, cq, cfg):
         *color_args, str(tmp),
     ]
 
-    run_cmd(cmd)
+    duration = meta.get("duration") or 0.0
+    if show_progress and duration > 1.0:
+        out_path = cmd.pop()
+        cmd += ["-progress", "pipe:1", out_path]
+        label = f" {ORANGE}{'encode':<10}{RESET}CQ {BOLD}{cq}{RESET}"
+        _run_ffmpeg_progress(cmd, duration, label)
+    else:
+        run_cmd(cmd)
 
     if dest.exists():
         dest.unlink()
@@ -1218,7 +1318,7 @@ def process_videos(cfg):
                 d = dst_path(cq)
                 if not d.exists():
                     t0 = time.time()
-                    encode_av1(filepath, d, meta, cq, cfg)
+                    encode_av1(filepath, d, meta, cq, cfg, show_progress=True)
                     t_enc += time.time() - t0
                 return d
 
@@ -1277,9 +1377,8 @@ def process_videos(cfg):
 
             if sample_src or existing_cq is not None:
                 if not dst_path(best_cq).exists():
-                    print(f"{lbl('encode')}CQ {BOLD}{best_cq}{RESET} final encode...")
                     t0 = time.time()
-                    encode_av1(filepath, dst_path(best_cq), meta, best_cq, cfg)
+                    encode_av1(filepath, dst_path(best_cq), meta, best_cq, cfg, show_progress=True)
                     t_enc += time.time() - t0
                 else:
                     print(f"{lbl('reuse')}CQ {BOLD}{best_cq}{RESET} encode exists")
@@ -1305,7 +1404,7 @@ def process_videos(cfg):
                     print(f"{lbl('adjust')}Trying CQ {BOLD}{try_cq}{RESET}")
                     if not dst_path(try_cq).exists():
                         t0 = time.time()
-                        encode_av1(filepath, dst_path(try_cq), meta, try_cq, cfg)
+                        encode_av1(filepath, dst_path(try_cq), meta, try_cq, cfg, show_progress=True)
                         t_enc += time.time() - t0
                     t0 = time.time()
                     adj = vmaf_cached(
