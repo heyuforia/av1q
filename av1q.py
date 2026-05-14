@@ -1027,10 +1027,13 @@ def search_cq(source, meta, target, cache, cache_path,
 
     best = max((c for c in tested if valid_cq(c)), default=None)
     if best is None:
-        best = max(
-            (c for c in tested if math.isfinite(tested[c]["mean"])),
-            key=lambda c: tested[c]["mean"], default=None,
-        )
+        # No CQ satisfies both VMAF target and bitrate floor in the
+        # tested range. Prefer the lowest CQ tested — highest bitrate
+        # (best shot at the floor) and highest VMAF by monotonicity.
+        # The original code returned max-VMAF here, which in floor-bound
+        # mode meant the seed CQ that violated the floor — forcing the
+        # caller to re-encode the full source to push CQ lower.
+        best = min(tested) if tested else None
 
     # Guarantee a VMAF measurement on the returned candidate (floor-bound
     # path may have skipped it). Monotonicity makes a failure here very
@@ -1045,7 +1048,19 @@ def search_cq(source, meta, target, cache, cache_path,
         )
         vmaf_time += time.time() - t0
 
-    return best, tested.get(best), enc_time, vmaf_time
+    # Slopes for caller's post-search refinement
+    bitrate_decay = math.log(2) / 6  # default: ±6 CRF ≈ 2× bitrate
+    if len(bitrate_points) >= 2:
+        cqs_b = sorted(bitrate_points)
+        c1b, c2b = cqs_b[0], cqs_b[-1]
+        b1, b2 = bitrate_points[c1b], bitrate_points[c2b]
+        if b1 > 0 and b2 > 0 and c1b != c2b:
+            m = math.log(b1 / b2) / (c2b - c1b)
+            if m > 0:
+                bitrate_decay = m
+    state = {"vmaf_slope": slope, "bitrate_decay": bitrate_decay}
+
+    return best, tested.get(best), enc_time, vmaf_time, state
 
 
 # ── Cache ────────────────────────────────────────────────────
@@ -1176,6 +1191,7 @@ def process_videos(cfg):
     for idx, filepath in enumerate(files, 1):
         sample_src = None
         _file_error = False
+        search_state = None
         try:
             rel = filepath.parent.relative_to(input_dir)
             out_dir = output_dir / rel
@@ -1333,8 +1349,23 @@ def process_videos(cfg):
                 best_cq = existing_cq
                 print(f"{lbl('reuse')}Found existing CQ {BOLD}{existing_cq}{RESET} encode")
             elif sample_src:
-                best_cq, _, _, vt = search_cq(
-                    sample_src, meta, target, cache, cp,
+                # Apply learned VMAF offset (sample over/under-predicts
+                # full VMAF for this file) so the sample search aims at
+                # the CQ that will hit `target` on the full video.
+                sample_target = target
+                cal_v = cache.get("calibration")
+                if isinstance(cal_v, dict):
+                    off = cal_v.get("vmaf_offset")
+                    if (isinstance(off, (int, float))
+                            and -3.0 <= off <= 3.0 and abs(off) >= 0.1):
+                        sample_target = clamp(target + off, 0.0, 100.0)
+                        print(
+                            f"{lbl('calibr')}sample target"
+                            f" {BOLD}{sample_target:.2f}{RESET}"
+                            f" {DIM}(offset {off:+.2f}){RESET}"
+                        )
+                best_cq, _, _, vt, search_state = search_cq(
+                    sample_src, meta, sample_target, cache, cp,
                     do_enc_sample, vmaf_threads, cfg, tag="sample",
                 )
                 t_vmaf += vt
@@ -1353,7 +1384,7 @@ def process_videos(cfg):
                     except OSError:
                         pass
             else:
-                best_cq, best_vmaf, _, vt = search_cq(
+                best_cq, best_vmaf, _, vt, search_state = search_cq(
                     filepath, meta, target, cache, cp,
                     do_enc_full, vmaf_threads, cfg,
                 )
@@ -1375,6 +1406,9 @@ def process_videos(cfg):
                 print(f"   Run without --dry-run to encode")
                 continue
 
+            min_kbps = MIN_BITRATE_KBPS.get(res_tier(meta["w"], meta["h"]), 0)
+
+            # Final full encode at the candidate CQ + VMAF verify
             if sample_src or existing_cq is not None:
                 if not dst_path(best_cq).exists():
                     t0 = time.time()
@@ -1395,106 +1429,148 @@ def process_videos(cfg):
                     f"  P5 {BOLD}{best_vmaf['p5']:.2f}{RESET}"
                 )
 
-                for _ in range(3):
-                    if best_vmaf["mean"] >= target - cfg["vmaf_tolerance"]:
-                        break
-                    if best_cq <= cfg["min_cq"]:
-                        break
-                    try_cq = best_cq - 1
-                    print(f"{lbl('adjust')}Trying CQ {BOLD}{try_cq}{RESET}")
-                    if not dst_path(try_cq).exists():
-                        t0 = time.time()
-                        encode_av1(filepath, dst_path(try_cq), meta, try_cq, cfg, show_progress=True)
-                        t_enc += time.time() - t0
-                    t0 = time.time()
-                    adj = vmaf_cached(
-                        filepath, dst_path(try_cq), meta, try_cq,
-                        cache, cp, vmaf_threads,
+            # Persist sample↔full calibration BEFORE the refine loop so
+            # a resumed or repeated run of this file starts with both
+            # the bitrate ratio and the VMAF offset. The original code
+            # only tracked the bitrate ratio, leaving VMAF mispredict
+            # entirely up to repeated full re-encodes.
+            enc_tag_cfg = f"p{cfg['preset']}g{cfg['film_grain']}"
+            entry_at_best = cache.get("entries", {}).get(str(best_cq), {})
+            sample_kbps_at_best = entry_at_best.get(f"sample_kbps_{enc_tag_cfg}")
+            sample_vmaf_at_best = entry_at_best.get("sample_full")
+            actual_kbps_now = (
+                video_kbps(dst_path(best_cq), meta["duration"])
+                if meta["duration"] > 1 and dst_path(best_cq).exists()
+                else None
+            )
+
+            cal_now = cache.get("calibration")
+            cal_now = dict(cal_now) if isinstance(cal_now, dict) else {}
+            cal_updated = False
+
+            if (sample_kbps_at_best and actual_kbps_now
+                    and sample_kbps_at_best > 0):
+                ratio = actual_kbps_now / sample_kbps_at_best
+                if 0.5 <= ratio <= 1.0:
+                    cal_now["ratio"] = ratio
+                    cal_updated = True
+                    print(
+                        f"{lbl('calibr')}sample {sample_kbps_at_best}kbps ->"
+                        f" video {actual_kbps_now}kbps (ratio {ratio:.2f})"
                     )
-                    t_vmaf += time.time() - t0
-                    if math.isfinite(adj["mean"]) and adj["mean"] > best_vmaf["mean"]:
-                        best_cq, best_vmaf = try_cq, adj
-                    else:
-                        break
+
+            if (sample_vmaf_at_best is not None and best_vmaf
+                    and math.isfinite(sample_vmaf_at_best)
+                    and math.isfinite(best_vmaf.get("mean", float("nan")))):
+                offset = sample_vmaf_at_best - best_vmaf["mean"]
+                if -3.0 <= offset <= 3.0:
+                    cal_now["vmaf_offset"] = offset
+                    cal_updated = True
+
+            if search_state and search_state.get("vmaf_slope"):
+                sl = search_state["vmaf_slope"]
+                if 0.1 <= sl <= 2.0:
+                    cal_now["vmaf_slope"] = sl
+                    cal_updated = True
+
+            if cal_updated:
+                cal_now["at_cq"] = best_cq
+                cal_now["enc_tag"] = enc_tag_cfg
+                cal_now["t"] = time.time()
+                cache["calibration"] = cal_now
+                tmp = cp.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(cache), encoding="utf-8")
+                tmp.replace(cp)
+
+            # Consolidated refine for VMAF + P5 + bitrate-floor deficits.
+            # Issue #3: the previous code ran three separate loops, each
+            # stepping CQ by 1 with a fresh full encode every iteration —
+            # easily 3-4× full encodes per source. This loop computes all
+            # deficits at once, takes the largest slope-required jump,
+            # and converges in 1-2 encodes.
+            slope_v = clamp(
+                (search_state.get("vmaf_slope") if search_state else None) or 0.5,
+                0.1, 2.0,
+            )
+            decay_b = clamp(
+                (search_state.get("bitrate_decay") if search_state else None)
+                or (math.log(2) / 6),
+                0.05, 0.4,
+            )
+            full_points = {}
+            if best_vmaf and math.isfinite(best_vmaf.get("mean", float("nan"))):
+                full_points[best_cq] = best_vmaf["mean"]
 
             for _ in range(3):
-                if best_vmaf["p5"] >= min_p5 or best_cq <= cfg["min_cq"]:
+                deficits = []
+                if best_vmaf and math.isfinite(best_vmaf.get("mean", float("nan"))):
+                    d = target - best_vmaf["mean"]
+                    if d > cfg["vmaf_tolerance"]:
+                        deficits.append(
+                            ("VMAF", d, max(1, int(math.ceil(d / slope_v))))
+                        )
+                if best_vmaf and math.isfinite(best_vmaf.get("p5", float("nan"))):
+                    d = min_p5 - best_vmaf["p5"]
+                    if d > 0:
+                        deficits.append(
+                            ("P5", d, max(1, int(math.ceil(d / slope_v))))
+                        )
+                if min_kbps and meta["duration"] > 1 and dst_path(best_cq).exists():
+                    actual_kbps = video_kbps(dst_path(best_cq), meta["duration"])
+                    if actual_kbps and actual_kbps < min_kbps:
+                        step_b = max(
+                            1,
+                            int(math.ceil(
+                                math.log(min_kbps / actual_kbps) / decay_b
+                            )),
+                        )
+                        deficits.append(("bitrate", min_kbps - actual_kbps, step_b))
+
+                if not deficits:
                     break
-                try_cq = best_cq - 1
-                print(f"{lbl('safety')}P5 low, trying CQ {BOLD}{try_cq}{RESET}")
-                do_enc_full(try_cq)
+                if best_cq <= cfg["min_cq"]:
+                    short_names = ", ".join(n for n, _, _ in deficits)
+                    print(
+                        f"{lbl('refine')}at min CQ {BOLD}{cfg['min_cq']}{RESET},"
+                        f" accepting ({short_names} short)"
+                    )
+                    break
+
+                step = max(s for _, _, s in deficits)
+                try_cq = max(cfg["min_cq"], best_cq - step)
+                if try_cq == best_cq or try_cq in full_points:
+                    break
+
+                reasons = ", ".join(n for n, _, _ in deficits)
+                print(
+                    f"{lbl('refine')}{reasons} short -> CQ {BOLD}{try_cq}{RESET}"
+                    f" {DIM}(jump {step}){RESET}"
+                )
+                if not dst_path(try_cq).exists():
+                    t0 = time.time()
+                    encode_av1(filepath, dst_path(try_cq), meta, try_cq, cfg, show_progress=True)
+                    t_enc += time.time() - t0
                 t0 = time.time()
-                safe = vmaf_cached(
+                adj = vmaf_cached(
                     filepath, dst_path(try_cq), meta, try_cq,
                     cache, cp, vmaf_threads,
                 )
                 t_vmaf += time.time() - t0
-                if math.isfinite(safe["p5"]) and safe["p5"] > best_vmaf["p5"]:
-                    best_cq, best_vmaf = try_cq, safe
-                else:
+                if not math.isfinite(adj.get("mean", float("nan"))):
                     break
-
-            min_kbps = MIN_BITRATE_KBPS.get(res_tier(meta["w"], meta["h"]), 0)
-            if min_kbps and dst_path(best_cq).exists():
-                actual_kbps = video_kbps(dst_path(best_cq), meta["duration"])
-
-                enc_tag_cfg = f"p{cfg['preset']}g{cfg['film_grain']}"
-                sample_kbps_key = f"sample_kbps_{enc_tag_cfg}"
-                sample_pts = {
-                    int(k): v[sample_kbps_key]
-                    for k, v in cache.get("entries", {}).items()
-                    if isinstance(v, dict) and sample_kbps_key in v
-                }
-                sample_at_best = sample_pts.get(best_cq)
-                if sample_at_best and actual_kbps and sample_at_best > 0:
-                    ratio = actual_kbps / sample_at_best
-                    if 0.5 <= ratio <= 1.0:
-                        cache["calibration"] = {
-                            "ratio": ratio, "at_cq": best_cq,
-                            "enc_tag": enc_tag_cfg, "t": time.time(),
-                        }
-                        tmp = cp.with_suffix(".json.tmp")
-                        tmp.write_text(json.dumps(cache), encoding="utf-8")
-                        tmp.replace(cp)
-                        print(
-                            f"{lbl('calibr')}sample {sample_at_best}kbps ->"
-                            f" video {actual_kbps}kbps (ratio {ratio:.2f})"
-                        )
-
-                default_decay = math.log(2) / 6
-                for _ in range(5):
-                    if not actual_kbps or actual_kbps >= min_kbps:
-                        break
-                    if best_cq <= cfg["min_cq"]:
-                        break
-
-                    decay = default_decay
-                    if len(sample_pts) >= 2:
-                        cqs_s = sorted(sample_pts)
-                        c1, c2 = cqs_s[0], cqs_s[-1]
-                        b1, b2 = sample_pts[c1], sample_pts[c2]
-                        if b1 > 0 and b2 > 0 and c1 != c2:
-                            m = math.log(b1 / b2) / (c2 - c1)
-                            if m > 0:
-                                decay = m
-                    needed = math.log(min_kbps / actual_kbps) / decay
-                    step = max(1, int(math.ceil(needed)))
-                    try_cq = max(cfg["min_cq"], best_cq - step)
-
-                    print(
-                        f"{lbl('bitrate')}video {actual_kbps}kbps"
-                        f" < {min_kbps}kbps floor,"
-                        f" trying CQ {BOLD}{try_cq}{RESET}"
-                    )
-                    do_enc_full(try_cq)
-                    t0 = time.time()
-                    adj = vmaf_cached(
-                        filepath, dst_path(try_cq), meta, try_cq,
-                        cache, cp, vmaf_threads,
-                    )
-                    t_vmaf += time.time() - t0
-                    best_cq, best_vmaf = try_cq, adj
-                    actual_kbps = video_kbps(dst_path(best_cq), meta["duration"])
+                print(
+                    f"{'':>{LBL + 1}}VMAF {BOLD}{adj['mean']:.2f}{RESET}"
+                    f"  P5 {BOLD}{adj['p5']:.2f}{RESET}"
+                )
+                best_cq, best_vmaf = try_cq, adj
+                full_points[try_cq] = adj["mean"]
+                if len(full_points) >= 2:
+                    cqs_v = sorted(full_points)
+                    c1v, c2v = cqs_v[0], cqs_v[-1]
+                    if c1v != c2v:
+                        m = (full_points[c1v] - full_points[c2v]) / (c2v - c1v)
+                        if m > 0:
+                            slope_v = clamp(m, 0.1, 2.0)
 
             final = dst_path(best_cq)
             if not final.exists():
