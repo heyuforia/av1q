@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-av1q-crop — Detect letterbox/pillarbox crop for av1q.
+av1q-crop — Batch letterbox/pillarbox crop detection for av1q.
 
 Writes a sidecar JSON (<file>.crop.json) beside each source. av1q reads
-these via --use-crops to remove black bars during encoding.
+these automatically (use --no-crops to ignore). For a one-step workflow,
+run av1q.py --auto-crop instead — it does the same detection inline
+before each encode.
 
 Conservative by design: only marks high-confidence crops for auto-apply.
 Ambiguous results (dark sources, mixed aspect ratios) are written with
@@ -11,201 +13,21 @@ confidence="low" for manual review — never silently applied.
 """
 
 import argparse
-import collections
 import json
-import os
-import subprocess
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.dont_write_bytecode = True  # don't litter the script dir with __pycache__
 from av1q import (
     VIDEO_EXTENSIONS,
-    GREEN, ORANGE, PURPLE, RED, RESET, BOLD, DIM, CHECK, CROSS, SEP,
-    _temp_files,
+    PURPLE, RESET, BOLD, DIM, CHECK, CROSS, SEP,
     cleanup_temp,
     partial_hash,
     probe_video,
-    detect_hwaccel,
-    detect_scenes,
-    analyze_complexity,
-    get_keyframes,
-    select_samples,
+    detect_crop_for_file,
 )
-
-
-def detect_crop_window(source, start, duration, limit, round_to, cache_dir):
-    """Run cropdetect on a single time window. Returns (w, h, x, y) or None."""
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    log = cache_dir / f"crop_{os.getpid()}_{int(time.time() * 1_000_000)}.txt"
-    _temp_files.add(log)
-    # ffmpeg's filter graph parser uses ':' as the option separator, so
-    # Windows drive colons in the metadata file path must be double-escaped
-    # (one level for the graph, one for the option value).
-    log_path = log.as_posix().replace(":", "\\\\:")
-
-    try:
-        hw = detect_hwaccel()
-        attempts = [hw, None] if hw else [None]
-
-        last_err = ""
-        for accel in attempts:
-            cmd = ["ffmpeg", "-hide_banner", "-v", "error"]
-            if accel:
-                cmd += ["-hwaccel", accel]
-            cmd += [
-                "-ss", f"{start:.3f}",
-                "-i", str(source),
-                "-t", f"{duration:.3f}",
-                "-an", "-sn",
-                "-vf",
-                f"cropdetect=limit={limit}:round={round_to}:reset_count=0,"
-                f"metadata=mode=print:file={log_path}",
-                "-f", "null", "-",
-            ]
-            r = subprocess.run(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, timeout=120,
-            )
-            if r.returncode == 0:
-                break
-            last_err = r.stderr
-        else:
-            return None
-
-        if not log.exists():
-            return None
-
-        w = h = x = y = None
-        for line in log.read_text(encoding="utf-8", errors="ignore").splitlines():
-            line = line.strip()
-            if "lavfi.cropdetect.w=" in line:
-                try:
-                    w = int(line.split("=")[-1])
-                except ValueError:
-                    pass
-            elif "lavfi.cropdetect.h=" in line:
-                try:
-                    h = int(line.split("=")[-1])
-                except ValueError:
-                    pass
-            elif "lavfi.cropdetect.x=" in line:
-                try:
-                    x = int(line.split("=")[-1])
-                except ValueError:
-                    pass
-            elif "lavfi.cropdetect.y=" in line:
-                try:
-                    y = int(line.split("=")[-1])
-                except ValueError:
-                    pass
-
-        if None in (w, h, x, y) or w <= 0 or h <= 0:
-            return None
-        return (w, h, x, y)
-
-    finally:
-        try:
-            if log.exists():
-                log.unlink()
-        except OSError:
-            pass
-        _temp_files.discard(log)
-
-
-def aggregate_crops(windows, frame_w, frame_h, min_keep_ratio, agree_ratio):
-    """Aggregate window crops via bounding-box union.
-
-    cropdetect on dark or noisy scenes typically returns crops that are
-    SMALLER than the truth — it mistakes shadowed picture edges for bars
-    and shaves a few pixels off. Exact-tuple matching (Counter.most_common)
-    then scatters these near-identical detections into many distinct
-    values and falsely reports "mixed aspect ratios". The fix: take the
-    bounding-box union of every window's detected picture rectangle.
-    Smaller noise-variants and catastrophic outliers (a fade scene's tiny
-    crop) sit inside the union and don't shift it.
-
-    Confidence: count windows whose detected area is within ~10% of the
-    union area. Real misdetects fall far below this threshold and don't
-    damage the result. True mixed-aspect content (IMAX-style scenes)
-    produces an oversized union → "none" or low keep-ratio → flagged.
-    """
-    AREA_AGREE = 0.90  # window's area must be >= 90% of union to "match"
-
-    valid = [c for c in windows if c is not None]
-    n_total = len(windows)
-    n_valid = len(valid)
-
-    if n_valid == 0:
-        return {
-            "crop": None, "confidence": "low",
-            "reason": "no windows returned crop values (source too dark or unreadable)",
-        }
-
-    if n_valid < n_total * 0.7:
-        return {
-            "crop": None, "confidence": "low",
-            "reason": (
-                f"only {n_valid}/{n_total} windows returned valid crops "
-                f"(likely many dark scenes)"
-            ),
-        }
-
-    # Bounding box of all detected picture rectangles, clamped to frame.
-    # cropdetect with round=2 returns even-aligned values, so the bbox
-    # stays even-aligned for chroma 4:2:0 without extra rounding.
-    x_min = min(c[2] for c in valid)
-    y_min = min(c[3] for c in valid)
-    x_max = min(frame_w, max(c[2] + c[0] for c in valid))
-    y_max = min(frame_h, max(c[3] + c[1] for c in valid))
-    w = x_max - x_min
-    h = y_max - y_min
-    x = x_min
-    y = y_min
-
-    if w >= frame_w and h >= frame_h:
-        return {
-            "crop": None, "confidence": "none",
-            "reason": "full frame — no letterbox/pillarbox detected",
-        }
-
-    union_area = w * h
-    threshold = union_area * AREA_AGREE
-    matching = sum(1 for c in valid if c[0] * c[1] >= threshold)
-    agreement = matching / n_valid
-
-    if agreement < agree_ratio:
-        return {
-            "crop": (w, h, x, y), "confidence": "low",
-            "reason": (
-                f"only {matching}/{n_valid} windows align with union crop "
-                f"{w}x{h} (within {int((1 - AREA_AGREE) * 100)}% area); "
-                f"likely mixed aspect ratios"
-            ),
-        }
-
-    keep_ratio = (w * h) / (frame_w * frame_h)
-    if keep_ratio < min_keep_ratio:
-        return {
-            "crop": (w, h, x, y), "confidence": "low",
-            "reason": (
-                f"detected crop keeps only {keep_ratio:.0%} of frame; "
-                f"below safety floor of {min_keep_ratio:.0%} "
-                f"(rerun with --min-keep-ratio if intentional)"
-            ),
-        }
-
-    return {
-        "crop": (w, h, x, y), "confidence": "high",
-        "reason": (
-            f"union of {n_valid} windows, {matching}/{n_valid} match "
-            f"within {int((1 - AREA_AGREE) * 100)}% "
-            f"({keep_ratio:.0%} of frame kept)"
-        ),
-    }
 
 
 def process_file(source, cfg):
@@ -224,114 +46,9 @@ def process_file(source, cfg):
         print(f"  {CROSS} invalid source dimensions or duration")
         return
 
-    is_hdr = meta["hdr"] or "10le" in meta["pix_fmt"]
-    limit = cfg["limit_hdr"] if is_hdr else cfg["limit_sdr"]
-    print(
-        f"  {ORANGE}{'probe':<10}{RESET}"
-        f"{meta['w']}x{meta['h']} "
-        f"{DIM}{'HDR' if is_hdr else 'SDR'} · limit={limit}{RESET}"
-    )
-
-    sample_cfg = {
-        "scene_threshold": cfg["scene_threshold"],
-        "cache_dir": cfg["cache_dir"],
-        "short_threshold": cfg["short_threshold"],
-        "sample_duration": cfg["window_duration"],
-        "min_scene_duration": 2.0,
-    }
-
-    safe_start = meta["duration"] * 0.05
-    safe_end = meta["duration"] * 0.95
-
-    scenes = []
-    complexity = []
-    keyframes = []
-    if meta["duration"] >= cfg["short_threshold"]:
-        scenes = detect_scenes(source, sample_cfg)
-        complexity = analyze_complexity(source)
-        keyframes = get_keyframes(source)
-
-    samples = None
-    if scenes:
-        scoped = [s for s in scenes if safe_start <= s["time"] <= safe_end]
-        if scoped:
-            samples = select_samples(
-                scoped, complexity, meta["duration"],
-                cfg["sample_count"], keyframes, sample_cfg,
-            )
-
-    if not samples:
-        n = cfg["sample_count"]
-        span = max(0.0, safe_end - safe_start)
-        if span <= 0:
-            n = 1
-            span = max(meta["duration"], 1.0)
-            safe_start = 0.0
-        samples = [
-            {"time": safe_start + span * (i + 0.5) / n,
-             "duration": cfg["window_duration"]}
-            for i in range(n)
-        ]
-        print(f"  {DIM}using fixed grid ({n} windows){RESET}")
-    else:
-        print(
-            f"  {DIM}{len(samples)} scene-windows · "
-            f"{cfg['window_duration']:.0f}s each{RESET}"
-        )
-
-    crops = []
-    for i, s in enumerate(samples):
-        c = detect_crop_window(
-            source, s["time"], cfg["window_duration"],
-            limit, cfg["round"], cfg["cache_dir"],
-        )
-        crops.append(c)
-        marker = CHECK if c else CROSS
-        cstr = f"{c[0]}:{c[1]}:{c[2]}:{c[3]}" if c else "—"
-        print(
-            f"  {DIM}window {i + 1}/{len(samples)} @ "
-            f"{s['time']:.0f}s {marker} {cstr}{RESET}"
-        )
-
-    result = aggregate_crops(
-        crops, meta["w"], meta["h"],
-        cfg["min_keep_ratio"], cfg["agree_ratio"],
-    )
-
-    sidecar_data = {
-        "version": 1,
-        "source_hash": partial_hash(source),
-        "source_name": source.name,
-        "frame_width": meta["w"],
-        "frame_height": meta["h"],
-        "hdr": is_hdr,
-        "limit": limit,
-        "round": cfg["round"],
-        "confidence": result["confidence"],
-        "reason": result["reason"],
-        "windows": [
-            {
-                "time": round(s["time"], 2),
-                "crop": (f"{c[0]}:{c[1]}:{c[2]}:{c[3]}" if c else None),
-            }
-            for s, c in zip(samples, crops)
-        ],
-        "detected_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    if result["crop"]:
-        w, h, x, y = result["crop"]
-        sidecar_data.update({"width": w, "height": h, "x": x, "y": y})
-
-    conf = result["confidence"]
-    color = GREEN if conf == "high" else (ORANGE if conf == "low" else DIM)
-    if result["crop"]:
-        w, h, x, y = result["crop"]
-        out = f"crop={w}:{h}:{x}:{y}"
-    else:
-        out = "no crop"
-    print(
-        f"  {color}{BOLD}{conf:<10}{RESET}{out}  "
-        f"{DIM}({result['reason']}){RESET}"
+    file_hash = partial_hash(source)
+    sidecar_data = detect_crop_for_file(
+        source, meta, cfg, file_hash, label_prefix="  ",
     )
 
     if cfg["dry_run"]:
