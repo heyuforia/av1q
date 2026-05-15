@@ -11,7 +11,7 @@ Drop videos into a folder, run the script, and each file gets encoded to AV1 at 
 1. **Detects scenes** and extracts short representative samples from complex parts of the video
 2. **Searches for the optimal CQ** by encoding only the samples — not the full file — and measuring VMAF after each attempt
 3. **Encodes the full video** at the chosen CQ, then verifies the final VMAF score matches the target
-4. **Adjusts automatically** if the full encode doesn't meet quality thresholds (mean VMAF and P5 floor)
+4. **Refines in 1-2 passes** if any constraint comes up short — VMAF, P5 floor, or bitrate floor — using the measured quality/bitrate slopes to jump directly to the right CQ rather than stepping by one
 
 ## Features
 
@@ -23,6 +23,7 @@ Drop videos into a folder, run the script, and each file gets encoded to AV1 at 
 - **HDR & color preservation** — carries over color primaries, transfer, matrix, and range
 - **10-bit output** by default, film grain synthesis included
 - **Hardware-accelerated decoding** — CUDA, D3D11VA (Windows), VideoToolbox (macOS), VAAPI (Linux)
+- **Optional auto-crop** — companion script `av1q-crop.py` detects letterbox/pillarbox bars and writes sidecar JSON; av1q auto-applies confidence-gated crops at encode time
 - **File-based caching** — skips re-analysis and re-measurement on subsequent runs
 - **Batch processing** with recursive subdirectory support
 - **Cross-platform** — Windows, macOS, Linux
@@ -60,6 +61,15 @@ python av1q.py -i /path/to/videos -o /path/to/output
 python av1q.py --vmaf 95 --preset 6
 ```
 
+**Auto-crop letterboxed or pillarboxed videos** — run the companion script first, then encode normally. Sidecars are picked up automatically:
+
+```
+python av1q-crop.py
+python av1q.py
+```
+
+`av1q-crop.py` writes a `<file>.crop.json` next to each source. av1q auto-applies any sidecar marked `confidence: "high"` and silently skips `low` / `none` ones (those are for manual review). Pass `--no-crops` to av1q to ignore sidecars without deleting them.
+
 ### Options
 
 | Flag | Default | Description |
@@ -76,6 +86,7 @@ python av1q.py --vmaf 95 --preset 6
 | `--no-recurse` | — | Don't process subdirectories |
 | `--overwrite` | — | Re-encode even if output exists |
 | `--dry-run` | — | Find optimal CQ but skip final encoding |
+| `--no-crops` | — | Ignore `*.crop.json` sidecars (auto-applied by default) |
 
 ## How it works
 
@@ -85,9 +96,8 @@ The script uses an adaptive search (similar to Newton's method) to converge on t
 2. **Sample** — the most complex scenes are extracted as short clips and concatenated
 3. **Search** — the sample is encoded at a seed CQ derived from the source's bitrate headroom over the floor (higher headroom → lower starting CQ; falls back to 30 when unknown), VMAF is measured, and the next CQ is estimated from the slope of quality-vs-CQ. The search estimates a bitrate ceiling from measured data (using the +-6 CRF = 2x bitrate rule, refined with actual measurements) to avoid jumping past the bitrate floor. When the bitrate floor is the binding constraint rather than VMAF, the search switches to bitrate targeting mode — testing additional sample CQs to compute the exact decay rate for the content and interpolating to the CQ that hits the floor. Repeats until the target is bracketed
 4. **Encode** — full video is encoded at the best CQ found
-5. **Verify** — full-file VMAF is measured. If it falls short, CQ is stepped down and re-encoded (up to 3 attempts)
-6. **P5 safety** — if the 5th percentile VMAF (worst frames) is below the floor, CQ is stepped down further
-7. **Bitrate floor** — if the output bitrate falls below the per-resolution minimum, CQ is stepped down until the floor is met
+5. **Verify & refine** — full-file VMAF, P5 (5th-percentile worst-frame quality), and bitrate are measured against their targets. If any one is short, the next CQ is computed from the measured quality/bitrate slopes — converges in 1-2 iterations rather than stepping by one per constraint
+6. **Calibrate** — sample-vs-full deltas (bitrate ratio, VMAF offset, slope) are cached, so a re-run or resume of the same file aims at the right CQ on the first probe
 
 Files that end up *larger* after encoding are automatically deleted.
 
