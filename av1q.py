@@ -223,15 +223,26 @@ def _run_ffmpeg_progress(cmd, duration, label):
                 speed_val = float(sp[:-1])
             except ValueError:
                 pass
+        fps_val = None
+        try:
+            fps_val = float(state.get("fps", "0"))
+        except ValueError:
+            pass
         filled = int(bar_w * pct / 100)
-        bar = "█" * filled + "░" * (bar_w - filled)
+        bar = (
+            f"{DIM}[{RESET}"
+            f"{GREEN}{'█' * filled}{RESET}"
+            f"{DIM}{'░' * (bar_w - filled)}]{RESET}"
+        )
         parts = [f"{BOLD}{pct:5.1f}%{RESET}"]
         if not final and speed_val and speed_val > 0 and duration > 0:
             remaining = max(0, (duration - t) / speed_val)
             parts.append(f"{fmt_time(remaining)} left")
             parts.append(f"{speed_val:.2f}x")
+        if not final and fps_val and fps_val > 0:
+            parts.append(f"{fps_val:.1f}fps")
         sys.stdout.write(
-            f"\r\033[K{label} {DIM}[{bar}]{RESET} {'  '.join(parts)}"
+            f"\r\033[K{label} {bar} {'  '.join(parts)}"
         )
         sys.stdout.flush()
         active = True
@@ -1424,9 +1435,11 @@ def process_videos(cfg):
                     cache, cp, vmaf_threads,
                 )
                 t_vmaf += time.time() - t0
+                vc = GREEN if best_vmaf["mean"] >= target - cfg["vmaf_tolerance"] else ""
+                pc = GREEN if best_vmaf["p5"] >= min_p5 else ""
                 print(
-                    f"{'':>{LBL + 1}}VMAF {BOLD}{best_vmaf['mean']:.2f}{RESET}"
-                    f"  P5 {BOLD}{best_vmaf['p5']:.2f}{RESET}"
+                    f"{'':>{LBL + 1}}VMAF {BOLD}{vc}{best_vmaf['mean']:.2f}{RESET}"
+                    f"  P5 {BOLD}{pc}{best_vmaf['p5']:.2f}{RESET}"
                 )
 
             # Persist sample↔full calibration BEFORE the refine loop so
@@ -1558,9 +1571,11 @@ def process_videos(cfg):
                 t_vmaf += time.time() - t0
                 if not math.isfinite(adj.get("mean", float("nan"))):
                     break
+                vc_a = GREEN if adj["mean"] >= target - cfg["vmaf_tolerance"] else ""
+                pc_a = GREEN if adj["p5"] >= min_p5 else ""
                 print(
-                    f"{'':>{LBL + 1}}VMAF {BOLD}{adj['mean']:.2f}{RESET}"
-                    f"  P5 {BOLD}{adj['p5']:.2f}{RESET}"
+                    f"{'':>{LBL + 1}}VMAF {BOLD}{vc_a}{adj['mean']:.2f}{RESET}"
+                    f"  P5 {BOLD}{pc_a}{adj['p5']:.2f}{RESET}"
                 )
                 best_cq, best_vmaf = try_cq, adj
                 full_points[try_cq] = adj["mean"]
@@ -1600,15 +1615,17 @@ def process_videos(cfg):
             kbps_str = f" ({BOLD}{out_kbps}kbps{RESET})" if out_kbps else ""
             in_str = f"{in_sz / 1e9:.2f}GB" if in_sz >= 1e9 else f"{in_sz / 1e6:.1f}MB"
             out_str = f"{out_sz / 1e9:.2f}GB" if out_sz >= 1e9 else f"{out_sz / 1e6:.1f}MB"
+            vc = GREEN if best_vmaf["mean"] >= target - cfg["vmaf_tolerance"] else ""
+            pc = GREEN if best_vmaf["p5"] >= min_p5 else ""
             print(SEP)
             print(
                 f" {CHECK} CQ {BOLD}{best_cq}{RESET}"
-                f"  VMAF {BOLD}{best_vmaf['mean']:.2f}{RESET}"
-                f"  P5 {BOLD}{best_vmaf['p5']:.2f}{RESET}"
+                f"  VMAF {BOLD}{vc}{best_vmaf['mean']:.2f}{RESET}"
+                f"  P5 {BOLD}{pc}{best_vmaf['p5']:.2f}{RESET}"
             )
             print(
                 f" {CHECK} {in_str} -> {BOLD}{out_str}{RESET}{kbps_str}"
-                f" saved {BOLD}{saved:.1f}%{RESET}"
+                f" saved {GREEN}{BOLD}{saved:.1f}%{RESET}"
             )
             print(f"   {DIM}Enc {fmt_time(t_enc)} \u00b7 VMAF {fmt_time(t_vmaf)}{RESET}")
 
@@ -1642,8 +1659,8 @@ def process_videos(cfg):
         print(f"{CHECK} Processed: {BOLD}{stats['proc']}{RESET}")
         print(f"{CHECK} Avg VMAF: {BOLD}{avg:.2f}{RESET}")
         print(
-            f"{CHECK} Saved: {BOLD}{stats['saved'] / 1e9:.2f}GB{RESET}"
-            f" ({BOLD}{pct:.1f}%{RESET})"
+            f"{CHECK} Saved: {GREEN}{BOLD}{stats['saved'] / 1e9:.2f}GB{RESET}"
+            f" ({GREEN}{BOLD}{pct:.1f}%{RESET})"
         )
         if stats["deleted"] > 0:
             print(f"{ORANGE} Deleted: {BOLD}{stats['deleted']}{RESET}")
