@@ -393,6 +393,9 @@ def detect_scenes(source, cfg):
     log = cache_dir / f"scdet_{os.getpid()}_{int(time.time() * 1000)}.txt"
     cache_dir.mkdir(parents=True, exist_ok=True)
     _temp_files.add(log)
+    # Filter-graph colons collide with Windows drive-letter colons; needs
+    # double-escape to survive both parsing stages.
+    log_path = log.as_posix().replace(":", "\\\\:")
 
     try:
         hw = detect_hwaccel()
@@ -405,7 +408,7 @@ def detect_scenes(source, cfg):
             cmd += [
                 "-i", str(source), "-an",
                 "-vf", f"scale=640:-2,scdet=t={cfg['scene_threshold']},"
-                       f"metadata=mode=print:file={log.as_posix()}",
+                       f"metadata=mode=print:file={log_path}",
                 "-f", "null", "-",
             ]
             r = subprocess.run(
@@ -657,18 +660,24 @@ def extract_samples(source, scenes, keyframes, cfg, file_hash=None):
 
 def measure_vmaf(ref, dist, meta, subsample, threads, cache_dir):
     """Compute VMAF score between reference and distorted video."""
-    filters = []
     fps = get_fps(dist)
 
-    filters.append("setpts=PTS-STARTPTS")  # normalize MP4 edit lists
-    if fps:
-        filters.append(f"fps={fps}")
+    def build_chain(with_crop):
+        # Crop only applies to the ref chain: dist was already encoded with
+        # crop applied, so its frames are pre-cropped. Cropping it again here
+        # would shave off real picture content and silently tank VMAF.
+        f = ["setpts=PTS-STARTPTS"]  # normalize MP4 edit lists
+        if fps:
+            f.append(f"fps={fps}")
+        if with_crop and meta.get("crop"):
+            f.append(f"crop={meta['crop']}")
+        if meta["hdr"] or "10le" in meta["pix_fmt"]:
+            f += ["zscale=t=bt709:m=bt709:r=tv:p=709", "tonemap=hable:desat=0"]
+        f.append("format=yuv420p")
+        return ",".join(f)
 
-    if meta["hdr"] or "10le" in meta["pix_fmt"]:
-        filters += ["zscale=t=bt709:m=bt709:r=tv:p=709", "tonemap=hable:desat=0"]
-    filters.append("format=yuv420p")
-
-    pf = ",".join(filters)
+    pf_ref = build_chain(with_crop=True)
+    pf_dist = build_chain(with_crop=False)
     cache_dir.mkdir(parents=True, exist_ok=True)
     log = cache_dir / f"vmaf_{os.getpid()}_{int(time.time() * 1000)}.json"
     _temp_files.add(log)
@@ -691,7 +700,7 @@ def measure_vmaf(ref, dist, meta, subsample, threads, cache_dir):
             cmd += ["-i", str(dist)]
             cmd += [
                 "-filter_complex",
-                f"[0:v]{pf}[r];[1:v]{pf}[d];"
+                f"[0:v]{pf_ref}[r];[1:v]{pf_dist}[d];"
                 f"[d][r]libvmaf=model=version={model}:"
                 f"n_subsample={subsample}{th}:"
                 f"log_fmt=json:log_path='{log_esc}'",
@@ -1088,6 +1097,34 @@ def load_cache(cache_dir, file_hash, sig):
     return {"sig": sig, "entries": {}}, cp
 
 
+def load_crop_sidecar(filepath, file_hash):
+    """Read <file>.crop.json from av1q-crop. Returns 'W:H:X:Y' or None.
+
+    Only confidence='high' sidecars are auto-applied; 'low' is for manual
+    review. Hash mismatch means the file was replaced after detection.
+    """
+    sidecar = filepath.with_suffix(filepath.suffix + ".crop.json")
+    if not sidecar.exists():
+        return None
+    try:
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if data.get("confidence") != "high":
+        return None
+    if data.get("source_hash") and data["source_hash"] != file_hash:
+        return None
+    try:
+        w, h, x, y = data["width"], data["height"], data["x"], data["y"]
+    except KeyError:
+        return None
+    if not all(isinstance(v, int) and v >= 0 for v in (w, h, x, y)):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return f"{w}:{h}:{x}:{y}"
+
+
 # ── Encoding ─────────────────────────────────────────────────
 
 
@@ -1124,10 +1161,15 @@ def encode_av1(source, dest, meta, cq, cfg, show_progress=False):
     fg = cfg["film_grain"]
     svt_params = f"tune=0:film-grain={fg}:film-grain-denoise=0:enable-tf=0:enable-overlays=1:scd=1"
 
+    vf_args = []
+    if meta.get("crop"):
+        vf_args = ["-vf", f"crop={meta['crop']}"]
+
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats",
         "-i", str(source),
         "-map", "0:v:0", "-map", "0:a?", "-map", "0:s?",
+        *vf_args,
         "-c:a", "copy", "-c:s", "copy",
         "-pix_fmt", pix,
         "-c:v", "libsvtav1",
@@ -1246,6 +1288,13 @@ def process_videos(cfg):
             if meta["codec"] == "av1":
                 print(f" {CHECK} Already AV1, skipping")
                 continue
+
+            meta["crop"] = None
+            if cfg["use_crops"]:
+                crop = load_crop_sidecar(filepath, file_hash)
+                if crop:
+                    meta["crop"] = crop
+                    print(f"{lbl('crop')}{BOLD}{crop}{RESET}")
 
             tier = max(k for k in TARGET_VMAF_BY_RES if min(meta["w"], meta["h"]) >= k)
             target = cfg.get("target_vmaf") or TARGET_VMAF_BY_RES[tier]
@@ -1731,6 +1780,11 @@ def main():
         "--dry-run", action="store_true",
         help="Find optimal CQ but skip final encoding",
     )
+    parser.add_argument(
+        "--no-crops", action="store_true",
+        help="Ignore <file>.crop.json sidecars (otherwise auto-applied when present "
+             "and confidence=high)",
+    )
 
     args = parser.parse_args()
 
@@ -1758,6 +1812,7 @@ def main():
         "vmaf_tolerance": 0.1,
         "bitrate_margin": 1.20,
         "dry_run": args.dry_run,
+        "use_crops": not args.no_crops,
         "sample_count": args.samples,
         "sample_duration": 6.0,
         "min_scene_duration": 2.0,
