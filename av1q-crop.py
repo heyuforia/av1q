@@ -117,17 +117,24 @@ def detect_crop_window(source, start, duration, limit, round_to, cache_dir):
 
 
 def aggregate_crops(windows, frame_w, frame_h, min_keep_ratio, agree_ratio):
-    """Take mode across windows, apply confidence rules.
+    """Aggregate window crops via bounding-box union.
 
-    Window agreement is the primary trust signal: misdetects happen on
-    specific frames (fades, dark scenes) so they make windows disagree.
-    A crop that every window returns identically is real even when
-    aggressive (e.g. 9:16 vertical content in a 16:9 frame keeps only
-    ~32% of pixels but is detected unanimously).
+    cropdetect on dark or noisy scenes typically returns crops that are
+    SMALLER than the truth — it mistakes shadowed picture edges for bars
+    and shaves a few pixels off. Exact-tuple matching (Counter.most_common)
+    then scatters these near-identical detections into many distinct
+    values and falsely reports "mixed aspect ratios". The fix: take the
+    bounding-box union of every window's detected picture rectangle.
+    Smaller noise-variants and catastrophic outliers (a fade scene's tiny
+    crop) sit inside the union and don't shift it.
 
-    Mode (not median) handles outlier windows naturally — HandBrake uses
-    median and over-crops on dark/mixed-aspect content (long-known bug).
+    Confidence: count windows whose detected area is within ~10% of the
+    union area. Real misdetects fall far below this threshold and don't
+    damage the result. True mixed-aspect content (IMAX-style scenes)
+    produces an oversized union → "none" or low keep-ratio → flagged.
     """
+    AREA_AGREE = 0.90  # window's area must be >= 90% of union to "match"
+
     valid = [c for c in windows if c is not None]
     n_total = len(windows)
     n_valid = len(valid)
@@ -147,9 +154,17 @@ def aggregate_crops(windows, frame_w, frame_h, min_keep_ratio, agree_ratio):
             ),
         }
 
-    counter = collections.Counter(valid)
-    top, top_count = counter.most_common(1)[0]
-    w, h, x, y = top
+    # Bounding box of all detected picture rectangles, clamped to frame.
+    # cropdetect with round=2 returns even-aligned values, so the bbox
+    # stays even-aligned for chroma 4:2:0 without extra rounding.
+    x_min = min(c[2] for c in valid)
+    y_min = min(c[3] for c in valid)
+    x_max = min(frame_w, max(c[2] + c[0] for c in valid))
+    y_max = min(frame_h, max(c[3] + c[1] for c in valid))
+    w = x_max - x_min
+    h = y_max - y_min
+    x = x_min
+    y = y_min
 
     if w >= frame_w and h >= frame_h:
         return {
@@ -157,28 +172,25 @@ def aggregate_crops(windows, frame_w, frame_h, min_keep_ratio, agree_ratio):
             "reason": "full frame — no letterbox/pillarbox detected",
         }
 
-    agreement = top_count / n_valid
-    keep_ratio = (w * h) / (frame_w * frame_h)
+    union_area = w * h
+    threshold = union_area * AREA_AGREE
+    matching = sum(1 for c in valid if c[0] * c[1] >= threshold)
+    agreement = matching / n_valid
 
-    # Windows disagreeing is the strongest unreliability signal — likely
-    # mixed aspect ratios (IMAX-style scenes) or scattered misdetects.
     if agreement < agree_ratio:
         return {
-            "crop": top, "confidence": "low",
+            "crop": (w, h, x, y), "confidence": "low",
             "reason": (
-                f"{len(counter)} distinct crop values across {n_valid} windows; "
-                f"top supported by only {top_count}/{n_valid} "
-                f"(likely mixed aspect ratios)"
+                f"only {matching}/{n_valid} windows align with union crop "
+                f"{w}x{h} (within {int((1 - AREA_AGREE) * 100)}% area); "
+                f"likely mixed aspect ratios"
             ),
         }
 
-    # Catastrophic-misdetect floor. Below this, even unanimous agreement
-    # can't be trusted (e.g. an entirely dark video where every window
-    # misdetects identically into a tiny region). Set well below the
-    # most-aggressive legitimate case (9:16 vertical in 16:9 ≈ 32%).
+    keep_ratio = (w * h) / (frame_w * frame_h)
     if keep_ratio < min_keep_ratio:
         return {
-            "crop": top, "confidence": "low",
+            "crop": (w, h, x, y), "confidence": "low",
             "reason": (
                 f"detected crop keeps only {keep_ratio:.0%} of frame; "
                 f"below safety floor of {min_keep_ratio:.0%} "
@@ -187,9 +199,10 @@ def aggregate_crops(windows, frame_w, frame_h, min_keep_ratio, agree_ratio):
         }
 
     return {
-        "crop": top, "confidence": "high",
+        "crop": (w, h, x, y), "confidence": "high",
         "reason": (
-            f"agreed on {top_count}/{n_valid} windows "
+            f"union of {n_valid} windows, {matching}/{n_valid} match "
+            f"within {int((1 - AREA_AGREE) * 100)}% "
             f"({keep_ratio:.0%} of frame kept)"
         ),
     }
