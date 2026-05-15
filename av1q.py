@@ -38,6 +38,7 @@ DIM = "\033[2m"
 CHECK = f"{GREEN}✓{RESET}"
 CROSS = f"{RED}✗{RESET}"
 SEP = f"{DIM}{'─' * 48}{RESET}"
+MIDDOT = "·"  # · — kept as a constant so f-strings stay Python <3.12 compatible
 
 # ── Constants ────────────────────────────────────────────────
 
@@ -1570,7 +1571,8 @@ def process_videos(cfg):
             dur_str = fmt_time(meta["duration"]) if meta["duration"] > 0 else ""
             hdr_str = "HDR" if meta["hdr"] else ""
             info_parts = [p for p in [res_str, codec_str, sz_str, src_kbps, dur_str, hdr_str] if p]
-            print(f"      {DIM}{' \u00b7 '.join(info_parts)}{RESET}")
+            sep = f" {MIDDOT} "
+            print(f"      {DIM}{sep.join(info_parts)}{RESET}")
 
             if meta["codec"] == "av1":
                 print(f" {CHECK} Already AV1, skipping")
@@ -1715,7 +1717,7 @@ def process_videos(cfg):
                 return d
 
             floor_kbps = MIN_BITRATE_KBPS.get(res_tier(meta["w"], meta["h"]), 0)
-            floor_str = f" {DIM}\u00b7{RESET} floor {BOLD}{floor_kbps}kbps{RESET}" if floor_kbps else ""
+            floor_str = f" {DIM}{MIDDOT}{RESET} floor {BOLD}{floor_kbps}kbps{RESET}" if floor_kbps else ""
             print(
                 f"{lbl('target')}VMAF {BOLD}{target:.1f}{RESET}"
                 f" (P5 >= {BOLD}{min_p5:.1f}{RESET}){floor_str}"
@@ -1992,7 +1994,7 @@ def process_videos(cfg):
                 f" {CHECK} {in_str} -> {BOLD}{out_str}{RESET}{kbps_str}"
                 f" saved {GREEN}{BOLD}{saved:.1f}%{RESET}"
             )
-            print(f"   {DIM}Enc {fmt_time(t_enc)} \u00b7 VMAF {fmt_time(t_vmaf)}{RESET}")
+            print(f"   {DIM}Enc {fmt_time(t_enc)} {MIDDOT} VMAF {fmt_time(t_vmaf)}{RESET}")
 
             stats["proc"] += 1
             if math.isfinite(best_vmaf["mean"]):
