@@ -23,7 +23,7 @@ Drop videos into a folder, run the script, and each file gets encoded to AV1 at 
 - **HDR & color preservation** — carries over color primaries, transfer, matrix, and range
 - **10-bit output** by default, film grain synthesis included
 - **Hardware-accelerated decoding** — CUDA, D3D11VA (Windows), VideoToolbox (macOS), VAAPI (Linux)
-- **Optional auto-crop** — companion script `av1q-crop.py` detects letterbox/pillarbox bars and writes sidecar JSON; av1q auto-applies confidence-gated crops at encode time
+- **Optional auto-crop** — `--auto-crop` detects letterbox/pillarbox bars inline before each encode (or use the standalone `av1q-crop.py` to pre-scan a library); confidence-gated so ambiguous detections aren't silently applied
 - **File-based caching** — skips re-analysis and re-measurement on subsequent runs
 - **Batch processing** with recursive subdirectory support
 - **Cross-platform** — Windows, macOS, Linux
@@ -61,14 +61,20 @@ python av1q.py -i /path/to/videos -o /path/to/output
 python av1q.py --vmaf 95 --preset 6
 ```
 
-**Auto-crop letterboxed or pillarboxed videos** — run the companion script first, then encode normally. Sidecars are picked up automatically:
+**Auto-crop letterboxed or pillarboxed videos** — add `--auto-crop`:
+
+```
+python av1q.py --auto-crop
+```
+
+Before each encode, the script samples 8 short windows of the video, detects black bars, and applies the crop if the detection is confident. Results are cached as `<file>.crop.json` sidecars beside each source, so re-runs reuse them without re-scanning. Low-confidence detections (dark sources, mixed aspect ratios) are saved for manual review but not auto-applied. Pass `--no-crops` to ignore sidecars entirely.
+
+For batch pre-scanning a whole library before encoding (so you can review borderline sidecars first), the companion `av1q-crop.py` does the same detection standalone and writes the same sidecar format:
 
 ```
 python av1q-crop.py
 python av1q.py
 ```
-
-`av1q-crop.py` writes a `<file>.crop.json` next to each source. av1q auto-applies any sidecar marked `confidence: "high"` and silently skips `low` / `none` ones (those are for manual review). Pass `--no-crops` to av1q to ignore sidecars without deleting them.
 
 ### Options
 
@@ -86,6 +92,7 @@ python av1q.py
 | `--no-recurse` | — | Don't process subdirectories |
 | `--overwrite` | — | Re-encode even if output exists |
 | `--dry-run` | — | Find optimal CQ but skip final encoding |
+| `--auto-crop` | — | Detect letterbox/pillarbox inline before each encode (skips files that already have a sidecar) |
 | `--no-crops` | — | Ignore `*.crop.json` sidecars (auto-applied by default) |
 
 ## How it works
