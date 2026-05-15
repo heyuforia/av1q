@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.dont_write_bytecode = True  # don't litter the script dir with __pycache__
 from av1q import (
     VIDEO_EXTENSIONS,
     GREEN, ORANGE, PURPLE, RED, RESET, BOLD, DIM, CHECK, CROSS, SEP,
