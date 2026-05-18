@@ -1098,6 +1098,54 @@ def load_cache(cache_dir, file_hash, sig):
     return {"sig": sig, "entries": {}}, cp
 
 
+def load_global_calibration(cache_dir):
+    """Load cross-file rolling averages used as defaults for new files."""
+    path = cache_dir / "_global_calibration.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def update_global_calibration(cache_dir, vmaf_offset=None, ratio=None):
+    """Roll new measurements into the cohort calibration cache.
+
+    Per-file calibration only helps on re-runs of the same file. The
+    cohort cache gives new files an informed starting point so first-
+    encounter sample-vs-full mispredict is corrected up front, avoiding
+    a wasted second full encode. n is capped so the average stays
+    responsive to drift (e.g. encoder/preset changes).
+    """
+    N_CAP = 50
+    g = load_global_calibration(cache_dir)
+
+    def roll(key, n_key, val):
+        if val is None:
+            return
+        prev = g.get(key)
+        n = g.get(n_key, 0)
+        if not isinstance(prev, (int, float)) or not isinstance(n, int) or n <= 0:
+            g[key] = float(val)
+            g[n_key] = 1
+            return
+        n_new = min(n + 1, N_CAP)
+        weight = 1.0 / n_new
+        g[key] = prev * (1 - weight) + float(val) * weight
+        g[n_key] = n_new
+
+    roll("vmaf_offset", "n_offset", vmaf_offset)
+    roll("ratio", "n_ratio", ratio)
+    g["t"] = time.time()
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = cache_dir / "_global_calibration.json"
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(g), encoding="utf-8")
+    tmp.replace(path)
+
+
 def load_crop_sidecar(filepath, file_hash):
     """Read <file>.crop.json from av1q-crop. Returns 'W:H:X:Y' or None.
 
@@ -1206,21 +1254,22 @@ def detect_crop_window(source, start, duration, limit, round_to, cache_dir):
 
 
 def aggregate_crops(windows, frame_w, frame_h, min_keep_ratio, agree_ratio):
-    """Aggregate window crops via bounding-box union.
+    """Aggregate window crops via bounding-box union with per-edge agreement.
 
     cropdetect on dark or noisy scenes typically returns crops SMALLER
-    than the truth — it mistakes shadowed picture edges for bars. Exact-
-    tuple matching scatters these near-identical detections into many
-    distinct values and falsely reports "mixed aspect ratios". The fix:
-    bounding-box union. Smaller noise-variants and outliers sit inside
-    the union and don't shift it.
+    than the truth — it mistakes shadowed picture edges for bars. Older
+    area-agreement conflated letterbox and pillarbox axes: horizontal
+    noise from a few dark scenes in a clean letterboxed film would drop
+    overall area below the threshold and falsely flag "mixed aspect".
 
-    Confidence: count windows whose detected area is within ~10% of the
-    union area. Real misdetects fall far below this and don't damage the
-    result. True mixed-aspect content (IMAX-style scenes) produces an
-    oversized union → "none" or below min_keep_ratio → flagged.
+    Per-edge agreement only checks the edges the union is actually
+    cropping. A pure-letterbox film has stable top/bottom edges; left
+    and right sit at the frame boundary and are skipped, so horizontal
+    cropdetect noise from dark scenes is irrelevant. True mixed-aspect
+    content disagrees on the cropped axis itself and still fails the
+    agreement threshold.
     """
-    AREA_AGREE = 0.90
+    EDGE_TOL = 4  # px tolerance per edge
 
     valid = [c for c in windows if c is not None]
     n_total = len(windows)
@@ -1256,18 +1305,35 @@ def aggregate_crops(windows, frame_w, frame_h, min_keep_ratio, agree_ratio):
             "reason": "full frame — no letterbox/pillarbox detected",
         }
 
-    union_area = w * h
-    threshold = union_area * AREA_AGREE
-    matching = sum(1 for c in valid if c[0] * c[1] >= threshold)
-    agreement = matching / n_valid
+    edges = []
+    if y_min > 0:
+        m = sum(1 for c in valid if abs(c[3] - y_min) <= EDGE_TOL)
+        edges.append(("top", m))
+    if y_max < frame_h:
+        m = sum(1 for c in valid if abs(c[3] + c[1] - y_max) <= EDGE_TOL)
+        edges.append(("bottom", m))
+    if x_min > 0:
+        m = sum(1 for c in valid if abs(c[2] - x_min) <= EDGE_TOL)
+        edges.append(("left", m))
+    if x_max < frame_w:
+        m = sum(1 for c in valid if abs(c[2] + c[0] - x_max) <= EDGE_TOL)
+        edges.append(("right", m))
+
+    if not edges:
+        return {
+            "crop": None, "confidence": "none",
+            "reason": "full frame — no letterbox/pillarbox detected",
+        }
+
+    worst_name, worst_match = min(edges, key=lambda e: e[1])
+    agreement = worst_match / n_valid
 
     if agreement < agree_ratio:
         return {
             "crop": (w, h, x, y), "confidence": "low",
             "reason": (
-                f"only {matching}/{n_valid} windows align with union crop "
-                f"{w}x{h} (within {int((1 - AREA_AGREE) * 100)}% area); "
-                f"likely mixed aspect ratios"
+                f"only {worst_match}/{n_valid} windows agree on {worst_name} edge "
+                f"(±{EDGE_TOL}px); likely mixed aspect ratios"
             ),
         }
 
@@ -1282,12 +1348,12 @@ def aggregate_crops(windows, frame_w, frame_h, min_keep_ratio, agree_ratio):
             ),
         }
 
+    edge_summary = ", ".join(f"{n} {m}/{n_valid}" for n, m in edges)
     return {
         "crop": (w, h, x, y), "confidence": "high",
         "reason": (
-            f"union of {n_valid} windows, {matching}/{n_valid} match "
-            f"within {int((1 - AREA_AGREE) * 100)}% "
-            f"({keep_ratio:.0%} of frame kept)"
+            f"edges agree within ±{EDGE_TOL}px ({edge_summary}); "
+            f"{keep_ratio:.0%} of frame kept"
         ),
     }
 
@@ -1528,6 +1594,7 @@ def process_videos(cfg):
         "saved": 0, "orig": 0, "deleted": 0,
     }
     t_start = time.time()
+    global_cal = load_global_calibration(cache_dir)
 
     for idx, filepath in enumerate(files, 1):
         sample_src = None
@@ -1728,20 +1795,32 @@ def process_videos(cfg):
                 print(f"{lbl('reuse')}Found existing CQ {BOLD}{existing_cq}{RESET} encode")
             elif sample_src:
                 # Apply learned VMAF offset (sample over/under-predicts
-                # full VMAF for this file) so the sample search aims at
-                # the CQ that will hit `target` on the full video.
+                # full VMAF) so the sample search aims at the CQ that
+                # will hit `target` on the full video. Per-file calibration
+                # takes precedence; on first encounter we fall back to the
+                # cohort average so new files start informed instead of
+                # paying a second-encode tax to learn the offset.
                 sample_target = target
+                off = None
+                off_src = None
                 cal_v = cache.get("calibration")
                 if isinstance(cal_v, dict):
-                    off = cal_v.get("vmaf_offset")
-                    if (isinstance(off, (int, float))
-                            and -3.0 <= off <= 3.0 and abs(off) >= 0.1):
-                        sample_target = clamp(target + off, 0.0, 100.0)
-                        print(
-                            f"{lbl('calibr')}sample target"
-                            f" {BOLD}{sample_target:.2f}{RESET}"
-                            f" {DIM}(offset {off:+.2f}){RESET}"
-                        )
+                    o = cal_v.get("vmaf_offset")
+                    if isinstance(o, (int, float)) and -3.0 <= o <= 3.0:
+                        off = o
+                        off_src = "per-file"
+                if off is None:
+                    g_off = global_cal.get("vmaf_offset")
+                    if isinstance(g_off, (int, float)) and -3.0 <= g_off <= 3.0:
+                        off = g_off
+                        off_src = f"cohort n={global_cal.get('n_offset', '?')}"
+                if off is not None and abs(off) >= 0.1:
+                    sample_target = clamp(target + off, 0.0, 100.0)
+                    print(
+                        f"{lbl('calibr')}sample target"
+                        f" {BOLD}{sample_target:.2f}{RESET}"
+                        f" {DIM}(offset {off:+.2f} {off_src}){RESET}"
+                    )
                 best_cq, _, _, vt, search_state = search_cq(
                     sample_src, meta, sample_target, cache, cp,
                     do_enc_sample, vmaf_threads, cfg, tag="sample",
@@ -1827,6 +1906,8 @@ def process_videos(cfg):
             cal_now = cache.get("calibration")
             cal_now = dict(cal_now) if isinstance(cal_now, dict) else {}
             cal_updated = False
+            fresh_offset = None
+            fresh_ratio = None
 
             if (sample_kbps_at_best and actual_kbps_now
                     and sample_kbps_at_best > 0):
@@ -1834,6 +1915,7 @@ def process_videos(cfg):
                 if 0.5 <= ratio <= 1.0:
                     cal_now["ratio"] = ratio
                     cal_updated = True
+                    fresh_ratio = ratio
                     print(
                         f"{lbl('calibr')}sample {sample_kbps_at_best}kbps ->"
                         f" video {actual_kbps_now}kbps (ratio {ratio:.2f})"
@@ -1846,6 +1928,7 @@ def process_videos(cfg):
                 if -3.0 <= offset <= 3.0:
                     cal_now["vmaf_offset"] = offset
                     cal_updated = True
+                    fresh_offset = offset
 
             if search_state and search_state.get("vmaf_slope"):
                 sl = search_state["vmaf_slope"]
@@ -1861,6 +1944,18 @@ def process_videos(cfg):
                 tmp = cp.with_suffix(".json.tmp")
                 tmp.write_text(json.dumps(cache), encoding="utf-8")
                 tmp.replace(cp)
+
+                # Roll fresh measurements into the cohort so subsequent
+                # new files start with an informed prior. Only the
+                # measurements taken this run are rolled in — values
+                # carried over from a previous run aren't double-counted.
+                if fresh_offset is not None or fresh_ratio is not None:
+                    update_global_calibration(
+                        cache_dir,
+                        vmaf_offset=fresh_offset,
+                        ratio=fresh_ratio,
+                    )
+                    global_cal = load_global_calibration(cache_dir)
 
             # Consolidated refine for VMAF + P5 + bitrate-floor deficits.
             # Issue #3: the previous code ran three separate loops, each
