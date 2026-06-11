@@ -202,8 +202,9 @@ def find_tool(patterns, fallback_name, hint):
     )
 
 
-def _download_encoder(tools):
-    """First-run fetch of SVT-AV1-Essential from its GitHub releases.
+def _download_encoder(dest):
+    """First-run fetch of SVT-AV1-Essential from its GitHub releases
+    into dest/ (tools/SVT-AV1-Essential, mirroring FFVship's subfolder).
 
     Release assets are bare executables. Prefers the CPU-Optimized build
     but smoke-tests it and falls back to Generic — Optimized uses newer
@@ -241,8 +242,8 @@ def _download_encoder(tools):
         try:
             data = _http_download(
                 asset["browser_download_url"], "SvtAv1EncApp", asset["size"])
-            tools.mkdir(parents=True, exist_ok=True)
-            exe = tools / asset["name"]
+            dest.mkdir(parents=True, exist_ok=True)
+            exe = dest / asset["name"]
             exe.write_bytes(data)
             if sys.platform != "win32":
                 os.chmod(exe, 0o755)
@@ -265,7 +266,7 @@ def find_encoder():
             "Download from https://github.com/nekotrix/SVT-AV1-Essential/releases",
         )
     except FileNotFoundError:
-        exe = _download_encoder(_ROOT / "tools")
+        exe = _download_encoder(_ROOT / "tools" / "SVT-AV1-Essential")
         if exe:
             return exe
         raise
