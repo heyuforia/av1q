@@ -1,0 +1,26 @@
+# Claude Code
+.claude/
+CLAUDE.md
+
+# Local-only: docs, tests, tool binaries
+docs/
+tests/
+tools/
+pytest.ini
+
+# Runtime work folders and artifacts
+_cache/
+Video Input/
+AV1 Output/
+*.crop.json
+*.tmp.mkv
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store
