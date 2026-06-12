@@ -8,7 +8,38 @@ import time
 
 from .probe import detect_hwaccel, get_fps
 from .ui import RED, RESET
-from .util import _temp_files, atomic_write_json, make_temp_log
+from .util import _temp_files, atomic_write_json, make_temp_log, run_cmd
+
+# Codec profiles that must never go through a hardware decoder here.
+# ffmpeg's hwaccel capability check only asks the driver about codec +
+# chroma + bit depth, never the profile — so a stream using profile
+# tools the silicon doesn't implement can be CLAIMED as supported and
+# decode to garbage with exit code 0, silently corrupting the scores.
+# Concretely: x264 lossless tags High 4:4:4 Predictive even for plain
+# 4:2:0 content (so the caps query passes everywhere), and its
+# transform-bypass mode mis-decoded on RTX 5090/Blackwell + ffmpeg
+# master — collapsing sample VMAF to ~71/P5 12 (issue #4) while older
+# GPUs whose caps query fails fell back to software and scored
+# correctly. Software decode is bit-exact by definition; for these
+# profiles correctness beats decode speed.
+_HW_UNSAFE_PROFILES = ("4:4:4", "4:2:2", "444", "422", "rext")
+
+
+def _sw_decode_only(path):
+    """True when this stream's profile is on the hw-unsafe list.
+    Unknown/unreadable profiles return False (mainstream profiles are
+    the overwhelmingly common case, and a hw decode that errors out
+    still falls back to the software attempt)."""
+    try:
+        r = run_cmd([
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=profile",
+            "-of", "default=nw=1:nk=1", str(path),
+        ])
+        prof = (r.stdout or "").strip().lower()
+    except RuntimeError:
+        return False
+    return any(t in prof for t in _HW_UNSAFE_PROFILES)
 
 
 def measure_vmaf(ref, dist, meta, subsample, threads, cache_dir):
@@ -65,6 +96,8 @@ def measure_vmaf(ref, dist, meta, subsample, threads, cache_dir):
 
     try:
         hw = detect_hwaccel()
+        if hw and (_sw_decode_only(ref) or _sw_decode_only(dist)):
+            hw = None
         attempts = [hw, None] if hw else [None]
 
         for accel in attempts:
