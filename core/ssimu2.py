@@ -19,8 +19,39 @@ import math
 import subprocess
 
 from .tools import find_ffvship_optional
-from .ui import RED, RESET
+from .ui import DIM, RED, RESET
 from .util import _temp_files, make_temp_log
+
+# Demuxed video packet counts, memoized so the source of a long file is
+# only counted once across its verify/refine/final measurements.
+_frame_counts = {}
+
+
+def _video_frame_count(path):
+    """Video packet count via demux only (packets stand in for frames,
+    same as the keyframe/complexity scans). None when uncountable."""
+    try:
+        st = path.stat()
+        key = (str(path), st.st_size, int(st.st_mtime))
+    except OSError:
+        return None
+    if key in _frame_counts:
+        return _frame_counts[key]
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-count_packets", "-show_entries", "stream=nb_read_packets",
+             "-of", "default=nw=1:nk=1", str(path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=600,
+        )
+        if r.returncode != 0:
+            return None
+        n = int(r.stdout.strip())
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return None
+    _frame_counts[key] = n
+    return n
 
 
 def ffvship_crop_args(crop, src_w, src_h):
@@ -73,6 +104,24 @@ def _run_ffvship(ref, dist, meta, cache_dir, exe,
     refine) is only indexed once; the distorted index is per-encode.
     Index files live under <cache_dir>/_ffindex, never next to videos.
     """
+    # FFVship pairs frame i of the source with frame i of the encode —
+    # it has no timestamps. A near-VFR source that slips past the
+    # is_vfr gate gets frames duplicated/dropped by the CFR Y4M feed,
+    # so every pair after the first divergence compares the wrong
+    # frames and SSIMU2 collapses (negative scores). With unequal
+    # frame counts the comparison is meaningless: skip it — for an
+    # info column, no number beats a wrong one.
+    n_ref = _video_frame_count(ref)
+    n_dist = _video_frame_count(dist)
+    if n_ref is not None and n_dist is not None and n_ref != n_dist:
+        if verbose:
+            print(
+                f" {DIM}SSIMU2 skipped: source {n_ref} frames vs encode"
+                f" {n_dist} (irregular source timing — frame pairing"
+                f" would misalign){RESET}"
+            )
+        return None
+
     log = make_temp_log(cache_dir, "ssimu2", "json")
     idx_dir = cache_dir / "_ffindex"
     if ref_index:
