@@ -124,6 +124,57 @@ def process_videos(cfg, engine):
     ]
     total = len(files)
 
+    # A user seed only seeds NEW searches: files with a completed search
+    # resume past it (and verified outputs skip entirely), which reads as
+    # the seed being silently ignored. Offer the choice up front, once
+    # for the whole batch — a per-file prompt would stall unattended
+    # runs partway through. Yes clears those files' caches so they get a
+    # fresh search from the seed; the default keeps today's behavior.
+    user_seed = cfg[engine.seed_key]
+    seeded_redo = set()
+    if user_seed is not None and files and sys.stdin.isatty():
+        prior = []
+        for f in files:
+            try:
+                fh = partial_hash(f)
+            except OSError:
+                continue
+            c, _ = load_cache(root_cache, fh, engine.sig)
+            rec = c.get("recommended")
+            if (isinstance(rec, dict)
+                    and all(
+                        rec.get(k) == cfg[k]
+                        for k in (*engine.rec_bound_keys, "preset",
+                                  "film_grain", *engine.rec_extra_keys)
+                    )
+                    and rec.get("crop") == (
+                        load_crop_sidecar(f, fh) if cfg["use_crops"] else None
+                    )
+                    and (cfg["target_vmaf"] is None
+                         or rec.get("target") == cfg["target_vmaf"])):
+                prior.append((f, fh))
+        if prior:
+            print(
+                f"{ORANGE}{BOLD}{len(prior)}{RESET}{ORANGE} of {total}"
+                f" video(s) already encoded in a previous run:{RESET}"
+            )
+            for f, _ in prior[:5]:
+                print(f"   {DIM}{f.name}{RESET}")
+            if len(prior) > 5:
+                print(f"   {DIM}... and {len(prior) - 5} more{RESET}")
+            try:
+                raw = input(
+                    f"{PURPLE}{BOLD}Re-encode them with a fresh search"
+                    f" from your seed {engine.qname}"
+                    f" {grid.fmt(grid.quantize(user_seed))}?{RESET}"
+                    f" {DIM}(y/N){RESET}: "
+                ).strip().lower()
+            except EOFError:
+                raw = ""
+            if raw in ("y", "yes"):
+                seeded_redo = {fh for _, fh in prior}
+            print(SEP)
+
     stats = {
         "proc": 0, "vmaf_sum": 0.0, "vmaf_n": 0,
         "saved": 0, "orig": 0, "deleted": 0,
@@ -149,6 +200,17 @@ def process_videos(cfg, engine):
 
             file_hash = partial_hash(filepath)
             cache, cp = load_cache(root_cache, file_hash, engine.sig)
+
+            if file_hash in seeded_redo:
+                # User chose a fresh seeded search over the previous
+                # result: drop this file's whole cache (entries,
+                # calibration, scene data, recommended) so nothing
+                # resumes or skips below.
+                try:
+                    cp.unlink()
+                except OSError:
+                    pass
+                cache, cp = load_cache(root_cache, file_hash, engine.sig)
 
             # Output names carry the crop token so cropped and uncropped
             # encodes of the same source never collide (flipping
@@ -231,6 +293,12 @@ def process_videos(cfg, engine):
             if idx > 1:
                 print(SEP)
             print(f"{PURPLE}{BOLD}[{idx}/{total}]{RESET} {PURPLE}{filepath.name}{RESET}")
+            if file_hash in seeded_redo:
+                print(
+                    f"{lbl('redo')}{DIM}previous results cleared, searching"
+                    f" from seed {engine.qname}"
+                    f" {grid.fmt(grid.quantize(user_seed))}{RESET}"
+                )
 
             meta = probe_video(filepath)
 
@@ -324,9 +392,18 @@ def process_videos(cfg, engine):
                     )
                     and rec.get("crop") == meta["crop"]):
                 existing_q = grid.quantize(rec[engine.rec_q_key])
+                seed_note = ""
+                if user_seed is not None:
+                    # The seed only starts a NEW search; saying so here
+                    # beats looking like silently ignored input.
+                    seed_note = (
+                        f" {DIM}(seed {engine.qname}"
+                        f" {grid.fmt(grid.quantize(user_seed))} not used:"
+                        f" search already done){RESET}"
+                    )
                 print(
                     f"{lbl('resume')}{engine.qname} {BOLD}{grid.fmt(existing_q)}{RESET}"
-                    f" from previous search"
+                    f" from previous search{seed_note}"
                 )
 
             sample_scenes = sample_src = None

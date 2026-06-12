@@ -71,6 +71,8 @@ Seed CQ 18–38 (Enter = auto):
 
 Press Enter for the automatic seed, or type a CQ to start every file's search there — handy when a batch of similar clips all land around the same value, since a good seed can collapse the search to a single encode. The seed is only a starting point: VMAF is still measured and the search still corrects a wrong guess. `--seed-cq 24` does the same non-interactively (and skips the prompt); piped/scripted runs without the flag skip the prompt entirely.
 
+If some files in the batch were already encoded by a previous run, a seed alone won't redo them — their finished search result is reused. When a seed is given interactively, av1q lists those files and asks once whether to re-encode them with a fresh search from the seed (clearing their cached results) or keep the previous answers.
+
 **Auto-crop letterboxed or pillarboxed videos** — add `--auto-crop`:
 
 ```
