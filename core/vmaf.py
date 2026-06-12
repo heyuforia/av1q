@@ -43,16 +43,37 @@ def _sw_decode_only(path):
 
 
 def measure_vmaf(ref, dist, meta, subsample, threads, cache_dir):
-    """Compute VMAF score between reference and distorted video."""
-    fps = get_fps(dist)
+    """Compute VMAF score between reference and distorted video.
+
+    meta["vmaf_pair"] == "index" pairs frames by INDEX instead of by
+    timestamp: both chains get identical synthetic timestamps so
+    framesync matches frame n with frame n — the same pairing FFVship
+    uses. The sample path sets this: its pair is frame-aligned by
+    construction (the clean source is CFR and feeds the encoder 1:1),
+    while its container timestamps inherit quirks from stream-copied
+    cuts of irregular sources — which the timestamp/fps chain turned
+    into one-sided dup/drops, collapsing sample VMAF (issue #4: flat
+    ~76 / P5 ~2 against a sane SSIMU2, even in software decode). The
+    full path must keep timestamp pairing: there the encode-side CFR
+    conversion changes the frame count, and mirroring that conversion
+    on the reference is exactly what keeps full VMAF aligned.
+    """
+    index_pair = meta.get("vmaf_pair") == "index"
+    fps = None if index_pair else get_fps(dist)
 
     def build_chain(with_crop):
         # Crop only applies to the ref chain: dist was already encoded with
         # crop applied, so its frames are pre-cropped. Cropping it again here
         # would shave off real picture content and silently tank VMAF.
-        f = ["setpts=PTS-STARTPTS"]  # normalize MP4 edit lists
-        if fps:
-            f.append(f"fps={fps}")
+        if index_pair:
+            # Identical re-stamp on both chains -> framesync pairs 1:1
+            # by index. The rate constant is arbitrary (VMAF scores
+            # per frame; nothing is temporally resampled).
+            f = ["settb=AVTB", "setpts=N/(25*TB)"]
+        else:
+            f = ["setpts=PTS-STARTPTS"]  # normalize MP4 edit lists
+            if fps:
+                f.append(f"fps={fps}")
         if with_crop and meta.get("crop"):
             f.append(f"crop={meta['crop']}")
         if meta["hdr"]:

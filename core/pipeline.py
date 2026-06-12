@@ -234,8 +234,12 @@ def process_videos(cfg, engine):
             # verify, and refine all route through here so every score
             # lands in (and reuses) the same frozen cache layout.
             def measure(ref, dist, q, tag=None):
+                # Sample measurements pair frames by index (the pair is
+                # frame-aligned by construction; its container
+                # timestamps are not trustworthy) — see measure_vmaf.
+                m = {**meta, "vmaf_pair": "index"} if tag else meta
                 return core_vmaf.vmaf_cached(
-                    ref, dist, meta, q, cache, cp, tag=tag,
+                    ref, dist, m, q, cache, cp, tag=tag,
                     threads=vmaf_threads, log_dir=root_cache,
                     key_base=engine.vmaf_key_base, q_key=grid.fmt(q),
                 )
