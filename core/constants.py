@@ -14,7 +14,7 @@ FALLBACK_MAXRATE = {
 }
 
 # Starvation backstops, not targets.
-MIN_BITRATE_KBPS = {0: 0, 720: 1000, 1080: 1800, 1440: 2500, 2160: 5000, 4320: 8000}
+MIN_BITRATE_KBPS = {0: 0, 720: 1000, 1080: 1800, 1440: 2500, 2160: 4500, 4320: 8000}
 
 # Bitrate acceptance band: a video anywhere in [floor, floor × BITRATE_BAND]
 # has hit the floor closely enough. The search and the refine loop both aim
