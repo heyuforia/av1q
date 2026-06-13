@@ -13,7 +13,7 @@ import time
 
 from .. import ssimu2
 from ..crop import crop_token
-from ..probe import is_vfr, probe_hdr_metadata
+from ..probe import get_rfps, is_vfr, probe_hdr_metadata
 from ..sampling import clean_sample_source
 from ..tools import find_encoder, find_ffvship_optional
 from ..ui import BOLD, DIM, GREEN, MIDDOT, ORANGE, RESET, fmt_time
@@ -142,8 +142,31 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
 
     ff_cmd = ["ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats",
               "-i", str(source), "-map", "0:v:0"]
+    # Full encodes normalize the feed's timeline to the source's nominal
+    # frame cadence: setpts zeroes any start offset / edit-list delay and
+    # fps re-times onto a clean CFR grid at r_frame_rate. This is a no-op
+    # for well-formed CFR sources, but for irregular ones (e.g. stream-
+    # copy concatenations with a per-join timing gap) it is what keeps the
+    # full encode frame-aligned with the VMAF reference, which applies the
+    # identical setpts+fps normalization on its side. Without it the
+    # encoder's own CFR conversion fills the gaps differently than the
+    # reference's fps filter and the two drift out of phase, collapsing
+    # full VMAF. Samples skip this: their search source is already a clean
+    # CFR re-encode (clean_sample_source) and they pair by index.
+    vf = []
     if meta.get("crop"):
-        ff_cmd += ["-vf", f"crop={meta['crop']}"]
+        vf.append(f"crop={meta['crop']}")
+    rfps = meta.get("rfps") if is_full else None
+    if rfps:
+        vf += ["setpts=PTS-STARTPTS", f"fps={rfps}"]
+    if vf:
+        ff_cmd += ["-vf", ",".join(vf)]
+    if rfps:
+        # Pass the fps filter's CFR frames through untouched; without this
+        # the yuv4mpegpipe muxer re-runs its own CFR conversion on top,
+        # which can diverge from the reference's fps filter at the same
+        # rate and reintroduce the drift.
+        ff_cmd += ["-fps_mode", "passthrough"]
     ff_cmd += ["-pix_fmt", "yuv420p10le", "-strict", "-1",
                "-f", "yuv4mpegpipe", "-"]
 
@@ -161,6 +184,14 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
     last_render = 0.0
     rendered = False
     tail = []  # last stderr lines for error reporting
+    # Real-time speed multiplier = encode fps / source fps, matching the
+    # "1.4x" field ffmpeg's own -progress output gives av1q's bar. The
+    # encoder reports encode fps but no speed, so derive source fps from
+    # the known frame count over the source duration.
+    source_fps = (
+        expected_frames / meta["duration"]
+        if expected_frames and meta.get("duration", 0) > 0 else 0
+    )
 
     def render(frames, total, fps_val, kbps, final=False):
         nonlocal last_render, rendered
@@ -181,6 +212,8 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
         if not final and fps_val and fps_val > 0 and total_known:
             remaining = max(0, (total_known - frames) / fps_val)
             parts.append(f"{fmt_time(remaining)} left")
+            if source_fps > 0:
+                parts.append(f"{fps_val / source_fps:.2f}x")
             parts.append(f"{fps_val:.1f}fps")
         if not final and kbps:
             parts.append(f"{kbps:.0f}kbps")
@@ -416,6 +449,9 @@ class EssentialEngine(Engine):
         meta["mastering"] = meta["cll"] = None
         if meta["hdr"]:
             meta["mastering"], meta["cll"] = probe_hdr_metadata(source)
+        # Nominal frame cadence for the full-encode feed's CFR
+        # normalization (see encode_essential). Fetched once per file.
+        meta["rfps"] = get_rfps(source)
         return bool(meta["mastering"] or meta["cll"])
 
     def prep_sample(self, concat, meta, cfg):

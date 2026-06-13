@@ -103,6 +103,35 @@ def get_fps(filepath):
         return None
 
 
+def get_rfps(filepath):
+    """Nominal frame cadence (r_frame_rate) as a rational string, or None.
+
+    Distinct from get_fps, which reports avg_frame_rate: on an irregular
+    source (e.g. a stream-copy concatenation with per-join timing gaps)
+    the average drifts off the true cadence, while r_frame_rate stays the
+    intended rate. The CFR feed normalizes to this nominal rate so the
+    encode and the VMAF reference resample onto the same grid.
+    """
+    try:
+        r = run_cmd([
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate",
+            "-of", "default=nw=1:nk=1", str(filepath),
+        ])
+        v = r.stdout.strip()
+        if not v or v in ("0/0", "N/A"):
+            return None
+        if "/" in v:
+            a, b = v.split("/", 1)
+            if float(b) == 0 or float(a) / float(b) <= 0:
+                return None
+        elif float(v) <= 0:
+            return None
+        return v
+    except (RuntimeError, ValueError):
+        return None
+
+
 def res_tier(w, h):
     """Resolution tier based on the short dimension (handles vertical video)."""
     short = min(w, h)

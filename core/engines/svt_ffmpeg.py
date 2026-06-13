@@ -70,6 +70,15 @@ def _run_ffmpeg_progress(cmd, duration, label):
             fps_val = float(state.get("fps", "0"))
         except ValueError:
             pass
+        # ffmpeg's -progress stream reports a running-average bitrate as
+        # e.g. "bitrate=3234.5kbits/s" (or "N/A" before the first frame).
+        kbps_val = None
+        br = state.get("bitrate", "").strip()
+        if br.endswith("kbits/s"):
+            try:
+                kbps_val = float(br[:-len("kbits/s")])
+            except ValueError:
+                pass
         filled = int(bar_w * pct / 100)
         bar = (
             f"{DIM}[{RESET}"
@@ -83,6 +92,8 @@ def _run_ffmpeg_progress(cmd, duration, label):
             parts.append(f"{speed_val:.2f}x")
         if not final and fps_val and fps_val > 0:
             parts.append(f"{fps_val:.1f}fps")
+        if not final and kbps_val and kbps_val > 0:
+            parts.append(f"{kbps_val:.0f}kbps")
         sys.stdout.write(
             f"\r\033[K{label} {bar} {'  '.join(parts)}"
         )

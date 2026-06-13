@@ -643,6 +643,15 @@ def process_videos(cfg, engine):
             # SSIMU2 info per full-encode quantizer (display only).
             s2_seen = {}
 
+            def kbps_suffix(kbps):
+                """Trailing video-only bitrate field for a result line."""
+                return f"  {DIM}{kbps}kbps{RESET}" if kbps else ""
+
+            # Bitrate of the verified best_q encode: shown on the verify
+            # line and reused by the calibration block below so video_kbps
+            # is only computed once for that encode.
+            actual_kbps_now = None
+
             # Final full encode at the candidate quantizer + VMAF verify
             if sample_src or existing_q is not None:
                 if not dst_path(best_q).exists():
@@ -665,11 +674,16 @@ def process_videos(cfg, engine):
                     filepath, dst_path(best_q), meta, cfg, ref_index=full_idx,
                 )
                 t_vmaf += time.time() - t0
+                actual_kbps_now = (
+                    video_kbps(dst_path(best_q), meta["duration"])
+                    if meta["duration"] > 1 and dst_path(best_q).exists()
+                    else None
+                )
                 vc = vmaf_pass_color(best_vmaf["mean"], target, cfg["vmaf_tolerance"])
                 print(
                     f"{'':>{LBL + 1}}VMAF {BOLD}{vc}{best_vmaf['mean']:.2f}{RESET}"
                     f"  {DIM}P5 {best_vmaf['p5']:.2f}{RESET}"
-                    f"{fmt_s2(s2_seen[best_q])}"
+                    f"{fmt_s2(s2_seen[best_q])}{kbps_suffix(actual_kbps_now)}"
                 )
 
             # Persist sample↔full calibration BEFORE the refine loop so a
@@ -680,11 +694,14 @@ def process_videos(cfg, engine):
             sample_vmaf_at_best = entry_at_best.get(
                 f"sample_{engine.vmaf_key_base}"
             )
-            actual_kbps_now = (
-                video_kbps(dst_path(best_q), meta["duration"])
-                if meta["duration"] > 1 and dst_path(best_q).exists()
-                else None
-            )
+            # Full-file search path skips the verify block above, so
+            # measure it here if it wasn't already.
+            if actual_kbps_now is None:
+                actual_kbps_now = (
+                    video_kbps(dst_path(best_q), meta["duration"])
+                    if meta["duration"] > 1 and dst_path(best_q).exists()
+                    else None
+                )
 
             cal_now = cache.get("calibration")
             cal_now = dict(cal_now) if isinstance(cal_now, dict) else {}
@@ -880,13 +897,18 @@ def process_videos(cfg, engine):
                 t_vmaf += time.time() - t0
                 if not math.isfinite(adj.get("mean", float("nan"))):
                     break
+                adj_kbps = (
+                    video_kbps(dst_path(try_q), meta["duration"])
+                    if meta["duration"] > 1 and dst_path(try_q).exists()
+                    else None
+                )
                 vc_a = vmaf_pass_color(adj["mean"], target, cfg["vmaf_tolerance"])
                 print(
                     f"{'':>{LBL + 1}}VMAF {BOLD}{vc_a}{adj['mean']:.2f}{RESET}"
                     f"  {DIM}P5 {adj['p5']:.2f}{RESET}"
-                    f"{fmt_s2(s2_seen.get(try_q))}"
+                    f"{fmt_s2(s2_seen.get(try_q))}{kbps_suffix(adj_kbps)}"
                 )
-                record_point(try_q, adj)
+                record_point(try_q, adj, kbps=adj_kbps)
                 best_q, best_vmaf = try_q, adj
 
                 # Re-fit both models from the measured full-encode points.
@@ -972,7 +994,13 @@ def process_videos(cfg, engine):
 
             saved = (1.0 - out_sz / in_sz) * 100
             out_kbps = calc_kbps(out_sz, meta["duration"])
-            kbps_str = f" ({BOLD}{out_kbps}kbps{RESET})" if out_kbps else ""
+            # Output bitrate rides the result line next to VMAF (where the
+            # eye looks for "how did this encode turn out"); the size line
+            # below stays size + saved%.
+            kbps_final = (
+                f"  {DIM}{MIDDOT}{RESET}  {BOLD}{out_kbps}kbps{RESET}"
+                if out_kbps else ""
+            )
             in_str = fmt_size(in_sz)
             out_str = fmt_size(out_sz)
             vc = vmaf_pass_color(best_vmaf["mean"], target, cfg["vmaf_tolerance"])
@@ -981,6 +1009,7 @@ def process_videos(cfg, engine):
                 f" {CHECK} {engine.qname} {BOLD}{grid.fmt(best_q)}{RESET}"
                 f"  VMAF {BOLD}{vc}{best_vmaf['mean']:.2f}{RESET}"
                 f"  {DIM}P5 {best_vmaf['p5']:.2f}{RESET}"
+                f"{kbps_final}"
             )
             if extra_s2:
                 print(
@@ -988,7 +1017,7 @@ def process_videos(cfg, engine):
                     f"  P5 {extra_s2['p5']:.2f}  (info only){RESET}"
                 )
             print(
-                f" {CHECK} {in_str} -> {BOLD}{out_str}{RESET}{kbps_str}"
+                f" {CHECK} {in_str} -> {BOLD}{out_str}{RESET}"
                 f" saved {GREEN}{BOLD}{saved:.1f}%{RESET}"
             )
             print(f"   {DIM}Enc {fmt_time(t_enc)} {MIDDOT} VMAF {fmt_time(t_vmaf)}{RESET}")

@@ -102,12 +102,21 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
     tested_paths = {}
 
     min_kbps = MIN_BITRATE_KBPS.get(res_tier(meta["w"], meta["h"]), 0)
-    src_duration = 0.0
-    if min_kbps:
+    # Duration drives the per-probe bitrate readout, which is shown for
+    # every probe now — not just files with a non-zero floor (SD is tier 0
+    # with min_kbps == 0 but its encodes still have a bitrate worth seeing).
+    # The full path's source IS the file, so its meta duration applies and
+    # no extra probe is needed; the sample path must probe the concat for
+    # its own (short) duration. The floor machinery below stays gated on
+    # min_kbps regardless.
+    if tag:
+        src_duration = 0.0
         try:
             src_duration = probe_fn(source)["duration"]
         except Exception:
             pass
+    else:
+        src_duration = meta.get("duration") or 0.0
 
     floor_cap = max_q
     bitrate_points = {}
