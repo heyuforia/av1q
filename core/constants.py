@@ -16,6 +16,25 @@ FALLBACK_MAXRATE = {
 # Starvation backstops, not targets.
 MIN_BITRATE_KBPS = {0: 0, 720: 1000, 1080: 1800, 1440: 2500, 2160: 5000, 4320: 8000}
 
+# Bitrate acceptance band: a video anywhere in [floor, floor × BITRATE_BAND]
+# has hit the floor closely enough. The search and the refine loop both aim
+# at the floor but accept the whole band, so neither spends an extra full
+# encode shaving the last few percent off a video that's already there
+# (e.g. trimming 5330kbps toward 5000 when the floor is 5000). 1.1 keeps the
+# overshoot under ~one quarter-CRF grid step.
+BITRATE_BAND = 1.1
+
+# Sample→full bitrate margin for evenly-spaced sampling. The normal margin
+# (cfg["bitrate_margin"], ~1.20) models complexity-selection bias: samples
+# cut from the hardest scenes encode hotter than the full video, so the
+# sample must clear margin × floor for the video to clear the floor. Evenly
+# spaced samples (intra-only sources, or any file with no detected scenes)
+# carry no such bias — the sample is representative, so the ratio is ~1.0
+# and the big margin would over-cap the search and force a wasted refine
+# re-encode. A small margin keeps the video centered in the band above the
+# floor while leaving room for ratio noise.
+EVEN_SAMPLE_MARGIN = 1.05
+
 # Full-encode VMAF this far above target is treated as wasted bitrate worth
 # a re-encode at higher CQ (unless the bitrate floor is what's holding CQ
 # down). Also caps the search loop's acceptance band and bounds the

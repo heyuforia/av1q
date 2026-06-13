@@ -33,7 +33,8 @@ from .calibrate import (
     load_global_calibration, update_global_calibration,
 )
 from .constants import (
-    DEFAULT_BITRATE_DECAY, ENDGAME_SNAP_GAIN, INTRA_ONLY_CODECS,
+    BITRATE_BAND, DEFAULT_BITRATE_DECAY, ENDGAME_SNAP_GAIN,
+    EVEN_SAMPLE_MARGIN, INTRA_ONLY_CODECS,
     MIN_BITRATE_KBPS, MINI_SAMPLE_COUNT, MINI_SAMPLE_DURATION,
     MINI_SAMPLE_MIN_RATIO, TARGET_VMAF_BY_RES, VIDEO_EXTENSIONS,
     VMAF_OVERSHOOT,
@@ -411,6 +412,7 @@ def process_videos(cfg, engine):
                 )
 
             sample_scenes = sample_src = None
+            even_sampling = False
             plan = sampling_plan(meta["duration"], cfg)
 
             if existing_q is None and plan:
@@ -450,6 +452,12 @@ def process_videos(cfg, engine):
                     keyframes,
                     {**cfg, "sample_duration": s_dur, "short_threshold": 0},
                 )
+                # No detected scenes (intra-only sources, or scdet found
+                # none) means the samples are evenly spaced and therefore
+                # representative, not complexity-biased — the sample→full
+                # bitrate ratio is ~1.0, so the floor search uses a small
+                # margin instead of the complexity-bias one.
+                even_sampling = not scenes
                 if sample_scenes:
                     info = (
                         f"samples from {BOLD}{len(scenes)}{RESET} scenes"
@@ -576,9 +584,17 @@ def process_videos(cfg, engine):
                         f" {BOLD}{sample_target:.2f}{RESET}"
                         f" {DIM}(offset {off:+.2f} {off_src}){RESET}"
                     )
+                # Evenly-spaced samples are representative, so shrink the
+                # complexity-bias margin toward 1.0 — otherwise the search
+                # over-predicts the video bitrate, caps the quantizer too
+                # low, and ships a video well over the floor that the refine
+                # loop then has to climb back down one full encode at a time.
+                search_cfg = cfg
+                if even_sampling and cfg["bitrate_margin"] > EVEN_SAMPLE_MARGIN:
+                    search_cfg = {**cfg, "bitrate_margin": EVEN_SAMPLE_MARGIN}
                 best_q, _, _, vt, search_state = core_search.search(
                     sample_src, meta, sample_target, cache, cp,
-                    do_enc_sample, cfg, engine, tag="sample",
+                    do_enc_sample, search_cfg, engine, tag="sample",
                     decay_prior=dec_prior,
                     measure_fn=lambda ref, dist, q: measure(
                         ref, dist, q, tag="sample"),
@@ -834,6 +850,16 @@ def process_videos(cfg, engine):
                     desc = ", ".join(n for n, _ in deficits) + " short"
                 else:
                     overshoot = vm_mean - target
+                    # Already inside the bitrate band [floor, floor × BAND]:
+                    # the video has hit the floor closely enough, so accept
+                    # it instead of spending another full encode trimming a
+                    # few percent of bitrate the band already allows. This
+                    # is what stops the floor-bound crawl (e.g. 5330kbps
+                    # over a 5000 floor is done, not a step toward 5000).
+                    in_band = (
+                        min_kbps and cur_kbps
+                        and cur_kbps <= min_kbps * BITRATE_BAND
+                    )
                     # Bitrate headroom over the floor caps how far the
                     # quantizer can rise (log-linear model, same as the
                     # search). A file that's over target because the floor
@@ -847,7 +873,8 @@ def process_videos(cfg, engine):
                         ceiling = min(
                             ceiling, grid.quantize(best_q + max(0, headroom))
                         )
-                    if overshoot <= VMAF_OVERSHOOT or best_q >= ceiling:
+                    if (overshoot <= VMAF_OVERSHOOT or best_q >= ceiling
+                            or in_band):
                         break
                     # Aim mid-band (flooring the step skews the landing
                     # toward the upper half) so slope error stays inside
