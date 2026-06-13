@@ -800,7 +800,7 @@ def process_videos(cfg, engine):
             )
             decay_b = clamp(
                 (search_state.get("bitrate_decay") if search_state else None)
-                or (math.log(2) / 6),
+                or DEFAULT_BITRATE_DECAY,
                 0.05, 0.4,
             )
             full_points = {}
