@@ -422,6 +422,27 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
                 )
             next_q = grid.quantize(clamp(next_q, min_q, effective_max))
 
+            # Quality-ceiling short-circuit (sample path only). A downward
+            # jump that clamps to min_q — the max-quality grid bound — while
+            # VMAF is still in deficit means min_q is forced: nothing encodes
+            # at higher quality and we're below target, so the final
+            # selection takes min_q whatever its VMAF reads. On the sample
+            # path that probe only measures a number that changes no
+            # decision, so skip the encode entirely and let the final
+            # full-file encode verify. The full path's min_q encode is the
+            # deliverable, so it has nothing to skip — this is the low-q
+            # mirror of the high-q bitrate-ceiling accept above.
+            if (tag is not None and next_q == min_q and next_q not in tested
+                    and vm["mean"] < target - tol):
+                print(
+                    f" {ORANGE}{'accept':<10}{RESET}{engine.qname}"
+                    f" {BOLD}{grid.fmt(min_q)}{RESET} is max quality and VMAF"
+                    f" still short — selecting it without a sample probe"
+                )
+                tested[next_q] = {"mean": float("nan"), "p5": float("nan")}
+                q, vm = next_q, tested[next_q]
+                break
+
             # Full-file endgame snap. Sample probes are cheap, but on the
             # full-file path every probe is a full encode and the current
             # one ships as-is when accepted: a final climb toward the
