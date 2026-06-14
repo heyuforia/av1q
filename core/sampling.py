@@ -10,7 +10,7 @@ from .constants import (
     MINI_SAMPLE_COUNT, MINI_SAMPLE_DURATION, MINI_SAMPLE_MIN_RATIO,
 )
 from .ui import DIM, RED, RESET
-from .util import _temp_files, run_cmd
+from .util import _temp_files, clamp, run_cmd
 
 
 def sampling_plan(duration, cfg):
@@ -98,6 +98,51 @@ def select_samples(scenes, complexity, duration, count, keyframes, cfg):
             used.add(best["time"])
 
     return selected or None
+
+
+def complexity_bias_margin(complexity, sample_scenes, base_margin, floor_margin):
+    """Estimate the sample→full bitrate margin from this file's complexity spread.
+
+    The floor search needs to know how much hotter the sampled scenes
+    encode than the whole file — samples are cut from the highest-complexity
+    scenes, so they run above the full-file average, and the search must
+    clear margin × floor for the video to clear the floor. That bias is
+    normally a fixed cold-start guess (base_margin, ~1.20). Here it is
+    estimated a priori — before any encode — from the packet-stat
+    complexity (analyze_complexity) that already ranked the scenes: the
+    ratio of the selected scenes' mean complexity to the whole-file mean.
+    Low-variance content (its hottest scenes barely above average) yields a
+    margin near 1.0; high-variance content keeps the full margin.
+
+    Bounded to [floor_margin, base_margin]: the estimate can only TIGHTEN
+    the conservative default, never widen it past it, so a noisy proxy can't
+    push the search below the floor any harder than the fixed margin already
+    might — and the two-sided refine loop backstops whatever it misses.
+    Returns base_margin when the complexity data is missing or degenerate.
+
+    complexity is analyze_complexity's per-5s-window list; sample_scenes is
+    select_samples' output (only `time`/`duration`), so the selected scenes
+    are mapped back to their windows the same way select_samples does.
+    """
+    if not complexity or not sample_scenes:
+        return base_margin
+    comp_map = {int(c["time"] / 5) * 5: c["complexity"] for c in complexity}
+    all_vals = [
+        c["complexity"] for c in complexity
+        if isinstance(c.get("complexity"), (int, float)) and c["complexity"] > 0
+    ]
+    sel_vals = []
+    for s in sample_scenes:
+        v = comp_map.get(int(s["time"] / 5) * 5)
+        if isinstance(v, (int, float)) and v > 0:
+            sel_vals.append(v)
+    if not all_vals or not sel_vals:
+        return base_margin
+    mean_all = sum(all_vals) / len(all_vals)
+    mean_sel = sum(sel_vals) / len(sel_vals)
+    if mean_all <= 0:
+        return base_margin
+    return clamp(mean_sel / mean_all, floor_margin, base_margin)
 
 
 def extract_samples(source, scenes, keyframes, cfg, file_hash=None):

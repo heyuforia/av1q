@@ -97,6 +97,53 @@ def decay_prior(per_file_cal, global_cal):
     return None, None
 
 
+# Sample→full bitrate ratio range. Samples cut from the hottest scenes
+# encode richer than the full file, so the ratio (full ÷ sample) is < 1;
+# values outside [0.5, 1.0] are treated as corrupt and skipped (mirrors the
+# gate in effective_sample_floor).
+RATIO_MIN, RATIO_MAX = 0.5, 1.0
+
+
+def ratio_prior(per_file_cal, global_cal, margin):
+    """Pick the sample→full bitrate ratio for the search's floor threshold.
+
+    Mirrors decay_prior and calibration_offset: a per-file measured ratio
+    is a direct measurement of this file and trusted as-is; the cohort
+    average is shrunk toward the margin-implied ratio (1/margin — what
+    effective_sample_floor would otherwise assume) by n/(n+COHORT_SHRINK_K).
+
+    This is the cross-file half of the sample→full bitrate calibration. The
+    cohort already learns the ratio after every file
+    (update_global_calibration); this is what finally feeds it back into the
+    next file's floor search, instead of every fresh file re-paying the
+    conservative-margin tax (the search over-predicting the video bitrate,
+    capping the quantizer too low, and shipping a video well over the floor
+    that the refine loop then has to climb back down with a second full
+    encode).
+
+    Returns (ratio, source_label); (None, None) when neither source has a
+    usable value (the search then falls back to the raw margin).
+    """
+    if isinstance(per_file_cal, dict):
+        r = per_file_cal.get("ratio")
+        if isinstance(r, (int, float)) and RATIO_MIN <= r <= RATIO_MAX:
+            return float(r), "per-file"
+    if isinstance(global_cal, dict):
+        g = global_cal.get("ratio")
+        if isinstance(g, (int, float)) and RATIO_MIN <= g <= RATIO_MAX:
+            n = global_cal.get("n_ratio")
+            if not isinstance(n, int) or n < 1:
+                n = 1
+            implied = 1.0 / margin if margin and margin > 0 else 1.0
+            w = n / (n + COHORT_SHRINK_K)
+            shrunk = g * w + implied * (1 - w)
+            label = f"cohort n={n}"
+            if abs(g - shrunk) >= 0.005:
+                label += f", shrunk from {g:.2f}"
+            return shrunk, label
+    return None, None
+
+
 def update_global_calibration(cache_dir, vmaf_offset=None, ratio=None,
                               decay=None):
     """Roll new measurements into the cohort calibration cache.

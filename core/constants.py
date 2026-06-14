@@ -35,6 +35,18 @@ BITRATE_BAND = 1.1
 # floor while leaving room for ratio noise.
 EVEN_SAMPLE_MARGIN = 1.05
 
+# Lower bound for the complexity-derived sample→full margin (see
+# complexity_bias_margin in core/sampling.py). For scene-selected samples
+# the bias the floor search needs — how much hotter the sampled (hottest)
+# scenes encode than the whole file — is estimated per file from the
+# packet-stat complexity spread instead of the fixed cold-start margin.
+# This floor caps how far that estimate may tighten the margin, bounding
+# the downside when the source-codec complexity proxy under-reads the true
+# AV1 bitrate bias (the two-sided refine loop still backstops any floor
+# miss). It sits above EVEN_SAMPLE_MARGIN: a scene-selected sample is
+# never as representative as an evenly-spaced one.
+COMPLEXITY_MARGIN_FLOOR = 1.10
+
 # Full-encode VMAF this far above target is treated as wasted bitrate worth
 # a re-encode at higher CQ (unless the bitrate floor is what's holding CQ
 # down). Also caps the search loop's acceptance band and bounds the

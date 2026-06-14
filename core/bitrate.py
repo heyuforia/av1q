@@ -52,16 +52,25 @@ def measured_kbps(path, duration, tag):
     return video_kbps(path, duration)
 
 
-def effective_sample_floor(min_kbps, margin, calibration=None):
+def effective_sample_floor(min_kbps, margin, calibration=None, ratio_prior=None):
     """Sample-bitrate threshold that predicts full video clears min_kbps.
 
     Samples are cut from max-complexity scenes, so they encode at a higher
-    bitrate than the full video at the same CQ. When a measured per-file
-    sample→full ratio is cached, use it; otherwise fall back to the default
-    margin.
+    bitrate than the full video at the same quantizer. Sources of the
+    sample→full ratio, in order of trust:
+
+      1. a measured per-file ratio (this exact file, after one full encode)
+      2. the cohort ratio prior (learned across files — see ratio_prior in
+         core/calibrate.py; this is what lets a fresh file skip the
+         conservative-margin tax once a few similar files have been seen)
+      3. the cold-start margin
+
+    The first two convert the floor by dividing; the margin multiplies.
     """
     if calibration:
         r = calibration.get("ratio")
         if isinstance(r, (int, float)) and 0.5 <= r <= 1.0:
             return min_kbps / r
+    if isinstance(ratio_prior, (int, float)) and 0.5 <= ratio_prior <= 1.0:
+        return min_kbps / ratio_prior
     return min_kbps * margin

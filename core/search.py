@@ -75,7 +75,7 @@ def _hyperbolic_crossing(pts, lf):
 
 def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
            *, tag=None, measure_fn=None, probe_fn=None, s2_fn=None,
-           s2_ref_index=None, decay_prior=None):
+           s2_ref_index=None, decay_prior=None, ratio_prior=None):
     """Find the optimal quantizer that hits the target VMAF.
 
     Adaptive Newton-style search: encode at successive grid points,
@@ -131,11 +131,14 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
 
     def eff_floor():
         # Sample path converts the video floor into a sample-bitrate threshold.
-        # Full path already measures video-only kbps, so compare raw.
+        # Full path already measures video-only kbps, so compare raw. The
+        # cohort ratio prior (ratio_prior) supplements the per-file ratio in
+        # calibration: per-file > cohort > margin (see effective_sample_floor).
         if not tag:
             return min_kbps
         return effective_sample_floor(
-            min_kbps, cfg["bitrate_margin"], cache.get("calibration")
+            min_kbps, cfg["bitrate_margin"], cache.get("calibration"),
+            ratio_prior=ratio_prior,
         )
 
     def local_decay(target_kbps):

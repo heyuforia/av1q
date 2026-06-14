@@ -29,19 +29,21 @@ from .analyze import analyze_complexity, detect_scenes, get_keyframes
 from .bitrate import calc_kbps, video_kbps
 from .cache import load_cache
 from .calibrate import (
-    DECAY_MAX, DECAY_MIN, calibration_offset, decay_prior,
+    DECAY_MAX, DECAY_MIN, calibration_offset, decay_prior, ratio_prior,
     load_global_calibration, update_global_calibration,
 )
 from .constants import (
-    BITRATE_BAND, DEFAULT_BITRATE_DECAY, ENDGAME_SNAP_GAIN,
-    EVEN_SAMPLE_MARGIN, INTRA_ONLY_CODECS,
+    BITRATE_BAND, COMPLEXITY_MARGIN_FLOOR, DEFAULT_BITRATE_DECAY,
+    ENDGAME_SNAP_GAIN, EVEN_SAMPLE_MARGIN, INTRA_ONLY_CODECS,
     MIN_BITRATE_KBPS, MINI_SAMPLE_COUNT, MINI_SAMPLE_DURATION,
     MINI_SAMPLE_MIN_RATIO, TARGET_VMAF_BY_RES, VIDEO_EXTENSIONS,
     VMAF_OVERSHOOT,
 )
 from .crop import crop_token, detect_crop_for_file, load_crop_sidecar
 from .probe import get_fps, probe_video, res_tier
-from .sampling import extract_samples, sampling_plan, select_samples
+from .sampling import (
+    complexity_bias_margin, extract_samples, sampling_plan, select_samples,
+)
 from .ui import (
     BOLD, CHECK, CROSS, DIM, GREEN, MIDDOT, ORANGE, PURPLE, RED, RESET, SEP,
     fmt_s2, fmt_size, fmt_time, vmaf_pass_color,
@@ -413,6 +415,7 @@ def process_videos(cfg, engine):
 
             sample_scenes = sample_src = None
             even_sampling = False
+            complexity = []  # per-window complexity; used for the margin estimate
             plan = sampling_plan(meta["duration"], cfg)
 
             if existing_q is None and plan:
@@ -584,18 +587,63 @@ def process_videos(cfg, engine):
                         f" {BOLD}{sample_target:.2f}{RESET}"
                         f" {DIM}(offset {off:+.2f} {off_src}){RESET}"
                     )
-                # Evenly-spaced samples are representative, so shrink the
-                # complexity-bias margin toward 1.0 — otherwise the search
-                # over-predicts the video bitrate, caps the quantizer too
-                # low, and ships a video well over the floor that the refine
-                # loop then has to climb back down one full encode at a time.
+                # Sample→full bitrate margin for the floor search — how much
+                # hotter the sampled scenes encode than the whole video.
+                # Evenly-spaced samples are representative (ratio ~1.0), so
+                # shrink toward the small EVEN_SAMPLE_MARGIN; otherwise the
+                # search over-predicts the video bitrate, caps the quantizer
+                # too low, and ships a video well over the floor that refine
+                # then climbs back down a full encode at a time. Scene-
+                # selected samples ARE complexity-biased, but how much is
+                # estimated per file from its own complexity spread instead
+                # of a fixed guess — bounded so it can only tighten the
+                # cold-start margin. The cohort ratio prior (below)
+                # supersedes this margin once a few files have been measured;
+                # the margin still seeds that prior's shrink target.
+                search_margin = cfg["bitrate_margin"]
+                if even_sampling:
+                    search_margin = min(search_margin, EVEN_SAMPLE_MARGIN)
+                elif sample_scenes:
+                    search_margin = complexity_bias_margin(
+                        complexity, sample_scenes, search_margin,
+                        COMPLEXITY_MARGIN_FLOOR,
+                    )
                 search_cfg = cfg
-                if even_sampling and cfg["bitrate_margin"] > EVEN_SAMPLE_MARGIN:
-                    search_cfg = {**cfg, "bitrate_margin": EVEN_SAMPLE_MARGIN}
+                if search_margin != cfg["bitrate_margin"]:
+                    search_cfg = {**cfg, "bitrate_margin": search_margin}
+                    if min_kbps and not even_sampling:
+                        print(
+                            f"{lbl('calibr')}sample margin"
+                            f" {BOLD}{search_margin:.2f}{RESET}"
+                            f" {DIM}(complexity spread){RESET}"
+                        )
+
+                # Cohort sample→full ratio prior: the cross-file other half
+                # of the floor calibration. Per-file ratio (in calibration)
+                # still takes precedence inside effective_sample_floor; this
+                # only kicks in for files that haven't been encoded yet, so a
+                # fresh file aims at the learned floor instead of paying the
+                # conservative-margin tax. Skipped for evenly-spaced samples:
+                # they are representative (ratio ~1.0), so EVEN_SAMPLE_MARGIN
+                # is a better prior than the scene-biased cohort ratio — the
+                # per-file ratio still applies to them on reruns via
+                # effective_sample_floor.
+                rat_prior, rat_src = (None, None)
+                if not even_sampling:
+                    rat_prior, rat_src = ratio_prior(
+                        cache.get("calibration"), global_cal, search_margin
+                    )
+                if (min_kbps and rat_prior is not None and rat_src != "per-file"
+                        and abs(rat_prior - 1.0 / search_margin) >= 0.01):
+                    print(
+                        f"{lbl('calibr')}bitrate ratio {BOLD}{rat_prior:.2f}{RESET}"
+                        f" {DIM}({rat_src}){RESET}"
+                    )
+
                 best_q, _, _, vt, search_state = core_search.search(
                     sample_src, meta, sample_target, cache, cp,
                     do_enc_sample, search_cfg, engine, tag="sample",
-                    decay_prior=dec_prior,
+                    decay_prior=dec_prior, ratio_prior=rat_prior,
                     measure_fn=lambda ref, dist, q: measure(
                         ref, dist, q, tag="sample"),
                     probe_fn=probe_video,
@@ -659,9 +707,21 @@ def process_videos(cfg, engine):
             # SSIMU2 info per full-encode quantizer (display only).
             s2_seen = {}
 
-            def kbps_suffix(kbps):
-                """Trailing video-only bitrate field for a result line."""
-                return f"  {DIM}{kbps}kbps{RESET}" if kbps else ""
+            def size_kbps_suffix(path, kbps):
+                """Trailing 'size  video-kbps' field for a full-encode result
+                line, mirroring the sample probe lines (file size then
+                video-only bitrate). The size is the muxed output on disk
+                (audio/subs included); the kbps stays video-only for floor
+                parity, so the two can legitimately differ."""
+                parts = []
+                try:
+                    if path is not None and path.exists():
+                        parts.append(fmt_size(path.stat().st_size))
+                except OSError:
+                    pass
+                if kbps:
+                    parts.append(f"{kbps}kbps")
+                return f"  {DIM}{' '.join(parts)}{RESET}" if parts else ""
 
             # Bitrate of the verified best_q encode: shown on the verify
             # line and reused by the calibration block below so video_kbps
@@ -699,7 +759,8 @@ def process_videos(cfg, engine):
                 print(
                     f"{'':>{LBL + 1}}VMAF {BOLD}{vc}{best_vmaf['mean']:.2f}{RESET}"
                     f"  {DIM}P5 {best_vmaf['p5']:.2f}{RESET}"
-                    f"{fmt_s2(s2_seen[best_q])}{kbps_suffix(actual_kbps_now)}"
+                    f"{fmt_s2(s2_seen[best_q])}"
+                    f"{size_kbps_suffix(dst_path(best_q), actual_kbps_now)}"
                 )
 
             # Persist sample↔full calibration BEFORE the refine loop so a
@@ -933,7 +994,8 @@ def process_videos(cfg, engine):
                 print(
                     f"{'':>{LBL + 1}}VMAF {BOLD}{vc_a}{adj['mean']:.2f}{RESET}"
                     f"  {DIM}P5 {adj['p5']:.2f}{RESET}"
-                    f"{fmt_s2(s2_seen.get(try_q))}{kbps_suffix(adj_kbps)}"
+                    f"{fmt_s2(s2_seen.get(try_q))}"
+                    f"{size_kbps_suffix(dst_path(try_q), adj_kbps)}"
                 )
                 record_point(try_q, adj, kbps=adj_kbps)
                 best_q, best_vmaf = try_q, adj
