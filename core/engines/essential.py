@@ -46,12 +46,60 @@ def crf_range(lo, hi):
     return [qcrf(lo + i * CRF_STEP) for i in range(max(0, n) + 1)]
 
 
+# Encoder flags av1q-essential sets itself (encode_essential / build_color_args).
+# A user --enc-args value repeating one of these would emit it twice on the
+# command line, so filter_enc_args drops them (with a warning) and av1q's own
+# value wins — users should reach for av1q's matching CLI option instead
+# (e.g. --tune, --film-grain). All of these take a following value.
+MANAGED_ENC_FLAGS = {
+    "-i", "-b", "--preset", "--crf", "--tune",
+    "--film-grain", "--film-grain-denoise",
+    "--color-primaries", "--transfer-characteristics",
+    "--matrix-coefficients", "--color-range",
+    "--mastering-display", "--content-light",
+    "--progress", "--hide-banner",
+}
+
+
+def filter_enc_args(tokens):
+    """Strip any av1q-managed flag (and its value) from a flat token list.
+
+    Returns (kept, dropped) where dropped is the list of managed flag names
+    that were removed, so the caller can warn once. Handles both the
+    '--flag value' and '--flag=value' spellings; managed flags all take a
+    value, so the space-separated form consumes the next token too.
+    """
+    kept, dropped = [], []
+    i, n = 0, len(tokens)
+    while i < n:
+        tok = tokens[i]
+        base = tok.split("=", 1)[0]
+        if base in MANAGED_ENC_FLAGS:
+            dropped.append(base)
+            # Consume an attached value token for the space-separated form.
+            # A value never starts with '-' here, so a following flag (e.g.
+            # a malformed trailing '--tune') is left for its own iteration.
+            if "=" not in tok and i + 1 < n and not tokens[i + 1].startswith("-"):
+                i += 2
+            else:
+                i += 1
+            continue
+        kept.append(tok)
+        i += 1
+    return kept, dropped
+
+
 def enc_signature_e(cfg, crop=None):
     """Tag covering everything that changes Essential's output for one
-    source at a given CRF: preset, film grain, tune, and crop. The tune
-    knob is new vs av1q's signature — Essential exposes it per-encode.
+    source at a given CRF: preset, film grain, tune, crop, and any extra
+    raw encoder flags. The tune knob is new vs av1q's signature —
+    Essential exposes it per-encode. The enc-args hash (cfg['enc_args_sig'],
+    None when no --enc-args) only widens the tag when extra flags are
+    present, so a plain run produces the exact same signature as before.
     """
-    return f"p{cfg['preset']}g{cfg['film_grain']}t{cfg['tune']}{crop_token(crop)}"
+    xa = cfg.get("enc_args_sig")
+    extra = f"x{xa}" if xa else ""
+    return f"p{cfg['preset']}g{cfg['film_grain']}t{cfg['tune']}{extra}{crop_token(crop)}"
 
 
 # ffprobe names -> SvtAv1EncApp names (Appendix A.2). Identical names are
@@ -178,6 +226,9 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
         "--progress", "2", "--hide-banner", "1",
     ]
     enc_cmd += build_color_args(meta)
+    # User-supplied raw encoder flags (already filtered of anything av1q
+    # manages, so these can't duplicate the flags above). Appended last.
+    enc_cmd += list(cfg.get("enc_args") or [])
 
     ff_log = make_temp_log(cfg["cache_dir"], "y4mfeed", "log")
     bar_w = 20
@@ -404,7 +455,11 @@ class EssentialEngine(Engine):
     tmp_patterns = ("*.tmp.mkv", "*.tmp.webm")
     rec_q_key = "crf"
     rec_bound_keys = ("min_crf", "max_crf")
-    rec_extra_keys = ("tune",)
+    # enc_args_sig is None for a plain run, so a recommended block written
+    # before this field existed (missing -> .get() None) still matches a
+    # plain rerun; a value present means --enc-args changed the output, so
+    # the search is correctly re-run instead of resumed at the old CRF.
+    rec_extra_keys = ("tune", "enc_args_sig")
     seed_key = "seed_crf"
     seed_prompt_hint = "(0.25 steps, Enter = auto)"
     cal_q_key = "at_crf"

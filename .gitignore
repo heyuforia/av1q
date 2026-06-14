@@ -15,6 +15,9 @@ AV1 Output/
 *.crop.json
 *.tmp.mkv
 
+# Local-only custom launchers (per-user encoder flag sets)
+*.bat
+
 # Python
 __pycache__/
 *.py[cod]

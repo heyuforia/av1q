@@ -25,7 +25,9 @@ Tools expected under ./tools (any subfolder):
 """
 
 import argparse
+import hashlib
 import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -54,7 +56,7 @@ from core.engines.essential import (
     EssentialEngine,
     CRF_STEP, qcrf, crf_str, crf_range, enc_signature_e,
     SVT_PRIMARIES, SVT_TRANSFER, SVT_MATRIX, SVT_RANGE, build_color_args,
-    encode_essential,
+    encode_essential, MANAGED_ENC_FLAGS, filter_enc_args,
 )
 from core.probe import _ratval, is_vfr, probe_hdr_metadata
 from core.sampling import clean_sample_source
@@ -221,6 +223,16 @@ def main():
         help="Starting CRF for the search (default: auto from source bitrate; "
              "prompted interactively when run in a terminal)",
     )
+    parser.add_argument(
+        "--enc-args", type=str, default=None,
+        help="Extra raw flags passed straight to SvtAv1EncApp, as one quoted "
+             "string, e.g. --enc-args=\"--scd 1 --sharpness 7\". Use the "
+             "--enc-args=\"...\" (equals) form so values starting with - are "
+             "not mistaken for options. Flags av1q sets itself (--tune, "
+             "--film-grain, --color-*, etc.) are ignored here — use the "
+             "matching av1q option instead. Changing this re-runs the search; "
+             "clear _cache/_essential if you want a clean slate.",
+    )
 
     args = parser.parse_args()
 
@@ -238,6 +250,28 @@ def main():
         parser.error("--metric-every must be >= 1")
     if args.seed_crf is not None and not args.min_crf <= args.seed_crf <= args.max_crf:
         parser.error("--seed-crf must be within --min-crf..--max-crf")
+
+    # Parse extra encoder flags: shlex-split the one quoted string, drop
+    # anything av1q manages (warn once), and fingerprint the survivors so
+    # the signature/recommended block separate enc-args runs from plain ones.
+    enc_args = []
+    enc_args_sig = None
+    if args.enc_args:
+        try:
+            tokens = shlex.split(args.enc_args)
+        except ValueError as e:
+            parser.error(f"--enc-args is not a valid flag string: {e}")
+        enc_args, dropped = filter_enc_args(tokens)
+        if dropped:
+            print(
+                f"{ORANGE}Ignoring --enc-args flags av1q sets itself: "
+                f"{', '.join(dict.fromkeys(dropped))}. Use the matching av1q "
+                f"option instead (e.g. --tune, --film-grain).{RESET}"
+            )
+        if enc_args:
+            enc_args_sig = hashlib.sha256(
+                " ".join(enc_args).encode("utf-8")
+            ).hexdigest()[:8]
 
     cache_dir = SCRIPT_DIR / "_cache"
     cfg = {
@@ -264,6 +298,8 @@ def main():
         "use_crops": not args.no_crops,
         "auto_crop": args.auto_crop,
         "seed_crf": qcrf(args.seed_crf) if args.seed_crf is not None else None,
+        "enc_args": enc_args,
+        "enc_args_sig": enc_args_sig,
         "sample_count": args.samples,
         "sample_duration": 6.0,
         "min_scene_duration": 2.0,
