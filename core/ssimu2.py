@@ -20,7 +20,7 @@ import subprocess
 
 from .tools import find_ffvship_optional
 from .ui import DIM, RED, RESET
-from .util import _temp_files, make_temp_log
+from .util import _temp_files, make_temp_log, suppress_win_error_dialog
 
 # Demuxed video packet counts, memoized so the source of a long file is
 # only counted once across its verify/refine/final measurements.
@@ -141,9 +141,14 @@ def _run_ffvship(ref, dist, meta, cache_dir, exe,
         cmd += ["--every", str(every)]
     cmd += ffvship_crop_args(meta.get("crop"), meta["w"], meta["h"])
     try:
-        r = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
+        # A broken FFVship (missing runtime, GPU/driver mismatch) fails to
+        # initialize and Windows pops a modal error box that hangs the batch
+        # until dismissed. Suppress it so the crash stays a silent non-zero
+        # exit — SSIMU2 is a display-only column and must never block the run.
+        with suppress_win_error_dialog():
+            r = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
         if r.returncode != 0:
             if verbose:
                 tail = "\n".join(

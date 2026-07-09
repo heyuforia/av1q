@@ -1,5 +1,6 @@
 """Process, filesystem, and hashing utilities shared by every stage."""
 
+import contextlib
 import hashlib
 import json
 import os
@@ -8,6 +9,34 @@ import subprocess
 import time
 
 _temp_files = set()
+
+
+@contextlib.contextmanager
+def suppress_win_error_dialog():
+    """Stop a child process that fails to start — e.g. FFVship's
+    0xc0000142 DLL-init crash — from popping a modal Windows error box
+    that blocks the batch until it's clicked away.
+
+    A child inherits its parent's process error mode at spawn time, so
+    setting SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX across the
+    spawn suppresses both the loader "unable to start correctly" box and
+    the crash box. The child still exits non-zero, which callers already
+    treat as failure. The prior mode is restored afterward, so nothing
+    else is affected. No-op off Windows.
+    """
+    if os.name != "nt":
+        yield
+        return
+    import ctypes
+
+    SEM_FAILCRITICALERRORS = 0x0001
+    SEM_NOGPFAULTERRORBOX = 0x0002
+    k32 = ctypes.windll.kernel32
+    prev = k32.SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX)
+    try:
+        yield
+    finally:
+        k32.SetErrorMode(prev)
 
 
 def run_cmd(cmd):
