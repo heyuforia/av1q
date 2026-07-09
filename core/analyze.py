@@ -5,14 +5,30 @@ import json
 import subprocess
 
 from .probe import detect_hwaccel
-from .util import _temp_files, escape_filter_path, make_temp_log
+from .util import _temp_files, clamp, escape_filter_path, make_temp_log
 
 
-def detect_scenes(source, cfg):
-    """Detect scene changes using ffmpeg's scdet filter."""
+def detect_scenes(source, cfg, duration=None):
+    """Detect scene changes using ffmpeg's scdet filter.
+
+    scdet decodes the whole file (downscaled to 640px) frame by frame, so
+    its wall time scales with runtime — measured ~13x realtime for 1080p
+    H.264, slower for 4K/HEVC. A fixed short cap silently killed the scan
+    on feature-length sources and dropped the pipeline to evenly-spaced
+    samples on exactly the long films that most benefit from complexity-
+    biased selection. The scan budget therefore scales with duration (a
+    1x-realtime allowance — many times the measured throughput, so it
+    only trips on a stalled decode), floored for short files and ceiled so
+    a genuinely hung process still can't block forever. A timeout is a
+    graceful miss: it returns [] like any other failure and the caller
+    falls back to even sampling.
+    """
     cache_dir = cfg["cache_dir"]
     log = make_temp_log(cache_dir, "scdet", "txt")
     log_path = escape_filter_path(log)
+    scan_timeout = (
+        int(clamp(duration, 300, 3600)) if duration and duration > 0 else 300
+    )
 
     try:
         hw = detect_hwaccel()
@@ -30,7 +46,7 @@ def detect_scenes(source, cfg):
             ]
             r = subprocess.run(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, timeout=300,
+                text=True, timeout=scan_timeout,
             )
             if r.returncode == 0:
                 break

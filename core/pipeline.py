@@ -440,7 +440,7 @@ def process_videos(cfg, engine):
                         keyframes = cache["keyframes"]
                     else:
                         print(f"{lbl('analyze')}Detecting scenes...")
-                        scenes = detect_scenes(filepath, cfg)
+                        scenes = detect_scenes(filepath, cfg, meta["duration"])
                         complexity = analyze_complexity(filepath)
                         keyframes = get_keyframes(filepath)
                         cache.update(scenes=scenes, complexity=complexity,

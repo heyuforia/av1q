@@ -256,7 +256,7 @@ def detect_crop_for_file(source, meta, cfg, file_hash, label_prefix=" "):
     complexity = []
     keyframes = []
     if meta["duration"] >= cfg["short_threshold"]:
-        scenes = detect_scenes(source, sample_cfg)
+        scenes = detect_scenes(source, sample_cfg, meta["duration"])
         complexity = analyze_complexity(source)
         keyframes = get_keyframes(source)
 
