@@ -2,12 +2,14 @@
 
 import hashlib
 import json
+import math
 import os
 import time
 
 from .analyze import get_keyframes
 from .constants import (
     MINI_SAMPLE_COUNT, MINI_SAMPLE_DURATION, MINI_SAMPLE_MIN_RATIO,
+    SAMPLE_COUNT_MAX, SAMPLE_SCALE_K, SAMPLE_SCALE_REF,
 )
 from .ui import DIM, RED, RESET
 from .util import _temp_files, clamp, run_cmd
@@ -19,18 +21,28 @@ def sampling_plan(duration, cfg):
     'standard' — the configured plan, when the source is meaningfully
     longer than its extracted total (1.25×; below that each probe encodes
     nearly the whole file and the final full encode + verify come on top).
-    'mini' — a scaled-down plan for short files that used to fall through
-    to full-file search, where every probe is a full encode: a few tiny
-    probes cost a fraction of one full encode and seed the search just as
-    well. None — ultra-short sources where even mini probes wouldn't
-    amortize the sample path's fixed cost; full-file search is cheaper.
+    The scene count scales up with duration so long features get enough
+    distinct scenes to represent their complexity range (see
+    SAMPLE_SCALE_* in constants): flat at the base count up to the
+    reference runtime, then +SAMPLE_SCALE_K per doubling, capped at
+    SAMPLE_COUNT_MAX. Clip length stays fixed. 'mini' — a scaled-down
+    plan for short files that used to fall through to full-file search,
+    where every probe is a full encode: a few tiny probes cost a fraction
+    of one full encode and seed the search just as well. None —
+    ultra-short sources where even mini probes wouldn't amortize the
+    sample path's fixed cost; full-file search is cheaper.
     """
+    base = cfg["sample_count"]
     sampling_min = max(
         cfg["short_threshold"],
-        cfg["sample_count"] * cfg["sample_duration"] * 1.25,
+        base * cfg["sample_duration"] * 1.25,
     )
     if duration > sampling_min:
-        return cfg["sample_count"], cfg["sample_duration"], "standard"
+        count = int(clamp(
+            round(base + SAMPLE_SCALE_K * math.log2(duration / SAMPLE_SCALE_REF)),
+            base, SAMPLE_COUNT_MAX,
+        ))
+        return count, cfg["sample_duration"], "standard"
     if duration > MINI_SAMPLE_COUNT * MINI_SAMPLE_DURATION * MINI_SAMPLE_MIN_RATIO:
         return MINI_SAMPLE_COUNT, MINI_SAMPLE_DURATION, "mini"
     return None

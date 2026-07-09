@@ -76,3 +76,22 @@ ENDGAME_SNAP_GAIN = 0.03
 MINI_SAMPLE_COUNT = 3
 MINI_SAMPLE_DURATION = 2.0
 MINI_SAMPLE_MIN_RATIO = 2.5
+
+# Duration-aware scaling for the standard sampling plan. A fixed sample
+# count captures a fixed slice of runtime, so an hours-long feature is
+# sampled at a small fraction of a short clip's coverage — too few distinct
+# scenes to represent the film's full complexity range, which pushes the
+# search onto its expensive full-file refine backstop (a whole re-encode)
+# whenever the sample estimate misses. The sampled scene COUNT therefore
+# grows with duration; clip length stays fixed (6s already spans multiple
+# GOPs — variety comes from more scenes, not longer ones). Growth is
+# logarithmic off SAMPLE_SCALE_REF, the reference runtime the base count
+# (cfg["sample_count"], i.e. --samples) is tuned for: the base band is
+# unchanged at/below the reference, then +SAMPLE_SCALE_K scenes per
+# doubling of duration, capped at SAMPLE_COUNT_MAX so search cost stays a
+# small fraction of a long encode. --samples is the base the curve scales
+# up FROM, so raising it shifts the whole curve; a base at or above the cap
+# pins the count flat (clamp with lo >= hi returns lo).
+SAMPLE_SCALE_REF = 600.0
+SAMPLE_SCALE_K = 4.0
+SAMPLE_COUNT_MAX = 24
