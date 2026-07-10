@@ -328,6 +328,18 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
     if not math.isfinite(vm["mean"]):
         return None, None, enc_time, vmaf_time, None
 
+    # Where to aim inside the acceptance band [target - tol,
+    # target + VMAF_OVERSHOOT] differs by path. The full path ships
+    # whichever probe lands in the band first, so it aims at the target
+    # itself and satisfices — every probe there is a full encode. The
+    # sample path's landing is a PREDICTION INPUT: the final encode
+    # lands wherever the sample landed plus the sample→full offset
+    # error, so any slack left here goes straight into the verify/refine
+    # miss budget, where correcting it costs a full re-encode. Sample
+    # probes are cheap — aim at the band's center so slope error and
+    # offset error spread symmetrically inside it.
+    aim = target + (VMAF_OVERSHOOT - tol) / 2 if tag else target
+
     # Floor-bound detection: VMAF comfortably above target AND bitrate well
     # below floor. In this regime VMAF is not binding — it's a pure bitrate
     # targeting problem. Skip VMAF on intermediate probes; verify once on
@@ -395,10 +407,20 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
             if q not in bitrate_points:
                 break
     else:
-        for _ in range(4):
-            if target - tol <= vm["mean"] <= target + VMAF_OVERSHOOT:
+        # The sample path gets one extra iteration: converging on the aim
+        # (instead of stopping anywhere in the band) occasionally takes
+        # one more cheap probe than band-satisficing did.
+        for _ in range(5 if tag else 4):
+            in_band = target - tol <= vm["mean"] <= target + VMAF_OVERSHOOT
+            if tag is None and in_band:
                 break
-            delta = (vm["mean"] - target) / slope
+            # Sample-path convergence: within tol of the aim is done (tol
+            # doubles as the epsilon — VMAF differences under it are
+            # noise). Grid resolution bounds it below: when the remaining
+            # delta rounds to no step, the `next_q == q` break fires.
+            if tag is not None and abs(vm["mean"] - aim) <= tol:
+                break
+            delta = (vm["mean"] - aim) / slope
             effective_max = min(max_q, floor_cap, estimate_max_q_for_floor())
 
             # At the quantizer ceiling (can't go higher without violating
@@ -419,9 +441,13 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
                 break
 
             next_q = grid.quantize(clamp(q + delta, min_q, effective_max))
-            if next_q == q:
+            if next_q == q and not in_band:
+                # Outside the band with a sub-step delta: force one step
+                # toward it rather than stalling short. Inside the band a
+                # sub-step delta means grid-converged — fall through to
+                # the `next_q == q` break below.
                 next_q = grid.quantize(
-                    q + (grid.step if vm["mean"] > target else -grid.step)
+                    q + (grid.step if vm["mean"] > aim else -grid.step)
                 )
             next_q = grid.quantize(clamp(next_q, min_q, effective_max))
 
@@ -487,7 +513,25 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
                 return False
         return True
 
-    best = max((c for c in tested if valid_q(c)), default=None)
+    valid = [c for c in tested if valid_q(c)]
+    if tag is None or floor_bound:
+        # Full path / floor-bound: highest valid quantizer = smallest
+        # file that still passes (floor-bound entries carry NaN VMAF, so
+        # aim distance is meaningless there).
+        best = max(valid, default=None)
+    else:
+        # The sample path stepped toward the aim, so several in-band
+        # candidates can exist; pick the landing closest to it. Under
+        # monotone VMAF this equals the old max(valid) whenever every
+        # candidate sits above the aim, and picks the better-centered
+        # one when the probes straddle it — a band-bottom pick would
+        # hand its slack straight to the full-encode miss budget.
+        # VMAF-less entries (the min_q short-circuit) rank last; ties
+        # prefer the higher quantizer (smaller file).
+        def aim_dist(c):
+            m = tested[c].get("mean", float("nan"))
+            return abs(m - aim) if math.isfinite(m) else float("inf")
+        best = min(valid, key=lambda c: (aim_dist(c), -c), default=None)
     if best is None:
         # No quantizer satisfies both VMAF target and bitrate floor in the
         # tested range. Prefer the lowest one tested — highest bitrate

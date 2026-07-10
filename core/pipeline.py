@@ -29,15 +29,16 @@ from .analyze import analyze_complexity, detect_scenes, get_keyframes
 from .bitrate import calc_kbps, video_kbps
 from .cache import load_cache
 from .calibrate import (
-    DECAY_MAX, DECAY_MIN, calibration_offset, decay_prior, ratio_prior,
-    load_global_calibration, update_global_calibration,
+    DECAY_MAX, DECAY_MIN, RATIO_MAX, RATIO_MIN, calibration_offset,
+    decay_prior, ratio_prior, load_global_calibration,
+    update_global_calibration,
 )
 from .constants import (
     BITRATE_BAND, COMPLEXITY_MARGIN_FLOOR, DEFAULT_BITRATE_DECAY,
     ENDGAME_SNAP_GAIN, EVEN_SAMPLE_MARGIN, INTRA_ONLY_CODECS,
     MIN_BITRATE_KBPS, MINI_SAMPLE_COUNT, MINI_SAMPLE_DURATION,
-    MINI_SAMPLE_MIN_RATIO, TARGET_VMAF_BY_RES, VIDEO_EXTENSIONS,
-    VMAF_OVERSHOOT,
+    MINI_SAMPLE_MIN_RATIO, SCENE_OFFSET_PRIOR, TARGET_VMAF_BY_RES,
+    VIDEO_EXTENSIONS, VMAF_OVERSHOOT,
 )
 from .crop import crop_token, detect_crop_for_file, load_crop_sidecar
 from .probe import get_fps, probe_video, res_tier
@@ -597,13 +598,20 @@ def process_videos(cfg, engine):
                 # Apply learned VMAF offset (sample over/under-predicts
                 # full VMAF) so the sample search aims at the quantizer
                 # that will hit `target` on the full video. Per-file
-                # calibration takes precedence; on first encounter we fall
-                # back to the cohort average (shrunk toward 0 while the
-                # cohort is small) so new files start informed instead of
-                # paying a second-encode tax to learn the offset.
+                # calibration takes precedence; on first encounter we
+                # fall back to the cohort average, shrunk toward the
+                # sampling mode's structural center — complexity-selected
+                # samples are the hardest scenes and read systematically
+                # LOW (SCENE_OFFSET_PRIOR, returned directly while the
+                # cohort is empty), evenly-spaced ones are representative
+                # (center 0). Even-sampled files never consume the scene
+                # cohort: its whole content is scene-selection bias that
+                # doesn't apply to them.
                 sample_target = target
                 off, off_src = calibration_offset(
-                    cache.get("calibration"), global_cal
+                    cache.get("calibration"),
+                    None if even_sampling else global_cal,
+                    prior_center=0.0 if even_sampling else SCENE_OFFSET_PRIOR,
                 )
                 if off is not None and abs(off) >= 0.1:
                     sample_target = clamp(target + off, 0.0, 100.0)
@@ -815,7 +823,7 @@ def process_videos(cfg, engine):
             if (sample_kbps_at_best and actual_kbps_now
                     and sample_kbps_at_best > 0):
                 ratio = actual_kbps_now / sample_kbps_at_best
-                if 0.5 <= ratio <= 1.0:
+                if RATIO_MIN <= ratio <= RATIO_MAX:
                     cal_now["ratio"] = ratio
                     cal_updated = True
                     fresh_ratio = ratio
@@ -860,13 +868,21 @@ def process_videos(cfg, engine):
                 # measurements taken this run are rolled in — values
                 # carried over from a previous run aren't double-counted.
                 # (Each engine has its own cohort file; different
-                # encoders must never share calibration.)
-                if (fresh_offset is not None or fresh_ratio is not None
+                # encoders must never share calibration.) Evenly-spaced
+                # samples are representative (offset ~0, ratio ~1.0):
+                # rolling them in would dilute the scene-selection bias
+                # the cohort exists to measure and mis-aim every scene-
+                # sampled file after them, so they keep their per-file
+                # calibration only. Decay is engine physics, not
+                # selection bias — it always rolls.
+                cohort_offset = None if even_sampling else fresh_offset
+                cohort_ratio = None if even_sampling else fresh_ratio
+                if (cohort_offset is not None or cohort_ratio is not None
                         or fresh_decay is not None):
                     update_global_calibration(
                         root_cache,
-                        vmaf_offset=fresh_offset,
-                        ratio=fresh_ratio,
+                        vmaf_offset=cohort_offset,
+                        ratio=cohort_ratio,
                         decay=fresh_decay,
                     )
                     global_cal = load_global_calibration(root_cache)
@@ -889,6 +905,14 @@ def process_videos(cfg, engine):
                 or DEFAULT_BITRATE_DECAY,
                 0.05, 0.4,
             )
+            # VMAF jumps aim at the CENTER of the acceptance band
+            # [target - tol, target + VMAF_OVERSHOOT] and round to the
+            # grid, so slope error spreads symmetrically inside the band.
+            # (The old floor-ed step against a target + OVERSHOOT/2 aim
+            # stacked every landing into the band's top quarter, where
+            # one slope misread walked back out — the +2-then-+1
+            # re-encode crawl this replaces.)
+            refine_aim = target + (VMAF_OVERSHOOT - cfg["vmaf_tolerance"]) / 2
             full_points = {}
 
             def record_point(q, vm, kbps=None):
@@ -912,9 +936,10 @@ def process_videos(cfg, engine):
                 deficits = []
                 d = target - vm_mean
                 if d > cfg["vmaf_tolerance"]:
-                    deficits.append(
-                        ("VMAF", max(grid.step, grid.ceil(d / slope_v)))
-                    )
+                    deficits.append(("VMAF", max(
+                        grid.step,
+                        grid.quantize((refine_aim - vm_mean) / slope_v),
+                    )))
                 if min_kbps and cur_kbps and cur_kbps < min_kbps:
                     step_b = max(
                         grid.step,
@@ -962,12 +987,9 @@ def process_videos(cfg, engine):
                     if (overshoot <= VMAF_OVERSHOOT or best_q >= ceiling
                             or in_band):
                         break
-                    # Aim mid-band (flooring the step skews the landing
-                    # toward the upper half) so slope error stays inside
-                    # the acceptance band instead of below it.
                     step = max(
                         grid.step,
-                        grid.floor((overshoot - VMAF_OVERSHOOT / 2) / slope_v),
+                        grid.quantize((vm_mean - refine_aim) / slope_v),
                     )
                     try_q = grid.quantize(min(ceiling, best_q + step))
                     # Same economics as the search's endgame snap: a full

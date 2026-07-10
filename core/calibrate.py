@@ -19,25 +19,35 @@ def load_global_calibration(cache_dir):
         return {}
 
 
-# Pseudo-count for shrinking the cohort VMAF offset toward 0 (= "sample
-# predicts full exactly"). The cohort average of n files is blended as if
-# K additional zero-offset files were observed, so a near-empty cohort
-# can't fully steer new files: one outlier first file otherwise mispredicts
-# every following file by its whole offset, costing an extra full encode
-# each (the "cohort n=1" failure). Trust ramps with evidence: n=1 → 33%,
+# Pseudo-count for shrinking the cohort VMAF offset toward its structural
+# center. The cohort average of n files is blended as if K additional
+# center-valued files were observed, so a near-empty cohort can't fully
+# steer new files: one outlier first file otherwise mispredicts every
+# following file by its whole offset, costing an extra full encode each
+# (the "cohort n=1" failure). Trust ramps with evidence: n=1 → 33%,
 # n=10 → 83%, n=50 (N_CAP) → 96%.
 COHORT_SHRINK_K = 2
 
 
-def calibration_offset(per_file_cal, global_cal):
+def calibration_offset(per_file_cal, global_cal, prior_center=0.0):
     """Pick the sample→full VMAF offset used to aim the sample search.
 
     Per-file calibration is a direct measurement of this exact file and is
     trusted as-is. The cohort average is indirect evidence (other files'
-    offsets), so it's shrunk toward 0 by n/(n+COHORT_SHRINK_K).
+    offsets), so it's shrunk toward prior_center by n/(n+COHORT_SHRINK_K).
 
-    Returns (offset, source_label); (None, None) when neither source has a
-    usable value. Values outside ±3.0 are treated as corrupt and skipped.
+    prior_center is the structural expectation for the sampling mode:
+    complexity-selected samples are the file's hardest scenes and read
+    systematically LOW against the full encode (SCENE_OFFSET_PRIOR),
+    while evenly-spaced samples are representative and center on 0.
+    Shrinking scene-sampled cohorts toward 0 under-corrected every
+    early file by most of its real offset — one wasted full re-encode
+    each; with no cohort at all the center itself is the best estimate
+    and is returned directly.
+
+    Returns (offset, source_label); (None, None) when neither source has
+    a usable value and the center is 0. Values outside ±3.0 are treated
+    as corrupt and skipped.
     """
     if isinstance(per_file_cal, dict):
         o = per_file_cal.get("vmaf_offset")
@@ -49,11 +59,14 @@ def calibration_offset(per_file_cal, global_cal):
             n = global_cal.get("n_offset")
             if not isinstance(n, int) or n < 1:
                 n = 1
-            shrunk = g_off * n / (n + COHORT_SHRINK_K)
+            w = n / (n + COHORT_SHRINK_K)
+            shrunk = g_off * w + prior_center * (1 - w)
             label = f"cohort n={n}"
             if abs(g_off - shrunk) >= 0.05:
                 label += f", shrunk from {g_off:+.2f}"
             return shrunk, label
+    if prior_center:
+        return prior_center, "cold-start prior"
     return None, None
 
 
@@ -98,10 +111,16 @@ def decay_prior(per_file_cal, global_cal):
 
 
 # Sample→full bitrate ratio range. Samples cut from the hottest scenes
-# encode richer than the full file, so the ratio (full ÷ sample) is < 1;
-# values outside [0.5, 1.0] are treated as corrupt and skipped (mirrors the
-# gate in effective_sample_floor).
-RATIO_MIN, RATIO_MAX = 0.5, 1.0
+# usually encode richer than the full file, so the ratio (full ÷ sample)
+# is typically < 1 — but not always: when the bitrate is carried by
+# something scene-independent (film grain everywhere, uniform detail),
+# the sampled peaks barely exceed the file's average and the measured
+# ratio runs slightly above 1 (1.13 observed on grain-heavy film). Those
+# measurements are real signal for the floor model — clamping them to
+# 1.0 silently over-caps the search — so the range admits them; 1.3
+# still rejects nonsense from a mis-measured probe. Mirrors the gates in
+# effective_sample_floor and the pipeline's calibration recorder.
+RATIO_MIN, RATIO_MAX = 0.5, 1.3
 
 
 def ratio_prior(per_file_cal, global_cal, margin):
