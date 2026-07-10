@@ -190,10 +190,17 @@ def extract_samples(source, scenes, keyframes, cfg, file_hash=None):
                 min(keyframes, key=lambda k: abs(k - sc["time"]))
                 if keyframes else sc["time"]
             )
+            # Map the video stream explicitly: default stream selection
+            # would also pick a subtitle stream (mov_text from MP4 fails
+            # MKV stream copy outright) and picks the "best" video stream
+            # rather than the first — while probe/encode/VMAF all use
+            # v:0. Samples are video-only by contract (see -an in the
+            # bitrate accounting notes).
             run_cmd([
                 "ffmpeg", "-y", "-hide_banner", "-v", "error",
                 "-ss", f"{start:.3f}", "-i", str(source),
                 "-t", f"{sc['duration']:.3f}",
+                "-map", "0:v:0",
                 "-c", "copy", "-an", "-avoid_negative_ts", "make_zero",
                 str(clip),
             ])

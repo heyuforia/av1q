@@ -262,23 +262,50 @@ def encode_av1(source, dest, meta, cq, cfg, show_progress=False,
     except OSError:
         pass
 
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats",
-        "-i", str(source),
-        "-map", "0:v:0", "-map", "0:a?", "-map", "0:s?",
-        *vf_args,
-        "-c:a", "copy", "-c:s", "copy",
-        *enc_args, str(tmp),
-    ]
-
+    # Subtitle fallback ladder, mirroring core.segments'
+    # mux_with_source_streams: MKV rejects some subtitle codecs as-is
+    # (e.g. mov_text from MP4) at header write — before any video is
+    # encoded — so stepping down to SRT, then to no subs, costs nothing.
+    # Only an early failure (no real output yet) walks the ladder; a
+    # mid-encode failure re-raises rather than re-paying the encode.
     duration = meta.get("duration") or 0.0
-    if show_progress and duration > 1.0:
-        out_path = cmd.pop()
-        cmd += ["-progress", "pipe:1", out_path]
-        label = f" {ORANGE}{'encode':<10}{RESET}CQ {BOLD}{cq}{RESET}"
-        _run_ffmpeg_progress(cmd, duration, label)
-    else:
-        run_cmd(cmd)
+    sub_attempts = [
+        (["-map", "0:s?"], ["-c:s", "copy"], None),
+        (["-map", "0:s?"], ["-c:s", "srt"], None),
+        ([], [], "subtitles incompatible with MKV — dropped"),
+    ]
+    for attempt, (sub_map, sub_codec, note) in enumerate(sub_attempts):
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats",
+            "-i", str(source),
+            "-map", "0:v:0", "-map", "0:a?", *sub_map,
+            *vf_args,
+            "-c:a", "copy", *sub_codec,
+            *enc_args, str(tmp),
+        ]
+        try:
+            if note:
+                print(f" {ORANGE}{'mux':<10}{RESET}{DIM}{note}{RESET}")
+            if show_progress and duration > 1.0:
+                out_path = cmd.pop()
+                cmd += ["-progress", "pipe:1", out_path]
+                label = f" {ORANGE}{'encode':<10}{RESET}CQ {BOLD}{cq}{RESET}"
+                _run_ffmpeg_progress(cmd, duration, label)
+            else:
+                run_cmd(cmd)
+            break
+        except RuntimeError:
+            try:
+                early = not tmp.exists() or tmp.stat().st_size < (64 << 10)
+            except OSError:
+                early = True
+            if attempt == len(sub_attempts) - 1 or not early:
+                raise
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
 
     if dest.exists():
         dest.unlink()
