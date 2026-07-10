@@ -17,7 +17,7 @@ Drop videos into a folder, run the script, and each file gets encoded to AV1 at 
 
 - **VMAF-targeted encoding** — hits a perceptual quality target instead of using a fixed CRF
 - **Resolution-aware defaults** — auto-selects VMAF targets (94 for HD, 93 for SD, 90 for 4K)
-- **Bitrate floors** — per-resolution minimum bitrates (1 Mbps 720p, 1.8 Mbps 1080p, 2.5 Mbps 1440p, 5 Mbps 2160p, 8 Mbps 4320p) prevent VMAF-misleading low-bitrate encodes; starvation backstops, not targets
+- **Bitrate floors** — per-resolution minimum bitrates (1 Mbps 720p, 1.8 Mbps 1080p, 2.5 Mbps 1440p, 4.5 Mbps 2160p, 8 Mbps 4320p) prevent VMAF-misleading low-bitrate encodes; starvation backstops, not targets
 - **Scene-based sampling** — fast quality estimation without encoding the whole file during search
 - **P5 quality reporting** — measures and reports 5th-percentile worst-frame VMAF alongside the mean, so you can spot files whose worst moments lag
 - **SSIMULACRA2 reporting** — every VMAF score is shown next to a GPU-computed [SSIMULACRA2](https://github.com/cloudinary/ssimulacra2) score as a second opinion; informational only, it never influences the encode
@@ -26,6 +26,7 @@ Drop videos into a folder, run the script, and each file gets encoded to AV1 at 
 - **Hardware-accelerated decoding** — CUDA, D3D11VA (Windows), VideoToolbox (macOS), VAAPI (Linux) speed up quality measurement and scene/crop detection; encoding itself is always CPU
 - **Optional auto-crop** — `--auto-crop` detects letterbox/pillarbox bars inline before each encode (or use the standalone `av1q-crop.py` to pre-scan a library); confidence-gated so ambiguous detections aren't silently applied
 - **File-based caching** — skips re-analysis and re-measurement on subsequent runs, and interrupted searches resume where they left off
+- **Resumable encodes** — full encodes of long sources (15 min+) are written as finalized segments, so an interrupted encode picks up at the last finished segment instead of restarting from frame 0 (disable with `--no-resume`)
 - **Batch processing** with recursive subdirectory support
 - **Cross-platform** — Windows, macOS, Linux
 
@@ -107,6 +108,7 @@ python av1q.py
 | `--dry-run` | — | Find optimal CQ but skip final encoding |
 | `--auto-crop` | — | Detect letterbox/pillarbox inline before each encode (skips files that already have a sidecar) |
 | `--no-crops` | — | Ignore `*.crop.json` sidecars (auto-applied by default) |
+| `--no-resume` | — | Disable resumable segmented encoding for long sources |
 
 ## How it works
 
