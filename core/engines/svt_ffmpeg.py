@@ -2,12 +2,14 @@
 ffmpeg's libsvtav1 wrapper. Color metadata, crop, and audio/subtitle
 passthrough all ride a single ffmpeg invocation."""
 
+import collections
 import math
 import os
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 from .. import segments, ssimu2
@@ -49,8 +51,21 @@ def _run_ffmpeg_progress(cmd, duration, label, base_time=0.0):
 
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1,
+        text=True, encoding="utf-8", errors="replace", bufsize=1,
     )
+    # stderr must be drained concurrently with the stdout progress
+    # stream: -v error keeps it normally silent, but a damaged source
+    # can flood decode errors, fill the OS pipe buffer, block ffmpeg's
+    # stderr write, and deadlock the encode under a frozen bar. The
+    # drain thread keeps only the tail, for the failure message.
+    stderr_tail = collections.deque(maxlen=80)
+
+    def drain_stderr():
+        for err_line in proc.stderr:
+            stderr_tail.append(err_line.rstrip("\n"))
+
+    drain = threading.Thread(target=drain_stderr, daemon=True)
+    drain.start()
     state = {}
     last_render = 0.0
     active = False
@@ -136,9 +151,9 @@ def _run_ffmpeg_progress(cmd, duration, label, base_time=0.0):
                 continue
             render()
         proc.wait()
+        drain.join(timeout=10)
         if proc.returncode != 0:
-            stderr_data = proc.stderr.read() if proc.stderr else ""
-            tail = "\n".join((stderr_data or "").splitlines()[-80:])
+            tail = "\n".join(stderr_tail)
             raise RuntimeError(
                 f"ffmpeg exit {proc.returncode}\n"
                 f"{subprocess.list2cmdline(cmd) if os.name == 'nt' else ' '.join(map(shlex.quote, cmd))}"
