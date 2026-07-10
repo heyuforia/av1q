@@ -391,10 +391,15 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
         for _ in range(4):
             effective_max = min(max_q, floor_cap, estimate_max_q_for_floor())
             current_kbps = bitrate_points.get(q, 0)
+            # Compare against the sample-converted threshold, not the raw
+            # video floor: on the sample path they differ (eff_floor is
+            # min_kbps scaled by the ratio/margin), and with a learned
+            # ratio > 1 the raw floor sits ABOVE the threshold — gating
+            # on it walked past points the model already accepted.
             q_violates_floor = (
                 q in bitrate_points and bitrate_points[q] < eff_floor()
             )
-            if (q >= effective_max and current_kbps >= min_kbps
+            if (q >= effective_max and current_kbps >= eff_floor()
                     and not q_violates_floor):
                 print(
                     f" {ORANGE}{'accept':<10}{RESET}bitrate floor met at"
@@ -405,7 +410,7 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
             next_q = grid.quantize(
                 clamp(estimate_max_q_for_floor(), min_q, effective_max)
             )
-            if (next_q == q and current_kbps < min_kbps
+            if (next_q == q and current_kbps < eff_floor()
                     and q - grid.step >= min_q):
                 next_q = grid.quantize(q - grid.step)
             if next_q == q or next_q in tested:
