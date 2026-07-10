@@ -450,10 +450,12 @@ def process_videos(cfg, engine):
                 # The plan already decided sampling applies, so disarm
                 # select_samples' own short-file bail-out and use the
                 # plan's clip length (mini plans cut shorter clips).
+                select_cfg = {
+                    **cfg, "sample_duration": s_dur, "short_threshold": 0,
+                }
                 sample_scenes = select_samples(
                     scenes, complexity, meta["duration"], n_samples,
-                    keyframes,
-                    {**cfg, "sample_duration": s_dur, "short_threshold": 0},
+                    keyframes, select_cfg,
                 )
                 # No detected scenes (intra-only sources, or scdet found
                 # none) means the samples are evenly spaced and therefore
@@ -461,10 +463,33 @@ def process_videos(cfg, engine):
                 # bitrate ratio is ~1.0, so the floor search uses a small
                 # margin instead of the complexity-bias one.
                 even_sampling = not scenes
+                # A degenerate scene list can't fill the plan:
+                # select_samples picks each distinct scene at most once,
+                # so a source with a lone detected cut yields a single
+                # clip — and betting the whole search on it is how one
+                # near-static scene misreads a high-bitrate source as
+                # floor-bound. Too few scene samples → re-select evenly
+                # spaced, which is representative by construction
+                # (mirrors the count//2 guard on select_samples' keyframe
+                # path; the max(2, ·) stops mini plans from riding on a
+                # single clip, min(count, ·) keeps 1-sample plans valid).
+                min_scene_samples = min(n_samples, max(2, n_samples // 2))
+                if (not even_sampling and sample_scenes
+                        and len(sample_scenes) < min_scene_samples):
+                    print(
+                        f"{lbl('fallback')}scenes fill only"
+                        f" {len(sample_scenes)} of {n_samples} samples,"
+                        f" switching to evenly-spaced"
+                    )
+                    sample_scenes = select_samples(
+                        [], complexity, meta["duration"], n_samples,
+                        keyframes, select_cfg,
+                    )
+                    even_sampling = True
                 if sample_scenes:
                     info = (
                         f"samples from {BOLD}{len(scenes)}{RESET} scenes"
-                        if scenes else "evenly-spaced samples"
+                        if not even_sampling else "evenly-spaced samples"
                     )
                     print(f"{lbl('scenes')}{BOLD}{len(sample_scenes)}{RESET} {info}")
                     print(f"{lbl('extract')}Extracting samples...")
