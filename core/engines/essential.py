@@ -15,9 +15,10 @@ from .. import ssimu2
 from ..crop import crop_token
 from ..probe import get_rfps, is_vfr, probe_hdr_metadata
 from ..sampling import clean_sample_source
+from ..segments import mux_with_source_streams
 from ..tools import find_encoder, find_ffvship_optional
 from ..ui import BOLD, DIM, GREEN, MIDDOT, ORANGE, RESET, fmt_time
-from ..util import _temp_files, make_temp_log, run_cmd
+from ..util import _temp_files, make_temp_log
 from .base import Engine, Grid
 
 
@@ -375,39 +376,11 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
         return
 
     # Remux: AV1 video from the encoder + audio/subs/chapters/attachments
-    # from the source. Subtitle copy can fail for codecs MKV won't take
-    # as-is (e.g. mov_text from MP4) — retried as SRT, then dropped.
+    # from the source (shared with av1q's segmented path — the SRT/drop
+    # subtitle fallback ladder lives in core.segments).
     tmp_mkv = dest.with_suffix(".tmp.mkv")
     _temp_files.add(tmp_mkv)
-
-    def mux_cmd(maps, codecs):
-        return [
-            "ffmpeg", "-y", "-hide_banner", "-v", "error",
-            "-i", str(enc_out), "-i", str(source),
-            *maps, "-map_chapters", "1", "-map_metadata", "1",
-            *codecs, str(tmp_mkv),
-        ]
-
-    with_subs = ["-map", "0:v:0", "-map", "1:a?", "-map", "1:s?", "-map", "1:t?"]
-    no_subs = ["-map", "0:v:0", "-map", "1:a?", "-map", "1:t?"]
-    attempts = [
-        (with_subs, ["-c", "copy"], None),
-        # MKV rejects some subtitle codecs as-is (e.g. mov_text from MP4)
-        (with_subs, ["-c", "copy", "-c:s", "srt"], None),
-        (no_subs, ["-c", "copy"], "subtitles incompatible with MKV — dropped"),
-    ]
-    last_err = None
-    for maps, codecs, note in attempts:
-        try:
-            if note:
-                print(f" {ORANGE}{'mux':<10}{RESET}{DIM}{note}{RESET}")
-            run_cmd(mux_cmd(maps, codecs))
-            last_err = None
-            break
-        except RuntimeError as e:
-            last_err = e
-    if last_err is not None:
-        raise RuntimeError(f"Remux failed: {last_err}")
+    mux_with_source_streams(enc_out, source, tmp_mkv, attachments=True)
 
     try:
         enc_out.unlink()
@@ -515,7 +488,11 @@ class EssentialEngine(Engine):
         return clean_sample_source(concat, meta, cfg)
 
     def encode(self, source, dest, meta, q, cfg,
-               show_progress=False, expected_frames=0):
+               show_progress=False, expected_frames=0, resumable=False):
+        # resumable is ignored: the Y4M pipe has no resume path (the
+        # standalone encoder muxes its own output, so there is no
+        # segment-muxer seam to split it at). Build on av1q's segmented
+        # design first; adapt here only once it has proven out.
         encode_essential(
             source, dest, meta, q, cfg,
             show_progress=show_progress, expected_frames=expected_frames,

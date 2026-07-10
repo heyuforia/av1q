@@ -190,6 +190,12 @@ def main():
         help="Starting CQ for the search (default: auto from source bitrate; "
              "prompted interactively when run in a terminal)",
     )
+    parser.add_argument(
+        "--no-resume", action="store_true",
+        help="Disable resumable segmented encoding for long sources "
+             "(by default, interrupted full encodes resume at the last "
+             "finished segment instead of restarting)",
+    )
 
     args = parser.parse_args()
 
@@ -220,6 +226,7 @@ def main():
         "use_crops": not args.no_crops,
         "auto_crop": args.auto_crop,
         "seed_cq": args.seed_cq,
+        "resume_encodes": not args.no_resume,
         "sample_count": args.samples,
         "sample_duration": 6.0,
         "min_scene_duration": 2.0,

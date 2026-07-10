@@ -5,17 +5,18 @@ passthrough all ride a single ffmpeg invocation."""
 import math
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
 
-from .. import ssimu2
-from ..constants import FALLBACK_MAXRATE
+from .. import segments, ssimu2
+from ..constants import FALLBACK_MAXRATE, RESUMABLE_MIN_DURATION, SEGMENT_TIME
 from ..crop import crop_token
 from ..probe import res_tier
 from ..tools import find_ffvship_optional
 from ..ui import BOLD, DIM, GREEN, ORANGE, RESET, fmt_time
-from ..util import _temp_files, clamp, run_cmd
+from ..util import _temp_files, clamp, partial_hash, run_cmd
 from .base import Engine, Grid
 
 
@@ -27,13 +28,20 @@ def enc_signature(cfg, crop=None):
     return f"p{cfg['preset']}g{cfg['film_grain']}{crop_token(crop)}"
 
 
-def _run_ffmpeg_progress(cmd, duration, label):
+def _run_ffmpeg_progress(cmd, duration, label, base_time=0.0):
     """Run ffmpeg with -progress pipe:1 and render an inline progress bar.
 
     Parses key=value blocks on stdout; uses out_time_us against the known
     source duration so the bar stays accurate even when fps/bitrate vary
     (SVT-AV1 lookahead, scene changes). Falls back to silent run_cmd when
     stdout is not a TTY (logs, redirected output).
+
+    base_time is the seek offset of a resumed segmented encode: the bar
+    must show progress through the WHOLE source, but whether out_time
+    reports absolute output PTS (the -copyts timeline) or zero-based
+    time isn't contractual — so the first real report picks: a value far
+    below base_time means zero-based, and the offset is added from then
+    on.
     """
     if not sys.stdout.isatty():
         run_cmd(cmd)
@@ -47,14 +55,19 @@ def _run_ffmpeg_progress(cmd, duration, label):
     last_render = 0.0
     active = False
     bar_w = 20
+    offset = None
 
     def render(final=False):
-        nonlocal last_render, active
+        nonlocal last_render, active, offset
         last_render = time.time()
         try:
             t = int(state.get("out_time_us", "0")) / 1_000_000
         except ValueError:
             t = 0.0
+        if base_time and t > 0:
+            if offset is None:
+                offset = base_time if t < base_time * 0.5 else 0.0
+            t += offset
         pct = max(0.0, min(100.0, t / duration * 100)) if duration > 0 else 0.0
         if final:
             pct = 100.0
@@ -142,21 +155,22 @@ def _run_ffmpeg_progress(cmd, duration, label):
         finish()
 
 
-def encode_av1(source, dest, meta, cq, cfg, show_progress=False):
-    """Encode video to AV1 using SVT-AV1 via ffmpeg."""
+def encode_av1(source, dest, meta, cq, cfg, show_progress=False,
+               resumable=False):
+    """Encode video to AV1 using SVT-AV1 via ffmpeg.
+
+    resumable marks a full-file output encode that may go through the
+    segmented path (_encode_segmented): the identical encoder invocation,
+    muxed into finalized segment files that survive a kill, so an
+    interrupted encode resumes at a segment boundary instead of
+    restarting from frame 0. Short sources and sample probes stay on the
+    single-pass path.
+    """
     pix = (
         "yuv420p10le"
         if meta["hdr"] or "10le" in meta["pix_fmt"] or cfg["force_10bit"]
         else "yuv420p"
     )
-
-    tmp = dest.with_suffix(".tmp.mkv")
-    _temp_files.add(tmp)
-    try:
-        if tmp.exists():
-            tmp.unlink()
-    except OSError:
-        pass
 
     color_args = []
     if meta["cp"] and meta["ct"]:
@@ -182,22 +196,26 @@ def encode_av1(source, dest, meta, cq, cfg, show_progress=False):
     # into smaller files (verified -9.8% at equal CRF on a synthetic A/B).
     # qm-min 2 / chroma-qm-min 4 follow SVT-AV1-Essential's curated
     # defaults (mainline's qm-min 8 barely lets the matrices act).
+    #
+    # irefresh-type=2 (closed GOP): ffmpeg's wrapper overrides the
+    # encoder's own default down to open GOP, where the periodic keyint
+    # refreshes are intra-only frames that don't reset the reference
+    # buffers and never get the container keyframe flag — players can't
+    # seek to them and the segment muxer can't cut on them. Closed GOP
+    # makes every keyint refresh a true key frame: seekable output, and
+    # the split points the segmented resume path requires.
     svt_params = (
         f"tune=0:sharpness=1:film-grain={fg}:film-grain-denoise=0"
         f":enable-tf=0:enable-overlays=1:scd=1"
         f":enable-qm=1:qm-min=2:chroma-qm-min=4"
+        f":irefresh-type=2"
     )
 
     vf_args = []
     if meta.get("crop"):
         vf_args = ["-vf", f"crop={meta['crop']}"]
 
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats",
-        "-i", str(source),
-        "-map", "0:v:0", "-map", "0:a?", "-map", "0:s?",
-        *vf_args,
-        "-c:a", "copy", "-c:s", "copy",
+    enc_args = [
         "-pix_fmt", pix,
         "-c:v", "libsvtav1",
         "-preset", str(cfg["preset"]),
@@ -212,7 +230,30 @@ def encode_av1(source, dest, meta, cq, cfg, show_progress=False):
         "-maxrate", str(maxrate),
         "-bufsize", str(maxrate * 2),
         "-fps_mode", "passthrough",
-        *color_args, str(tmp),
+        *color_args,
+    ]
+
+    if (resumable and cfg.get("resume_encodes", True)
+            and (meta.get("duration") or 0) >= RESUMABLE_MIN_DURATION):
+        _encode_segmented(source, dest, meta, cq, cfg, vf_args, enc_args,
+                          show_progress)
+        return
+
+    tmp = dest.with_suffix(".tmp.mkv")
+    _temp_files.add(tmp)
+    try:
+        if tmp.exists():
+            tmp.unlink()
+    except OSError:
+        pass
+
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats",
+        "-i", str(source),
+        "-map", "0:v:0", "-map", "0:a?", "-map", "0:s?",
+        *vf_args,
+        "-c:a", "copy", "-c:s", "copy",
+        *enc_args, str(tmp),
     ]
 
     duration = meta.get("duration") or 0.0
@@ -228,6 +269,123 @@ def encode_av1(source, dest, meta, cq, cfg, show_progress=False):
         dest.unlink()
     tmp.rename(dest)
     _temp_files.discard(tmp)
+
+
+def _encode_segmented(source, dest, meta, cq, cfg, vf_args, enc_args,
+                      show_progress):
+    """Resumable full encode: one continuous encoder, segment-muxed.
+
+    The segment muxer finalizes each completed ~SEGMENT_TIME segment
+    before opening the next, so the bitstream is identical to the
+    single-pass encode while every finished segment survives a kill.
+    Resume drops the last finished segment (its first-packet PTS is the
+    only exactly-knowable boundary — see core.segments.resume_state),
+    re-enters the encode there, then concatenates all segments and
+    remuxes audio/subs/chapters from the source.
+
+    Segment files and the manifest deliberately stay OUT of _temp_files:
+    surviving Ctrl-C and crashes is their entire purpose. Only the final
+    mux temp is registered. The work dir is removed on success; the
+    pipeline sweeps a file's dirs once its output is final.
+    """
+    file_hash = partial_hash(source)
+    enc_tag = enc_signature(cfg, meta.get("crop"))
+    sdir = segments.segment_dir(cfg["cache_dir"], file_hash, enc_tag, str(cq))
+    expected = segments.manifest_expected(
+        file_hash, enc_tag, str(cq), SEGMENT_TIME
+    )
+    manifest = segments.load_manifest(sdir)
+    if not segments.manifest_matches(manifest, expected):
+        if sdir.exists():
+            shutil.rmtree(sdir, ignore_errors=True)
+        manifest = {**expected, "complete": False, "segments": []}
+    sdir.mkdir(parents=True, exist_ok=True)
+
+    # A "complete" manifest (encoder finished, then concat/mux was
+    # interrupted) is only trusted while every segment is still on disk;
+    # otherwise fall back to the normal reconcile-and-resume path.
+    def _seg_ok(s):
+        try:
+            p = sdir / s["name"]
+            return p.is_file() and p.stat().st_size > 0
+        except (KeyError, TypeError, OSError):
+            return False
+
+    if manifest.get("complete") and not (
+            manifest.get("segments")
+            and all(_seg_ok(s) for s in manifest["segments"])):
+        manifest["complete"] = False
+
+    if not manifest.get("complete"):
+        kept, resume_ms = segments.resume_state(sdir, manifest)
+        manifest["segments"] = kept
+        segments.write_manifest(sdir, manifest)
+
+        base_time = 0.0
+        in_args = ["-i", str(source)]
+        ts_args = []
+        if resume_ms is not None:
+            base_time = resume_ms / 1000.0
+            # Accurate seek decodes up to the boundary and starts on the
+            # exact frame; -copyts -start_at_zero re-enters the first
+            # run's zero-based timeline at that PTS, so the new segments'
+            # timestamps continue the kept ones seamlessly.
+            in_args = ["-ss", segments.ms_ts(resume_ms), "-i", str(source)]
+            ts_args = ["-copyts", "-start_at_zero"]
+            print(
+                f" {ORANGE}{'resume':<10}{RESET}{BOLD}{len(kept)}{RESET}"
+                f" finished segment(s) kept"
+                f" {DIM}re-encoding from {fmt_time(base_time)}{RESET}"
+            )
+
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats",
+            *in_args, "-map", "0:v:0",
+            *vf_args, *enc_args, *ts_args,
+            "-f", "segment",
+            "-segment_time", str(SEGMENT_TIME),
+            "-segment_format", "matroska",
+            "-segment_list", str(sdir / segments.SEGMENT_LIST_NAME),
+            "-segment_list_type", "csv",
+            "-segment_start_number", str(len(kept)),
+            "-reset_timestamps", "0",
+            str(sdir / segments.SEGMENT_PATTERN),
+        ]
+
+        duration = meta.get("duration") or 0.0
+        if show_progress and duration > 1.0:
+            out_path = cmd.pop()
+            cmd += ["-progress", "pipe:1", out_path]
+            label = f" {ORANGE}{'encode':<10}{RESET}CQ {BOLD}{cq}{RESET}"
+            _run_ffmpeg_progress(cmd, duration, label, base_time=base_time)
+        else:
+            run_cmd(cmd)
+
+        new = segments.validate_new_segments(sdir, kept)
+        if not new:
+            raise RuntimeError("Segmented encode produced no segments")
+        manifest["segments"] = kept + new
+        manifest["complete"] = True
+        segments.write_manifest(sdir, manifest)
+
+    joined = sdir / segments.JOINED_NAME
+    segments.concat_segments(sdir, manifest["segments"], joined)
+
+    tmp = dest.with_suffix(".tmp.mkv")
+    _temp_files.add(tmp)
+    try:
+        if tmp.exists():
+            tmp.unlink()
+    except OSError:
+        pass
+    # No attachments: matches the single-pass path, which maps only
+    # video/audio/subs from the source.
+    segments.mux_with_source_streams(joined, source, tmp)
+    if dest.exists():
+        dest.unlink()
+    tmp.rename(dest)
+    _temp_files.discard(tmp)
+    shutil.rmtree(sdir, ignore_errors=True)
 
 
 class IntGrid(Grid):
@@ -294,10 +452,11 @@ class SvtAv1FfmpegEngine(Engine):
         find_ffvship_optional()
 
     def encode(self, source, dest, meta, q, cfg,
-               show_progress=False, expected_frames=0):
+               show_progress=False, expected_frames=0, resumable=False):
         # expected_frames is a Y4M-pipe concern; ffmpeg's own -progress
         # output drives this engine's bar.
-        encode_av1(source, dest, meta, q, cfg, show_progress=show_progress)
+        encode_av1(source, dest, meta, q, cfg, show_progress=show_progress,
+                   resumable=resumable)
 
     def ssimu2_info(self, ref, dist, meta, cfg, ref_index=None):
         return ssimu2.measure_ssimu2_display(

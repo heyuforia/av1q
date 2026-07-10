@@ -82,6 +82,20 @@ DEFAULT_BITRATE_DECAY = math.log(2) / 6
 # never snapped: there the extra probe still shrinks the final encode).
 ENDGAME_SNAP_GAIN = 0.03
 
+# Resumable segmented encodes. Full encodes of sources at least this long
+# are written as keyframe-aligned segment files that the muxer finalizes
+# as they complete, so an interrupted encode resumes at the last segment
+# boundary instead of restarting from frame 0. Below the gate the
+# segment/concat/remux overhead isn't worth the ~minutes it could save;
+# above it, a kill costs at most ~2 segments of work (the in-flight one
+# plus the boundary segment re-encoded for an exact seam). Segment length
+# is a policy constant, not a knob: 60s keeps the worst-case loss around
+# one percent of a feature while keeping the segment count (and concat
+# list) small. Cuts land on the first keyframe at/after each multiple, so
+# real segments run a few seconds over (SVT's default keyint is ~5-7s).
+RESUMABLE_MIN_DURATION = 900.0
+SEGMENT_TIME = 60
+
 # Scaled-down sampling plan for short files. Files at or under the
 # configured plan's threshold used to fall straight to full-file search,
 # where every probe is a full encode; mini-samples keep probes cheap for

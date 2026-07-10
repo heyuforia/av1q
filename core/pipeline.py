@@ -24,6 +24,7 @@ import sys
 import time
 
 from . import search as core_search
+from . import segments as core_segments
 from . import vmaf as core_vmaf
 from .analyze import analyze_complexity, detect_scenes, get_keyframes
 from .bitrate import calc_kbps, video_kbps
@@ -120,6 +121,9 @@ def process_videos(cfg, engine):
                 p.unlink()
             except OSError:
                 pass
+    # Unlike the leftover .tmp outputs above, segment dirs with a valid
+    # manifest are resume state and survive; only torn ones are junk.
+    core_segments.sweep_orphan_segments(root_cache)
 
     pattern = "**/*" if cfg["recurse"] else "*"
     files = [
@@ -564,6 +568,7 @@ def process_videos(cfg, engine):
                     engine.encode(
                         filepath, d, meta, q, cfg,
                         show_progress=True, expected_frames=expected_frames,
+                        resumable=True,
                     )
                     t_enc += time.time() - t0
                 return d
@@ -768,6 +773,7 @@ def process_videos(cfg, engine):
                     engine.encode(
                         filepath, dst_path(best_q), meta, best_q, cfg,
                         show_progress=True, expected_frames=expected_frames,
+                        resumable=True,
                     )
                     t_enc += time.time() - t0
                 else:
@@ -1058,6 +1064,7 @@ def process_videos(cfg, engine):
                     engine.encode(
                         filepath, dst_path(try_q), meta, try_q, cfg,
                         show_progress=True, expected_frames=expected_frames,
+                        resumable=True,
                     )
                     t_enc += time.time() - t0
                 t0 = time.time()
@@ -1147,6 +1154,10 @@ def process_videos(cfg, engine):
                         dst_path(c).unlink()
                     except OSError:
                         pass
+
+            # The final output exists, so this file's segment work dirs
+            # (any quantizer — refine may have left several) are spent.
+            core_segments.cleanup_file_segments(root_cache, file_hash)
 
             out_sz = final.stat().st_size
 
