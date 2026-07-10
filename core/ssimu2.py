@@ -43,7 +43,7 @@ def _video_frame_count(path):
              "-count_packets", "-show_entries", "stream=nb_read_packets",
              "-of", "default=nw=1:nk=1", str(path)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, timeout=600,
+            text=True, encoding="utf-8", errors="replace", timeout=600,
         )
         if r.returncode != 0:
             return None
@@ -147,7 +147,8 @@ def _run_ffvship(ref, dist, meta, cache_dir, exe,
         # exit — SSIMU2 is a display-only column and must never block the run.
         with suppress_win_error_dialog():
             r = subprocess.run(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
             )
         if r.returncode != 0:
             if verbose:

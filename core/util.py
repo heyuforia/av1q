@@ -40,8 +40,15 @@ def suppress_win_error_dialog():
 
 
 def run_cmd(cmd):
-    """Run a command and return the result. Raises on failure."""
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    """Run a command and return the result. Raises on failure.
+
+    Output is decoded as UTF-8 (ffmpeg/ffprobe always emit UTF-8): the
+    default locale codec is cp1252 on Windows and decodes strictly, so a
+    non-ASCII filename echoed in an error message would raise
+    UnicodeDecodeError instead of surfacing the real failure.
+    """
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       text=True, encoding="utf-8", errors="replace")
     if p.returncode:
         tail = "\n".join((p.stderr or "").splitlines()[-80:])
         raise RuntimeError(

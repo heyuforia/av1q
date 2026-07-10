@@ -46,7 +46,8 @@ def detect_scenes(source, cfg, duration=None):
             ]
             r = subprocess.run(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, timeout=scan_timeout,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=scan_timeout,
             )
             if r.returncode == 0:
                 break
@@ -95,7 +96,7 @@ def analyze_complexity(source):
              "-show_entries", "packet=pts_time,dts_time,size,flags",
              "-of", "json", str(source)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, timeout=600,
+            text=True, encoding="utf-8", errors="replace", timeout=600,
         )
         if r.returncode != 0:
             return []
@@ -155,7 +156,7 @@ def get_keyframes(source):
              "-show_entries", "packet=pts_time,dts_time,flags",
              "-of", "json", str(source)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, timeout=600,
+            text=True, encoding="utf-8", errors="replace", timeout=600,
         )
         if r.returncode != 0:
             return []

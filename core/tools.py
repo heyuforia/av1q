@@ -53,7 +53,8 @@ def _gpu_vendor():
             out = subprocess.run(
                 ["powershell", "-NoProfile", "-Command",
                  "(Get-CimInstance Win32_VideoController).Name"],
-                capture_output=True, text=True, timeout=20,
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=20,
             ).stdout.lower()
         except Exception:
             return "Vulkan"

@@ -171,7 +171,7 @@ def probe_hdr_metadata(filepath):
              "-show_entries", "frame=side_data_list",
              "-of", "json", str(filepath)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, timeout=120,
+            text=True, encoding="utf-8", errors="replace", timeout=120,
         )
         if r.returncode != 0:
             return None, None
@@ -242,7 +242,7 @@ def is_vfr(filepath, meta):
              "-count_packets", "-show_entries", "stream=nb_read_packets",
              "-of", "default=nw=1:nk=1", str(filepath)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, timeout=600,
+            text=True, encoding="utf-8", errors="replace", timeout=600,
         )
         if c.returncode != 0:
             return True  # suspicious header and uncountable: don't risk it

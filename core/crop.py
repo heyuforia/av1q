@@ -74,7 +74,7 @@ def detect_crop_window(source, start, duration, limit, round_to, cache_dir):
             ]
             r = subprocess.run(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, timeout=120,
+                text=True, encoding="utf-8", errors="replace", timeout=120,
             )
             if r.returncode == 0:
                 break

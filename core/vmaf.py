@@ -138,7 +138,8 @@ def measure_vmaf(ref, dist, meta, subsample, threads, cache_dir):
                 "-f", "null", "-",
             ]
             r = subprocess.run(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
             )
             if r.returncode == 0:
                 break

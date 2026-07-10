@@ -28,7 +28,7 @@ def video_kbps(filepath, duration=None):
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "packet=size", "-of", "csv=p=0", str(filepath)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, timeout=300,
+            text=True, encoding="utf-8", errors="replace", timeout=300,
         )
         if r.returncode != 0:
             return None
