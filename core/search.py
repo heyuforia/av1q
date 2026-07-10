@@ -97,6 +97,13 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
     min_q, max_q = engine.q_bounds(cfg)
     tol = cfg["vmaf_tolerance"]
     slope = 0.5
+    # True once `slope` has been fitted from two real probe pairs. The
+    # cold-start 0.5 is only a guess; jumps sized by it can clamp onto a
+    # grid bound purely as a slope artifact, so decisions that treat a
+    # bound landing as *proof* (the min_q short-circuit below) must wait
+    # for a measured slope. An explicit flag rather than len(tested) >= 2:
+    # a NaN-VMAF entry must never count as a measurement.
+    slope_measured = False
     enc_time = vmaf_time = 0.0
     tested = {}
     tested_paths = {}
@@ -375,6 +382,7 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
                     abs(prev_vm["mean"] - vm["mean"]) / abs(prev_q - q),
                     0.1, 1.5,
                 )
+                slope_measured = True
 
     if floor_bound:
         # Bitrate-only convergence: keep picking the estimated floor
@@ -461,8 +469,18 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
             # full-file encode verify. The full path's min_q encode is the
             # deliverable, so it has nothing to skip — this is the low-q
             # mirror of the high-q bitrate-ceiling accept above.
-            if (tag is not None and next_q == min_q and next_q not in tested
-                    and vm["mean"] < target - tol):
+            #
+            # Gated on a MEASURED slope: "min_q is forced" is only proven
+            # when the deficit extrapolates from real slope data. Off the
+            # cold-start guess a steep curve makes the first jump's raw
+            # Newton target overshoot the grid and park on min_q when an
+            # interior quantizer would pass — firing there selects max
+            # quality unprobed and the full encode pays a multi-re-encode
+            # overshoot walk-back. With the guard the loop probes min_q
+            # normally (a cheap sample encode); if it overshoots, the
+            # loop's own stepping walks back to the interior.
+            if (tag is not None and slope_measured and next_q == min_q
+                    and next_q not in tested and vm["mean"] < target - tol):
                 print(
                     f" {ORANGE}{'accept':<10}{RESET}{engine.qname}"
                     f" {BOLD}{grid.fmt(min_q)}{RESET} is max quality and VMAF"
@@ -502,6 +520,7 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
                     abs(prev_vm["mean"] - vm["mean"]) / abs(prev_q - q),
                     0.1, 1.5,
                 )
+                slope_measured = True
 
     def valid_q(c):
         vm_c = tested[c]

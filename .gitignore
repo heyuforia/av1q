@@ -6,6 +6,7 @@ CLAUDE.md
 docs/
 tests/
 tools/
+TODO/
 pytest.ini
 
 # Runtime work folders and artifacts
