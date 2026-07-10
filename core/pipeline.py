@@ -941,11 +941,41 @@ def process_videos(cfg, engine):
                         grid.quantize((refine_aim - vm_mean) / slope_v),
                     )))
                 if min_kbps and cur_kbps and cur_kbps < min_kbps:
-                    step_b = max(
-                        grid.step,
-                        grid.ceil(math.log(min_kbps / cur_kbps) / decay_b),
-                    )
-                    deficits.append(("bitrate", step_b))
+                    if cur_kbps >= min_kbps * (1 - ENDGAME_SNAP_GAIN):
+                        # Endgame-snap economics, deficit side: a full
+                        # re-encode lifting bitrate by under
+                        # ENDGAME_SNAP_GAIN buys nothing real — the floor
+                        # is a starvation backstop, not a target (a real
+                        # file re-encoded over a 4kbps shortfall).
+                        # point_ok below waives the same sliver so final
+                        # selection keeps this point.
+                        if not deficits:
+                            print(
+                                f"{lbl('refine')}{cur_kbps}kbps is within"
+                                f" {ENDGAME_SNAP_GAIN:.0%} of the"
+                                f" {min_kbps}kbps floor — accepting"
+                            )
+                    else:
+                        # Aim at the CENTER of the bitrate band [floor,
+                        # floor × BITRATE_BAND], not at the floor edge:
+                        # the jump is a model prediction, and against an
+                        # edge aim any under-prediction lands short and
+                        # costs a whole extra encode (a real file jumped
+                        # to the edge and landed 1796kbps against an 1800
+                        # floor). grid.ceil keeps the rounding bias on
+                        # the safe (above-floor) side — overshooting the
+                        # band top re-encodes nothing, undershooting the
+                        # floor does.
+                        step_b = max(
+                            grid.step,
+                            grid.ceil(
+                                math.log(
+                                    min_kbps * math.sqrt(BITRATE_BAND)
+                                    / cur_kbps
+                                ) / decay_b
+                            ),
+                        )
+                        deficits.append(("bitrate", step_b))
 
                 if deficits:
                     if best_q <= min_q:
@@ -984,8 +1014,16 @@ def process_videos(cfg, engine):
                         ceiling = min(
                             ceiling, grid.quantize(best_q + max(0, headroom))
                         )
-                    if (overshoot <= VMAF_OVERSHOOT or best_q >= ceiling
-                            or in_band):
+                    # tol past the band top is measurement-noise
+                    # hysteresis: tol is the declared VMAF noise epsilon
+                    # (differences under it are noise everywhere else in
+                    # the search), so a re-encode triggered by a
+                    # sub-noise excess — 94.51 against a 94.50 band top
+                    # on a real file — is spurious precision. Only the
+                    # is-it-worth-redoing edge widens; the aim below
+                    # stays at the band center.
+                    if (overshoot <= VMAF_OVERSHOOT + cfg["vmaf_tolerance"]
+                            or best_q >= ceiling or in_band):
                         break
                     step = max(
                         grid.step,
@@ -1076,7 +1114,11 @@ def process_videos(cfg, engine):
                 vm_p = p["vmaf"].get("mean", float("nan"))
                 if math.isfinite(vm_p) and vm_p < target - cfg["vmaf_tolerance"]:
                     return False
-                if min_kbps and p["kbps"] and p["kbps"] < min_kbps:
+                # Waive the same hairline floor shortfall the refine loop
+                # accepts (ENDGAME_SNAP_GAIN), or selection would discard
+                # the point refine just deemed not worth re-encoding.
+                if (min_kbps and p["kbps"]
+                        and p["kbps"] < min_kbps * (1 - ENDGAME_SNAP_GAIN)):
                     return False
                 return True
 

@@ -59,14 +59,17 @@ VMAF_OVERSHOOT = 0.5
 # samples. The sample is deliberately cut from the file's hardest scenes,
 # so at equal quantizer it scores systematically LOW against the full
 # encode; aiming the sample search with a zero offset therefore lands the
-# first full encode high (measured -0.6..-1.1 on 1080p film content) and
-# the refine loop pays a whole re-encode to walk it back down. The cohort
-# average supersedes this as evidence accumulates (calibration_offset
-# shrinks the cohort toward this center, not toward 0). The value sits at
-# the shallow end of observed offsets so a genuinely low-bias file is
-# never pushed under target. Evenly-spaced samples are representative
-# and keep a center of 0.
-SCENE_OFFSET_PRIOR = -0.5
+# first full encode high and the refine loop pays a whole re-encode to
+# walk it back down. The cohort average supersedes this as evidence
+# accumulates (calibration_offset shrinks the cohort toward this center,
+# not toward 0). Field-measured true offsets so far: -0.58, -0.79, -1.10
+# (mean -0.82) — a -0.5 prior left two of those three cold files landing
+# above the acceptance band and re-encoding. -0.75 centers the observed
+# range while staying a notch shallow of the mean, so a genuinely
+# low-bias file errs toward overshoot (bitrate waste, refine-capped by
+# the noise hysteresis) rather than under target. Evenly-spaced samples
+# are representative and keep a center of 0.
+SCENE_OFFSET_PRIOR = -0.75
 
 # Cold-start bitrate-decay slope d(log kbps)/d(quantizer) for the floor
 # model: ±6 quantizer steps ≈ 2× bitrate. Used until measured probes (or
