@@ -235,8 +235,8 @@ def encode_av1(source, dest, meta, cq, cfg, show_progress=False,
 
     if (resumable and cfg.get("resume_encodes", True)
             and (meta.get("duration") or 0) >= RESUMABLE_MIN_DURATION):
-        _encode_segmented(source, dest, meta, cq, cfg, vf_args, enc_args,
-                          show_progress)
+        _encode_segmented(source, dest, meta, cq, cfg, pix, vf_args,
+                          enc_args, show_progress)
         return
 
     tmp = dest.with_suffix(".tmp.mkv")
@@ -271,7 +271,7 @@ def encode_av1(source, dest, meta, cq, cfg, show_progress=False,
     _temp_files.discard(tmp)
 
 
-def _encode_segmented(source, dest, meta, cq, cfg, vf_args, enc_args,
+def _encode_segmented(source, dest, meta, cq, cfg, pix, vf_args, enc_args,
                       show_progress):
     """Resumable full encode: one continuous encoder, segment-muxed.
 
@@ -292,7 +292,7 @@ def _encode_segmented(source, dest, meta, cq, cfg, vf_args, enc_args,
     enc_tag = enc_signature(cfg, meta.get("crop"))
     sdir = segments.segment_dir(cfg["cache_dir"], file_hash, enc_tag, str(cq))
     expected = segments.manifest_expected(
-        file_hash, enc_tag, str(cq), SEGMENT_TIME
+        file_hash, enc_tag, str(cq), SEGMENT_TIME, pix
     )
     manifest = segments.load_manifest(sdir)
     if not segments.manifest_matches(manifest, expected):
@@ -329,8 +329,16 @@ def _encode_segmented(source, dest, meta, cq, cfg, vf_args, enc_args,
             # Accurate seek decodes up to the boundary and starts on the
             # exact frame; -copyts -start_at_zero re-enters the first
             # run's zero-based timeline at that PTS, so the new segments'
-            # timestamps continue the kept ones seamlessly.
-            in_args = ["-ss", segments.ms_ts(resume_ms), "-i", str(source)]
+            # timestamps continue the kept ones seamlessly. The seek
+            # target sits 1ms EARLY: the stored boundary is the MKV
+            # muxer's ms-ROUNDED PTS, which can round up past the true
+            # frame time on non-ms-exact sources (24000/1001 etc.) and
+            # the accurate-seek cutoff would then drop the boundary
+            # frame. 1ms of slack can't admit the previous frame (frame
+            # durations are >= 8ms) and -copyts means the seek target
+            # never shapes output timestamps, only the discard cutoff.
+            in_args = ["-ss", segments.ms_ts(max(0, resume_ms - 1)),
+                       "-i", str(source)]
             ts_args = ["-copyts", "-start_at_zero"]
             print(
                 f" {ORANGE}{'resume':<10}{RESET}{BOLD}{len(kept)}{RESET}"

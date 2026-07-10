@@ -45,15 +45,19 @@ def segment_dir(cache_root, file_hash, enc_tag, q_key):
     return segment_root(cache_root) / f"{file_hash[:8]}_{enc_tag}_{q_key}"
 
 
-def manifest_expected(file_hash, enc_tag, q_key, segment_time):
+def manifest_expected(file_hash, enc_tag, q_key, segment_time, pix):
     """The identity a segment dir must match to be resumed. Any mismatch
     (source changed, settings changed, different quantizer) means the
-    segments were produced by a different encode and must be discarded."""
+    segments were produced by a different encode and must be discarded.
+    pix is part of the identity even though enc_signature never carried
+    it: a bit-depth flip between interruption and resume would otherwise
+    stream-copy 8-bit and 10-bit segments into one corrupt file."""
     return {
         "source_hash": file_hash,
         "enc_tag": enc_tag,
         "q": q_key,
         "segment_time": segment_time,
+        "pix": pix,
     }
 
 
@@ -86,7 +90,10 @@ def parse_segment_list(csv_path):
     finalized — so the list is the authority on which segments completed.
     A kill can tear the last line mid-write; malformed rows are skipped.
     Only the basename is trusted (the filename column echoes whatever
-    pattern path ffmpeg was given).
+    pattern path ffmpeg was given). ffmpeg CSV-quotes that column when
+    the path contains `,` or `"` (doubling embedded quotes) — the quotes
+    must come off before the basename split, or an install path with a
+    comma in it turns every finished encode into a parse failure.
     """
     try:
         text = csv_path.read_text(encoding="utf-8", errors="ignore")
@@ -97,7 +104,10 @@ def parse_segment_list(csv_path):
         parts = line.rsplit(",", 2)
         if len(parts) != 3:
             continue
-        name = parts[0].replace("\\", "/").rsplit("/", 1)[-1].strip()
+        field = parts[0].strip()
+        if len(field) >= 2 and field.startswith('"') and field.endswith('"'):
+            field = field[1:-1].replace('""', '"')
+        name = field.replace("\\", "/").rsplit("/", 1)[-1].strip()
         try:
             float(parts[1]), float(parts[2])
         except ValueError:
@@ -242,7 +252,16 @@ def build_concat_list(segments, last_duration_s):
 
 def concat_segments(seg_dir, segments, out_path,
                     probe_duration=_probe_duration_s):
-    """Stream-copy concat all segments into one video-only file."""
+    """Stream-copy concat all segments into one video-only file.
+
+    The concat demuxer re-bases every file by (cumulative start − the
+    file's own start), which with exact durations is a uniform shift of
+    −first_start across the whole timeline: zero for the normal case of
+    video starting at PTS 0, but a video-led start offset would land the
+    joined video earlier than a single-pass encode places it (a constant
+    A/V offset once audio is remuxed). -output_ts_offset adds exactly
+    that first start back, restoring the original PTS in every case.
+    """
     if not segments:
         raise RuntimeError("No segments to concatenate")
     last_dur = probe_duration(seg_dir / segments[-1]["name"])
@@ -256,7 +275,9 @@ def concat_segments(seg_dir, segments, out_path,
     run_cmd([
         "ffmpeg", "-y", "-hide_banner", "-v", "error",
         "-f", "concat", "-safe", "0", "-i", str(lst),
-        "-map", "0:v:0", "-c", "copy", str(out_path),
+        "-map", "0:v:0", "-c", "copy",
+        "-output_ts_offset", ms_ts(segments[0]["start_ms"]),
+        str(out_path),
     ])
     if not out_path.exists() or out_path.stat().st_size == 0:
         raise RuntimeError("Segment concat produced no output")

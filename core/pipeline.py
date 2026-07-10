@@ -299,6 +299,11 @@ def process_videos(cfg, engine):
                             verified = True
                             break
                 if verified:
+                    # A verified file never reaches the post-encode
+                    # cleanup below, so reclaim any segment dirs an
+                    # interrupted refine encode left behind here — they
+                    # can hold most of a movie's video stream.
+                    core_segments.cleanup_file_segments(root_cache, file_hash)
                     print(f" {PURPLE}{filepath.name:<30}{RESET} {CHECK} exists")
                     continue
 
