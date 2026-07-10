@@ -126,10 +126,12 @@ def process_videos(cfg, engine):
     core_segments.sweep_orphan_segments(root_cache)
 
     pattern = "**/*" if cfg["recurse"] else "*"
-    files = [
+    # Sorted for a deterministic batch order (glob order is filesystem-
+    # dependent), matching av1q-crop's listing.
+    files = sorted(
         f for f in input_dir.glob(pattern)
         if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS
-    ]
+    )
     total = len(files)
 
     # A user seed only seeds NEW searches: files with a completed search
@@ -831,8 +833,11 @@ def process_videos(cfg, engine):
             fresh_ratio = None
             fresh_decay = None
 
-            if (sample_kbps_at_best and actual_kbps_now
-                    and sample_kbps_at_best > 0):
+            # isinstance guards: these come straight from the JSON cache,
+            # and a corrupt value must be ignored (like every other
+            # calibration read), not crash the file on the arithmetic.
+            if (isinstance(sample_kbps_at_best, (int, float))
+                    and actual_kbps_now and sample_kbps_at_best > 0):
                 ratio = actual_kbps_now / sample_kbps_at_best
                 if RATIO_MIN <= ratio <= RATIO_MAX:
                     cal_now["ratio"] = ratio
@@ -843,7 +848,7 @@ def process_videos(cfg, engine):
                         f" video {actual_kbps_now}kbps (ratio {ratio:.2f})"
                     )
 
-            if (sample_vmaf_at_best is not None and best_vmaf
+            if (isinstance(sample_vmaf_at_best, (int, float)) and best_vmaf
                     and math.isfinite(sample_vmaf_at_best)
                     and math.isfinite(best_vmaf.get("mean", float("nan")))):
                 offset = sample_vmaf_at_best - best_vmaf["mean"]
