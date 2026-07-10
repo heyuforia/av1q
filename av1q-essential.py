@@ -248,6 +248,8 @@ def main():
         parser.error("--film-grain must be 0-50")
     if args.metric_every < 1:
         parser.error("--metric-every must be >= 1")
+    if args.samples < 1:
+        parser.error("--samples must be >= 1")
     if args.seed_crf is not None and not args.min_crf <= args.seed_crf <= args.max_crf:
         parser.error("--seed-crf must be within --min-crf..--max-crf")
 

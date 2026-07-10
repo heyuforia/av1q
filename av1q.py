@@ -201,8 +201,17 @@ def main():
 
     if args.min_cq > args.max_cq:
         parser.error("--min-cq must be <= --max-cq")
+    # 1-63: ffmpeg's libsvtav1 wrapper clamps -crf to 63 and treats 0 as
+    # "unset" — out-of-range bounds would silently encode at a different
+    # CQ than the one the search records in the cache.
+    if not 1 <= args.min_cq <= 63 or not 1 <= args.max_cq <= 63:
+        parser.error("CQ bounds must be within 1-63")
     if not 0 <= args.preset <= 10:
         parser.error("--preset must be 0-10 (SVT-AV1 v3 removed presets above 10)")
+    if not 0 <= args.film_grain <= 50:
+        parser.error("--film-grain must be 0-50")
+    if args.samples < 1:
+        parser.error("--samples must be >= 1")
     if args.seed_cq is not None and not args.min_cq <= args.seed_cq <= args.max_cq:
         parser.error("--seed-cq must be within --min-cq..--max-cq")
 
