@@ -6,29 +6,31 @@ Automatically encode videos to AV1 at the best quality-to-size ratio, using VMAF
 
 ## What it does
 
-Drop videos into a folder, run the script, and each file gets encoded to AV1 at a quality level that hits a target VMAF score. Instead of guessing CRF values or doing manual test encodes, the tool figures it out for you.
+Drop videos into a folder and run the script. Each file is encoded to AV1 at a quality level that hits a target VMAF score, so there's no guessing at CRF values and no manual test encodes.
 
-1. **Detects scenes** and extracts short representative samples from complex parts of the video
-2. **Searches for the optimal CQ** by encoding only the samples — not the full file — and measuring VMAF after each attempt
-3. **Encodes the full video** at the chosen CQ, then verifies the final VMAF score matches the target
-4. **Refines in 1-2 passes** if VMAF or the bitrate floor comes up short — using the measured quality/bitrate slopes to jump directly to the right CQ rather than stepping by one
+For every file:
+
+1. **Detect scenes** and extract short samples from the most complex parts of the video
+2. **Search for the optimal CQ** by encoding only those samples, measuring VMAF after each attempt
+3. **Encode the full video** at the chosen CQ, then verify the final VMAF matches the target
+4. **Refine** if the result missed, using the measured quality and bitrate slopes to jump straight to the corrected CQ
 
 ## Features
 
-- **VMAF-targeted encoding** — hits a perceptual quality target instead of using a fixed CRF
-- **Resolution-aware defaults** — auto-selects VMAF targets (94 for HD, 93 for SD, 90 for 4K)
-- **Bitrate floors** — per-resolution minimum bitrates (1 Mbps 720p, 1.8 Mbps 1080p, 2.5 Mbps 1440p, 4.5 Mbps 2160p, 8 Mbps 4320p) prevent VMAF-misleading low-bitrate encodes; starvation backstops, not targets
-- **Scene-based sampling** — fast quality estimation without encoding the whole file during search
-- **P5 quality reporting** — measures and reports 5th-percentile worst-frame VMAF alongside the mean, so you can spot files whose worst moments lag
-- **SSIMULACRA2 reporting** — every VMAF score is shown next to a GPU-computed [SSIMULACRA2](https://github.com/cloudinary/ssimulacra2) score as a second opinion; informational only, it never influences the encode
-- **HDR & color preservation** — carries over color primaries, transfer, matrix, and range
-- **10-bit output** by default, film grain synthesis included
-- **Hardware-accelerated decoding** — CUDA, D3D11VA (Windows), VideoToolbox (macOS), VAAPI (Linux) speed up quality measurement and scene/crop detection; encoding itself is always CPU
-- **Optional auto-crop** — `--auto-crop` detects letterbox/pillarbox bars inline before each encode (or use the standalone `av1q-crop.py` to pre-scan a library); confidence-gated so ambiguous detections aren't silently applied
-- **File-based caching** — skips re-analysis and re-measurement on subsequent runs, and interrupted searches resume where they left off
-- **Resumable encodes** — full encodes of long sources (15 min+) are written as finalized segments, so an interrupted encode picks up at the last finished segment instead of restarting from frame 0 (disable with `--no-resume`)
-- **Batch processing** with recursive subdirectory support
-- **Cross-platform** — Windows, macOS, Linux
+- **VMAF-targeted encoding.** Hits a perceptual quality target instead of a fixed CRF.
+- **Resolution-aware defaults.** VMAF targets auto-select by resolution: 94 for HD, 93 for SD, 90 for 4K.
+- **Bitrate floors.** Per-resolution minimums (1 Mbps at 720p, 1.8 at 1080p, 2.5 at 1440p, 4.5 at 2160p, 8 at 4320p) prevent VMAF-misleading low-bitrate encodes. They're starvation backstops, not targets.
+- **Scene-based sampling.** Fast quality estimation, so the search never encodes the whole file.
+- **P5 quality reporting.** The 5th-percentile worst-frame VMAF is reported next to the mean, so you can spot files whose worst moments lag.
+- **SSIMULACRA2 reporting.** Every VMAF score is shown next to a GPU-computed [SSIMULACRA2](https://github.com/cloudinary/ssimulacra2) score as a second opinion. Informational only, it never influences the encode.
+- **HDR and color preservation.** Carries over color primaries, transfer, matrix, and range.
+- **10-bit output** by default, with film grain synthesis.
+- **Hardware-accelerated decoding.** CUDA, D3D11VA (Windows), VideoToolbox (macOS), and VAAPI (Linux) speed up quality measurement and scene detection. Encoding itself is always CPU.
+- **Optional auto-crop.** `--auto-crop` detects letterbox and pillarbox bars before each encode, or use the standalone `av1q-crop.py` to pre-scan a library. Confidence-gated, so ambiguous detections are never silently applied.
+- **File-based caching.** Analysis and measurements are reused on later runs, and interrupted searches resume where they left off.
+- **Resumable encodes.** Full encodes of sources 15 minutes and longer are written as finalized segments, so an interrupted encode picks up at the last finished segment instead of restarting from frame 0 (disable with `--no-resume`).
+- **Batch processing** with recursive subdirectory support.
+- **Cross-platform.** Windows, macOS, Linux.
 
 ## Requirements
 
@@ -42,11 +44,11 @@ Most ffmpeg builds from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) (Windows
 ### Optional
 
 - [colorama](https://pypi.org/project/colorama/) for Windows terminal colors (`pip install colorama`). Works without it.
-- [FFVship](https://codeberg.org/Line-fr/Vship) powers the SSIMULACRA2 info scores. On Windows it's downloaded automatically on first run (the build matching your GPU — NVIDIA, AMD, or generic Vulkan). Without it the SSIMULACRA2 column simply disappears; everything else works the same.
+- [FFVship](https://codeberg.org/Line-fr/Vship) powers the SSIMULACRA2 info scores. On Windows it downloads automatically on first run, picking the build that matches your GPU (NVIDIA, AMD, or generic Vulkan). Without it the SSIMULACRA2 column disappears and everything else works the same.
 
 ## Usage
 
-**Basic** — processes all videos in `./Video Input`, outputs to `./AV1 Output`:
+**Basic.** Processes all videos in `./Video Input`, outputs to `./AV1 Output`:
 
 ```
 python av1q.py
@@ -64,25 +66,25 @@ python av1q.py -i /path/to/videos -o /path/to/output
 python av1q.py --vmaf 95 --preset 6
 ```
 
-**Start the search at a known CQ** — when run in a terminal, the script asks once at startup:
+**Start the search at a known CQ.** When run in a terminal, the script asks once at startup:
 
 ```
 Seed CQ 18–38 (Enter = auto):
 ```
 
-Press Enter for the automatic seed, or type a CQ to start every file's search there — handy when a batch of similar clips all land around the same value, since a good seed can collapse the search to a single encode. The seed is only a starting point: VMAF is still measured and the search still corrects a wrong guess. `--seed-cq 24` does the same non-interactively (and skips the prompt); piped/scripted runs without the flag skip the prompt entirely.
+Press Enter for the automatic seed, or type a CQ to start every file's search there. This helps when a batch of similar clips all land around the same value, since a good seed can collapse the search to a single encode. The seed is only a starting point: VMAF is still measured and the search still corrects a wrong guess. `--seed-cq 24` does the same without the prompt, and piped or scripted runs skip the prompt entirely.
 
-If some files in the batch were already encoded by a previous run, a seed alone won't redo them — their finished search result is reused. When a seed is given interactively, av1q lists those files and asks once whether to re-encode them with a fresh search from the seed (clearing their cached results) or keep the previous answers.
+A seed alone won't redo files that a previous run already encoded, since their finished search result is reused. When a seed is given interactively, av1q lists those files and asks once whether to re-encode them with a fresh search from the seed or keep the previous results.
 
-**Auto-crop letterboxed or pillarboxed videos** — add `--auto-crop`:
+**Auto-crop letterboxed or pillarboxed videos:**
 
 ```
 python av1q.py --auto-crop
 ```
 
-Before each encode, the script samples 8 short windows of the video, detects black bars, and applies the crop if the detection is confident. Results are cached as `<file>.crop.json` sidecars beside each source, so re-runs reuse them without re-scanning. Low-confidence detections (dark sources, mixed aspect ratios) are saved for manual review but not auto-applied. Pass `--no-crops` to ignore sidecars entirely.
+Before each encode the script samples 8 short windows, detects black bars, and applies the crop if the detection is confident. Results are cached as `<file>.crop.json` sidecars beside each source, so re-runs reuse them. Low-confidence detections (dark sources, mixed aspect ratios) are saved for manual review but never auto-applied. Pass `--no-crops` to ignore sidecars entirely.
 
-For batch pre-scanning a whole library before encoding (so you can review borderline sidecars first), the companion `av1q-crop.py` does the same detection standalone and writes the same sidecar format:
+To pre-scan a whole library before encoding, so you can review borderline sidecars first, the companion `av1q-crop.py` runs the same detection standalone and writes the same sidecar format:
 
 ```
 python av1q-crop.py
@@ -100,28 +102,28 @@ python av1q.py
 | `--min-cq` | `18` | Minimum CQ (highest quality bound) |
 | `--max-cq` | `38` | Maximum CQ (lowest quality bound) |
 | `--film-grain` | `24` | Film grain synthesis level (0-50) |
-| `--samples` | `8` | Number of sample segments for estimation |
+| `--samples` | `8` | Base number of sample segments, scales up with duration |
 | `--seed-cq` | Prompted / auto | Starting CQ for the search (skips the interactive prompt) |
-| `--no-10bit` | — | Disable forced 10-bit encoding |
-| `--no-recurse` | — | Don't process subdirectories |
-| `--overwrite` | — | Re-encode even if output exists |
-| `--dry-run` | — | Find optimal CQ but skip final encoding |
-| `--auto-crop` | — | Detect letterbox/pillarbox inline before each encode (skips files that already have a sidecar) |
-| `--no-crops` | — | Ignore `*.crop.json` sidecars (auto-applied by default) |
-| `--no-resume` | — | Disable resumable segmented encoding for long sources |
+| `--no-10bit` | | Disable forced 10-bit encoding |
+| `--no-recurse` | | Don't process subdirectories |
+| `--overwrite` | | Re-encode even if output exists |
+| `--dry-run` | | Find optimal CQ but skip final encoding |
+| `--auto-crop` | | Detect letterbox/pillarbox inline before each encode |
+| `--no-crops` | | Ignore `*.crop.json` sidecars (auto-applied by default) |
+| `--no-resume` | | Disable resumable segmented encoding for long sources |
 
 ## How it works
 
-The script uses an adaptive search (similar to Newton's method) to converge on the right CQ value in 2-4 iterations rather than brute-forcing every option:
+The search is adaptive, similar to Newton's method: it converges on the right CQ in 2 to 4 iterations instead of testing every value.
 
-1. **Analyze** — scene detection identifies visually distinct segments; frame complexity analysis ranks them
-2. **Sample** — the most complex scenes are extracted as short clips and concatenated. Short files (~15–60s at defaults) scale down to a mini plan (3×2s clips) instead of skipping sampling; only files at ~15s or under search on the full file directly — there even tiny probes would cover most of the file anyway
-3. **Search** — the sample is encoded at a seed CQ derived from the source's bitrate headroom over the floor (higher headroom → lower starting CQ; falls back to 30 when unknown, and can be overridden interactively or with `--seed-cq`), VMAF is measured, and the next CQ is estimated from the slope of quality-vs-CQ. The search estimates a bitrate ceiling from measured data (starting from the ±6 CQ ≈ 2× bitrate rule of thumb — or the decay rate the encoder actually exhibited on previously processed files — and refining with actual measurements) to avoid jumping past the bitrate floor. When the bitrate floor is the binding constraint rather than VMAF, the search switches to bitrate targeting mode — testing additional sample CQs to compute the exact decay rate for the content and interpolating to the CQ that hits the floor. Repeats until the target is bracketed
-4. **Encode** — full video is encoded at the best CQ found
-5. **Verify & refine** — full-file VMAF and bitrate are checked against their targets (P5, the 5th-percentile worst-frame score, is measured and reported but not used as a gate). Misses in either direction trigger a corrective re-encode: a shortfall steps the CQ down, while VMAF landing well above target (with bitrate headroom over the floor) steps it up to reclaim wasted bitrate. Each jump is computed from the measured quality/bitrate slopes — converging in 1-2 iterations rather than stepping by one — and a re-encode predicted to trim less than ~3% bitrate is skipped as costing more than it saves
-6. **Calibrate** — sample-vs-full deltas (bitrate ratio, VMAF offset, quality slope, bitrate decay) are cached per file and rolled into cross-file averages, so re-runs of the same file — and new files once a few have been processed — aim at the right CQ on the first probe
+1. **Analyze.** Scene detection finds visually distinct segments, and packet-size analysis ranks them by complexity. Both read the container without decoding, so this stays fast on long 4K sources.
+2. **Sample.** The most complex scenes are cut out and concatenated into one short clip. The number of scenes sampled grows with duration, so a feature-length film is represented as well as a short one. Files roughly 15 to 60 seconds long get a smaller plan of 3 clips at 2 seconds each. Files at 15 seconds and under skip sampling and search on the full file, where a probe would cover most of the file anyway.
+3. **Search.** The sample is encoded at a seed CQ derived from the source's bitrate headroom over the floor, VMAF is measured, and the next CQ is estimated from the slope of quality against CQ. The search also tracks the bitrate floor and estimates a ceiling from the measured data, so it never jumps past it. When the floor is the binding constraint rather than VMAF, the search switches to bitrate targeting: it measures the exact bitrate decay rate for the content and interpolates to the CQ that lands on the floor.
+4. **Encode.** The full video is encoded at the best CQ found.
+5. **Verify and refine.** Full-file VMAF and bitrate are checked against their targets. P5 is measured and reported but is not a gate. A miss in either direction triggers a corrective re-encode: a shortfall lowers the CQ, while VMAF landing well above target with bitrate headroom to spare raises it to reclaim wasted bitrate. Each jump is sized from the measured slopes and converges in 1 or 2 passes. A re-encode predicted to trim less than about 3% of bitrate is skipped as costing more than it saves.
+6. **Calibrate.** Sample-to-full deltas (bitrate ratio, VMAF offset, quality slope, bitrate decay) are cached per file and rolled into cross-file averages. Re-runs of the same file, and new files once a few have been processed, aim at the right CQ on the first probe.
 
-Files that end up *larger* after encoding are automatically deleted.
+Files that end up larger after encoding are deleted automatically.
 
 ## License
 
