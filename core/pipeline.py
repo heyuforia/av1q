@@ -4,10 +4,8 @@ process_videos drives: discovery → skip-existing → probe → crop →
 engine gate/meta prep → scene analysis → sampling (engine sample prep)
 → search (core.search) → final encode + verify → calibration
 persistence → the consolidated refine loop → final selection and
-cleanup. Everything engine-specific goes through the Engine interface;
-the printed output is byte-identical to what each launcher printed
-before the merge (quantizer labels and grid formatting come from the
-engine).
+cleanup. Everything engine-specific goes through the Engine interface,
+including the printed output's quantizer labels and grid formatting.
 
 Two cache scopes, deliberately distinct:
   cfg["cache_dir"]        shared between pipelines — sample extraction,

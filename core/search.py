@@ -82,7 +82,8 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
     measure VMAF, fit the local quality slope, jump. Also tracks the
     per-resolution bitrate floor — when bitrate is the binding constraint
     instead of VMAF, switches to bitrate-targeting mode on a log-linear
-    bitrate model (±6 CRF ≈ 2× bitrate, refined with measured points).
+    bitrate model (±6 quantizer steps ≈ 2× bitrate, refined with
+    measured points).
 
     Injected seams (supplied by the launchers' compat wrappers so their
     module globals stay monkeypatchable):

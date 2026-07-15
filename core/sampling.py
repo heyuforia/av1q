@@ -194,8 +194,8 @@ def extract_samples(source, scenes, keyframes, cfg, file_hash=None):
             # would also pick a subtitle stream (mov_text from MP4 fails
             # MKV stream copy outright) and picks the "best" video stream
             # rather than the first — while probe/encode/VMAF all use
-            # v:0. Samples are video-only by contract (see -an in the
-            # bitrate accounting notes).
+            # v:0. Samples are video-only by contract: the sample path's
+            # kbps math reads their whole byte size as video.
             run_cmd([
                 "ffmpeg", "-y", "-hide_banner", "-v", "error",
                 "-ss", f"{start:.3f}", "-i", str(source),

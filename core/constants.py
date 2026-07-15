@@ -21,7 +21,7 @@ MIN_BITRATE_KBPS = {0: 0, 720: 1000, 1080: 1800, 1440: 2500, 2160: 4500, 4320: 8
 # at the floor but accept the whole band, so neither spends an extra full
 # encode shaving the last few percent off a video that's already there
 # (e.g. trimming 5330kbps toward 5000 when the floor is 5000). 1.1 keeps the
-# overshoot under ~one quarter-CRF grid step.
+# overshoot under ~one CQ grid step.
 BITRATE_BAND = 1.1
 
 # Sample→full bitrate margin for evenly-spaced sampling. The normal margin
