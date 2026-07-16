@@ -70,6 +70,12 @@ def process_videos(cfg, engine):
 
     root_cache = engine.cache_root(cfg)
     min_q, max_q = engine.q_bounds(cfg)
+    # Forced-quantizer mode: the user picked the value, so the whole
+    # estimation apparatus (sampling, search, VMAF, refine) has nothing
+    # to decide. Grid-native, set by the launchers (--force-cq /
+    # --force-crf); deliberately NOT clamped to the search bounds —
+    # they bound the search, and there is no search.
+    force_q = cfg.get("force_q")
 
     LBL = 10  # label column width for aligned output
     def lbl(tag):
@@ -82,7 +88,7 @@ def process_videos(cfg, engine):
     # (which falls back to 30 for intra-only sources like ProRes). Enter
     # keeps auto behavior. Only when stdin is a terminal — piped/scripted
     # runs must not block.
-    if cfg[engine.seed_key] is None and sys.stdin.isatty():
+    if force_q is None and cfg[engine.seed_key] is None and sys.stdin.isatty():
         while True:
             try:
                 raw = input(
@@ -140,7 +146,7 @@ def process_videos(cfg, engine):
     # fresh search from the seed; the default keeps today's behavior.
     user_seed = cfg[engine.seed_key]
     seeded_redo = set()
-    if user_seed is not None and files and sys.stdin.isatty():
+    if force_q is None and user_seed is not None and files and sys.stdin.isatty():
         prior = []
         for f in files:
             try:
@@ -253,51 +259,79 @@ def process_videos(cfg, engine):
                 )
 
             if cfg["skip_existing"]:
-                # An output file with a cached full VMAF is necessary but
-                # not sufficient: an interrupted search can leave a probe
-                # encode that later gets verified, and a verified-but-
-                # unconverged file (e.g. seed quantizer at 4x the intended
-                # bitrate) must not be skipped forever. Require the
-                # cache's `recommended` block — written only when a search
-                # completes — to match the current settings, and accept
-                # either the recommended quantizer itself or (for outputs
-                # predating the post-refine `recommended` update) a
-                # verified VMAF inside the acceptance band.
                 verified = False
-                rec = cache.get("recommended")
-                rec_ok = (
-                    isinstance(rec, dict)
-                    and all(
-                        rec.get(k) == cfg[k]
-                        for k in (*engine.rec_bound_keys, "preset",
-                                  "film_grain", *engine.rec_extra_keys)
+                if force_q is not None:
+                    # Forced mode has its own done contract: the `forced`
+                    # cache block records, per quantizer, the settings a
+                    # forced encode was made with plus its output size. A
+                    # bare file at the right name proves nothing (it could
+                    # be a stale-settings encode or a searched-run
+                    # leftover), and the search's `recommended` block must
+                    # play no part in either direction — a forced encode
+                    # is not a finished search, and a finished search must
+                    # never skip a forced encode.
+                    fb = cache.get("forced")
+                    fe = (
+                        fb.get(grid.fmt(force_q))
+                        if isinstance(fb, dict) else None
                     )
-                    and rec.get("crop") == expected_crop
-                    # Auto targets vary by resolution and the file hasn't
-                    # been probed yet, so a target check is only possible
-                    # against an explicit --vmaf.
-                    and (cfg["target_vmaf"] is None
-                         or rec.get("target") == cfg["target_vmaf"])
-                )
-                if rec_ok:
-                    rec_target = rec.get("target")
-                    for c in all_qs:
-                        d = dst_path(c)
-                        if not d.exists():
-                            continue
-                        entry = cache["entries"].get(grid.fmt(c))
-                        if not (entry and engine.vmaf_key_base in entry
-                                and entry.get("size") == d.stat().st_size):
-                            continue
-                        in_band = (
-                            isinstance(rec_target, (int, float))
-                            and rec_target - cfg["vmaf_tolerance"]
-                            <= entry[engine.vmaf_key_base]
-                            <= rec_target + VMAF_OVERSHOOT
+                    d = dst_path(force_q)
+                    if (isinstance(fe, dict)
+                            and all(
+                                fe.get(k) == cfg[k]
+                                for k in ("preset", "film_grain",
+                                          *engine.rec_extra_keys)
+                            )
+                            and fe.get("crop") == expected_crop
+                            and d.exists()
+                            and fe.get("size") == d.stat().st_size):
+                        verified = True
+                else:
+                    # An output file with a cached full VMAF is necessary
+                    # but not sufficient: an interrupted search can leave
+                    # a probe encode that later gets verified, and a
+                    # verified-but-unconverged file (e.g. seed quantizer
+                    # at 4x the intended bitrate) must not be skipped
+                    # forever. Require the cache's `recommended` block —
+                    # written only when a search completes — to match the
+                    # current settings, and accept either the recommended
+                    # quantizer itself or (for outputs predating the
+                    # post-refine `recommended` update) a verified VMAF
+                    # inside the acceptance band.
+                    rec = cache.get("recommended")
+                    rec_ok = (
+                        isinstance(rec, dict)
+                        and all(
+                            rec.get(k) == cfg[k]
+                            for k in (*engine.rec_bound_keys, "preset",
+                                      "film_grain", *engine.rec_extra_keys)
                         )
-                        if c == rec.get(engine.rec_q_key) or in_band:
-                            verified = True
-                            break
+                        and rec.get("crop") == expected_crop
+                        # Auto targets vary by resolution and the file
+                        # hasn't been probed yet, so a target check is
+                        # only possible against an explicit --vmaf.
+                        and (cfg["target_vmaf"] is None
+                             or rec.get("target") == cfg["target_vmaf"])
+                    )
+                    if rec_ok:
+                        rec_target = rec.get("target")
+                        for c in all_qs:
+                            d = dst_path(c)
+                            if not d.exists():
+                                continue
+                            entry = cache["entries"].get(grid.fmt(c))
+                            if not (entry and engine.vmaf_key_base in entry
+                                    and entry.get("size") == d.stat().st_size):
+                                continue
+                            in_band = (
+                                isinstance(rec_target, (int, float))
+                                and rec_target - cfg["vmaf_tolerance"]
+                                <= entry[engine.vmaf_key_base]
+                                <= rec_target + VMAF_OVERSHOOT
+                            )
+                            if c == rec.get(engine.rec_q_key) or in_band:
+                                verified = True
+                                break
                 if verified:
                     # A verified file never reaches the post-encode
                     # cleanup below, so reclaim any segment dirs an
@@ -381,6 +415,95 @@ def process_videos(cfg, engine):
             # metadata restated as encoder flags on the Y4M-pipe path).
             if engine.prepare_meta(filepath, meta, cfg):
                 print(f"{lbl('hdr')}{DIM}static metadata carried over{RESET}")
+
+            expected_frames = 0
+            if engine.needs_expected_frames:
+                fps_str = get_fps(filepath)
+                if fps_str and meta["duration"] > 0:
+                    try:
+                        if "/" in fps_str:
+                            a, b = fps_str.split("/", 1)
+                            fps_f = float(a) / float(b)
+                        else:
+                            fps_f = float(fps_str)
+                        expected_frames = int(meta["duration"] * fps_f)
+                    except (ValueError, ZeroDivisionError):
+                        pass
+
+            # Forced mode: one full encode at the user's quantizer and
+            # done. Probe/crop/gate/meta prep above still apply (they are
+            # source facts, not search machinery); segments still resume;
+            # nothing downstream runs — no sampling, search, VMAF, SSIMU2,
+            # calibration, or refine. Deliberate differences from the
+            # searched path: `recommended` is neither read nor written
+            # (it means "a search finished", which never happened),
+            # sibling-quantizer outputs are left alone (forcing a ladder
+            # of values for an A/B is the point of the mode), and a
+            # larger-than-source result is kept — the user chose the
+            # quantizer, so the file is the deliverable, not a failed
+            # compression bet.
+            if force_q is not None:
+                print(
+                    f"{lbl('forced')}{engine.qname}"
+                    f" {BOLD}{grid.fmt(force_q)}{RESET}"
+                    f" {DIM}(skipping search){RESET}"
+                )
+                t0 = time.time()
+                engine.encode(
+                    filepath, dst_path(force_q), meta, force_q, cfg,
+                    show_progress=True, expected_frames=expected_frames,
+                    resumable=True,
+                )
+                t_enc = time.time() - t0
+                final = dst_path(force_q)
+                if not final.exists():
+                    print(f" {CROSS} Final encode missing")
+                    continue
+                core_segments.cleanup_file_segments(root_cache, file_hash)
+                out_sz = final.stat().st_size
+
+                # The forced done-marker (see the skip-existing check):
+                # per-quantizer so a ladder of forced values each skip
+                # independently on re-runs.
+                forced = cache.get("forced")
+                forced = dict(forced) if isinstance(forced, dict) else {}
+                forced[grid.fmt(force_q)] = {
+                    "preset": cfg["preset"],
+                    "film_grain": cfg["film_grain"],
+                    **{k: cfg[k] for k in engine.rec_extra_keys},
+                    "crop": meta["crop"], "size": out_sz,
+                }
+                cache["forced"] = forced
+                atomic_write_json(cp, cache)
+
+                saved = (1.0 - out_sz / in_sz) * 100
+                out_kbps = calc_kbps(out_sz, meta["duration"])
+                kbps_final = (
+                    f"  {DIM}{MIDDOT}{RESET}  {BOLD}{out_kbps}kbps{RESET}"
+                    if out_kbps else ""
+                )
+                print(SEP)
+                print(
+                    f" {CHECK} {engine.qname}"
+                    f" {BOLD}{grid.fmt(force_q)}{RESET}{kbps_final}"
+                )
+                sv_color = GREEN if out_sz < in_sz else RED
+                print(
+                    f" {CHECK} {fmt_size(in_sz)} ->"
+                    f" {BOLD}{fmt_size(out_sz)}{RESET}"
+                    f" saved {sv_color}{BOLD}{saved:.1f}%{RESET}"
+                )
+                if out_sz >= in_sz:
+                    print(
+                        f" {ORANGE}Larger than the source — kept"
+                        f" (forced {engine.qname}){RESET}"
+                    )
+                print(f"   {DIM}Enc {fmt_time(t_enc)}{RESET}")
+
+                stats["proc"] += 1
+                stats["saved"] += in_sz - out_sz
+                stats["orig"] += in_sz
+                continue
 
             tier = max(k for k in TARGET_VMAF_BY_RES if min(meta["w"], meta["h"]) >= k)
             target = cfg.get("target_vmaf") or TARGET_VMAF_BY_RES[tier]
@@ -527,20 +650,6 @@ def process_videos(cfg, engine):
             sample_enc_dir.mkdir(parents=True, exist_ok=True)
             sample_enc_cache = {}
             enc_tag = engine.signature(cfg, meta.get("crop"))
-
-            expected_frames = 0
-            if engine.needs_expected_frames:
-                fps_str = get_fps(filepath)
-                if fps_str and meta["duration"] > 0:
-                    try:
-                        if "/" in fps_str:
-                            a, b = fps_str.split("/", 1)
-                            fps_f = float(a) / float(b)
-                        else:
-                            fps_f = float(fps_str)
-                        expected_frames = int(meta["duration"] * fps_f)
-                    except (ValueError, ZeroDivisionError):
-                        pass
 
             def do_enc_sample(q):
                 nonlocal t_enc
@@ -1246,10 +1355,13 @@ def process_videos(cfg, engine):
     if total > 0:
         print(SEP)
     if stats["proc"] > 0:
-        avg = stats["vmaf_sum"] / stats["vmaf_n"] if stats["vmaf_n"] else 0
         pct = stats["saved"] / stats["orig"] * 100 if stats["orig"] else 0
         print(f"{CHECK} Processed: {BOLD}{stats['proc']}{RESET}")
-        print(f"{CHECK} Avg VMAF: {BOLD}{avg:.2f}{RESET}")
+        # Forced runs measure no VMAF; an average over zero scores would
+        # print a bogus 0.00.
+        if stats["vmaf_n"]:
+            avg = stats["vmaf_sum"] / stats["vmaf_n"]
+            print(f"{CHECK} Avg VMAF: {BOLD}{avg:.2f}{RESET}")
         print(
             f"{CHECK} Saved: {GREEN}{BOLD}{stats['saved'] / 1e9:.2f}GB{RESET}"
             f" ({GREEN}{BOLD}{pct:.1f}%{RESET})"

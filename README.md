@@ -76,6 +76,14 @@ Press Enter for the automatic seed, or type a CQ to start every file's search th
 
 A seed alone won't redo files that a previous run already encoded, since their finished search result is reused. When a seed is given interactively, av1q lists those files and asks once whether to re-encode them with a fresh search from the seed or keep the previous results.
 
+**Encode at a fixed CQ.** When you already know the CQ you want, `--force-cq` skips the search entirely and encodes each file at exactly that value, with no sampling, no VMAF measurement, and no refinement:
+
+```
+python av1q.py --force-cq 33
+```
+
+Finished files are remembered and skipped on later runs, and outputs at different forced values sit side by side in the output folder, so encoding a small ladder like 30, 33, 36 is an easy way to compare quality by eye. The chosen value is treated as final, so the output is kept even when it ends up larger than the source.
+
 **Auto-crop letterboxed or pillarboxed videos:**
 
 ```
@@ -104,6 +112,7 @@ python av1q.py
 | `--film-grain` | `24` | Film grain synthesis level (0-50) |
 | `--samples` | `8` | Base number of sample segments, scales up with duration |
 | `--seed-cq` | Prompted / auto | Starting CQ for the search (skips the interactive prompt) |
+| `--force-cq` | | Encode at exactly this CQ, skipping sampling, search, VMAF, and refinement |
 | `--no-10bit` | | Disable forced 10-bit encoding |
 | `--no-recurse` | | Don't process subdirectories |
 | `--overwrite` | | Re-encode even if output exists |
@@ -123,7 +132,7 @@ The search is adaptive, similar to Newton's method: it converges on the right CQ
 5. **Verify and refine.** Full-file VMAF and bitrate are checked against their targets. P5 is measured and reported but is not a gate. A miss in either direction triggers a corrective re-encode: a shortfall lowers the CQ, while VMAF landing well above target with bitrate headroom to spare raises it to reclaim wasted bitrate. Each jump is sized from the measured slopes and converges in 1 or 2 passes. A re-encode predicted to trim less than about 3% of bitrate is skipped as costing more than it saves.
 6. **Calibrate.** Sample-to-full deltas (bitrate ratio, VMAF offset, quality slope, bitrate decay) are cached per file and rolled into cross-file averages. Re-runs of the same file, and new files once a few have been processed, aim at the right CQ on the first probe.
 
-Files that end up larger after encoding are deleted automatically.
+Files that end up larger after encoding are deleted automatically. Forced encodes are the exception and are always kept.
 
 ## License
 

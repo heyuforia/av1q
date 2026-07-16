@@ -224,6 +224,14 @@ def main():
              "prompted interactively when run in a terminal)",
     )
     parser.add_argument(
+        "--force-crf", type=float, default=None,
+        help="Encode every file at exactly this CRF (0.25 steps) and skip "
+             "everything else: no sampling, no search, no VMAF "
+             "measurement, no refinement. Independent of "
+             "--min-crf/--max-crf. Outputs at different forced values "
+             "coexist, and a result larger than the source is kept.",
+    )
+    parser.add_argument(
         "--enc-args", type=str, default=None,
         help="Extra raw flags passed straight to SvtAv1EncApp, as one quoted "
              "string, e.g. --enc-args=\"--scd 1 --sharpness 7\". Use the "
@@ -252,6 +260,18 @@ def main():
         parser.error("--samples must be >= 1")
     if args.seed_crf is not None and not args.min_crf <= args.seed_crf <= args.max_crf:
         parser.error("--seed-crf must be within --min-crf..--max-crf")
+    if args.force_crf is not None:
+        # Checked against the encoder's real 1-70 range, not
+        # --min/--max-crf — those bound the search, and --force-crf
+        # replaces it.
+        if not 1 <= args.force_crf <= 70:
+            parser.error("--force-crf must be within 1-70")
+        if args.vmaf is not None:
+            parser.error("--force-crf has no VMAF target; drop --vmaf")
+        if args.seed_crf is not None:
+            parser.error("--force-crf replaces the search; drop --seed-crf")
+        if args.dry_run:
+            parser.error("--force-crf has no search to dry-run; drop --dry-run")
 
     # Parse extra encoder flags: shlex-split the one quoted string, drop
     # anything av1q manages (warn once), and fingerprint the survivors so
@@ -300,6 +320,7 @@ def main():
         "use_crops": not args.no_crops,
         "auto_crop": args.auto_crop,
         "seed_crf": qcrf(args.seed_crf) if args.seed_crf is not None else None,
+        "force_q": qcrf(args.force_crf) if args.force_crf is not None else None,
         "enc_args": enc_args,
         "enc_args_sig": enc_args_sig,
         "sample_count": args.samples,

@@ -196,6 +196,14 @@ def main():
              "(by default, interrupted full encodes resume at the last "
              "finished segment instead of restarting)",
     )
+    parser.add_argument(
+        "--force-cq", type=int, default=None,
+        help="Encode every file at exactly this CQ and skip everything "
+             "else: no sampling, no search, no VMAF measurement, no "
+             "refinement. Independent of --min-cq/--max-cq. Outputs at "
+             "different forced values coexist, and a result larger than "
+             "the source is kept.",
+    )
 
     args = parser.parse_args()
 
@@ -214,6 +222,18 @@ def main():
         parser.error("--samples must be >= 1")
     if args.seed_cq is not None and not args.min_cq <= args.seed_cq <= args.max_cq:
         parser.error("--seed-cq must be within --min-cq..--max-cq")
+    if args.force_cq is not None:
+        # Same 1-63 wrapper-clamp rationale as the search bounds; checked
+        # against the encoder's real range, not --min/--max-cq — those
+        # bound the search, and --force-cq replaces it.
+        if not 1 <= args.force_cq <= 63:
+            parser.error("--force-cq must be within 1-63")
+        if args.vmaf is not None:
+            parser.error("--force-cq has no VMAF target; drop --vmaf")
+        if args.seed_cq is not None:
+            parser.error("--force-cq replaces the search; drop --seed-cq")
+        if args.dry_run:
+            parser.error("--force-cq has no search to dry-run; drop --dry-run")
 
     cfg = {
         "input_dir": args.input,
@@ -235,6 +255,7 @@ def main():
         "use_crops": not args.no_crops,
         "auto_crop": args.auto_crop,
         "seed_cq": args.seed_cq,
+        "force_q": args.force_cq,
         "resume_encodes": not args.no_resume,
         "sample_count": args.samples,
         "sample_duration": 6.0,
