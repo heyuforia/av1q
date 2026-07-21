@@ -4,6 +4,7 @@ are remuxed back from the source. Quarter-step CRF grid; color and
 HDR10 static metadata re-stated as encoder flags (Y4M carries none);
 VFR sources gated out (the Y4M pipe is CFR-only)."""
 
+import hashlib
 import math
 import os
 import re
@@ -181,7 +182,18 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
     CPU decode comfortably outpaces SVT-AV1 at these presets.
     """
     is_full = dest.suffix.lower() != ".webm"
-    enc_out = dest.with_suffix(".tmp.webm")
+    # The standalone encoder takes its output path on the command line,
+    # and on Windows a non-ASCII path is ANSI-mangled to '?' before it
+    # reaches the encoder, which then rejects the filename outright. A
+    # full-encode dest carries the source's (possibly non-Latin) stem, so
+    # its bitstream is written to an ASCII, hash-named scratch file in the
+    # cache dir; ffmpeg remuxes it to the real dest afterward and handles
+    # the Unicode path natively. Sample dests are already hash-named ASCII.
+    if is_full:
+        tag = hashlib.sha256(str(dest).encode("utf-8")).hexdigest()[:16]
+        enc_out = cfg["e_cache_dir"] / f"_enc_{tag}.tmp.webm"
+    else:
+        enc_out = dest.with_suffix(".tmp.webm")
     _temp_files.add(enc_out)
     try:
         if enc_out.exists():

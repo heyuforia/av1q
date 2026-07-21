@@ -119,12 +119,17 @@ def process_videos(cfg, engine):
     output_dir.mkdir(parents=True, exist_ok=True)
     engine.make_dirs(cfg)
 
+    # Leftover encode temps live next to the output (dest-derived names)
+    # and, when a dest is non-ASCII, in the cache root (an engine may
+    # redirect the encoder's scratch file there — see essential's Y4M
+    # path). Both are swept so a hard kill can't strand either.
     for pat in engine.tmp_patterns:
-        for p in output_dir.rglob(pat):
-            try:
-                p.unlink()
-            except OSError:
-                pass
+        for base in (output_dir, root_cache):
+            for p in base.rglob(pat):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
     # Unlike the leftover .tmp outputs above, segment dirs with a valid
     # manifest are resume state and survive; only torn ones are junk.
     core_segments.sweep_orphan_segments(root_cache)
