@@ -7,6 +7,7 @@ import os
 import shlex
 import subprocess
 import time
+from pathlib import Path
 
 _temp_files = set()
 
@@ -98,6 +99,63 @@ def escape_filter_path(path):
     the filtergraph and option parsing stages.
     """
     return path.as_posix().replace(":", "\\\\:")
+
+
+def _short_path_win(s):
+    """Windows 8.3 short-path alias for `s` (all-ASCII), or None on
+    failure. When the volume has no 8.3 name for the path (creation
+    disabled, or the file predates it) GetShortPathNameW returns the long
+    path unchanged, which the caller rejects as non-ASCII.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    fn = ctypes.windll.kernel32.GetShortPathNameW
+    fn.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    fn.restype = wintypes.DWORD
+    buf = ctypes.create_unicode_buffer(512)
+    n = fn(s, buf, len(buf))
+    if n > len(buf):  # buffer too small; n is the required size incl. null
+        buf = ctypes.create_unicode_buffer(n)
+        n = fn(s, buf, len(buf))
+    return buf.value if n else None
+
+
+def ascii_path(path, scratch_dir):
+    """An all-ASCII spelling of `path` for a Windows program that reads its
+    file arguments as ANSI (FFVship's bundled FFMS2), plus any temp link to
+    clean up afterward.
+
+    A non-ASCII path is '?'-mangled on the ANSI command line and can't be
+    opened, so callers pass the returned spelling in place of the raw path.
+    Returns (usable_path, link):
+      * (path, None)   already ASCII, or non-Windows — nothing to do.
+      * (short, None)  the volume's 8.3 alias — stable, no new file.
+      * (link, link)   an ASCII-named hardlink in scratch_dir; the caller
+                       unlinks `link` when done.
+      * (None, None)   no ASCII spelling possible — drop the optional work.
+    """
+    s = str(path)
+    if s.isascii() or os.name != "nt":
+        return path, None
+    short = _short_path_win(s)
+    if short and short.isascii():
+        return Path(short), None
+    # Content-addressed hardlink: same inode as the file, ASCII name.
+    # Same-volume only; a cross-volume link raises OSError and the optional
+    # work is dropped. Recreated every call (never reused) so a link left
+    # by a hard-killed prior run can't feed a stale inode.
+    try:
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+        suffix = path.suffix if path.suffix.isascii() else ""
+        tag = hashlib.sha256(s.encode()).hexdigest()[:16]
+        link = scratch_dir / f"_ascii_{tag}{suffix}"
+        if link.exists():
+            link.unlink()
+        os.link(s, link)
+        return link, link
+    except OSError:
+        return None, None
 
 
 def partial_hash(filepath, block=1 << 16):

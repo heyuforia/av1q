@@ -20,7 +20,9 @@ import subprocess
 
 from .tools import find_ffvship_optional
 from .ui import DIM, RED, RESET
-from .util import _temp_files, make_temp_log, suppress_win_error_dialog
+from .util import (
+    _temp_files, ascii_path, make_temp_log, suppress_win_error_dialog,
+)
 
 # Demuxed video packet counts, memoized so the source of a long file is
 # only counted once across its verify/refine/final measurements.
@@ -122,6 +124,22 @@ def _run_ffvship(ref, dist, meta, cache_dir, exe,
             )
         return None
 
+    # FFVship's FFMS2 reads --source/--encoded as ANSI argv, so a non-ASCII
+    # path arrives '?'-mangled and can't be opened. Hand it an ASCII
+    # spelling (8.3 alias or a hardlink) of each real file instead.
+    safe_ref, ref_link = ascii_path(ref, cache_dir)
+    safe_dist, dist_link = ascii_path(dist, cache_dir)
+    if safe_ref is None or safe_dist is None:
+        for lk in (ref_link, dist_link):
+            if lk:
+                try:
+                    lk.unlink()
+                except OSError:
+                    pass
+        if verbose:
+            print(f" {DIM}SSIMU2 skipped: no ASCII path for '{ref.name}'{RESET}")
+        return None
+
     log = make_temp_log(cache_dir, "ssimu2", "json")
     idx_dir = cache_dir / "_ffindex"
     if ref_index:
@@ -131,7 +149,7 @@ def _run_ffvship(ref, dist, meta, cache_dir, exe,
         src_idx = make_temp_log(idx_dir, "src", "ffindex")
     dst_idx = make_temp_log(idx_dir, "dist", "ffindex")
     cmd = [
-        str(exe), "--source", str(ref), "--encoded", str(dist),
+        str(exe), "--source", str(safe_ref), "--encoded", str(safe_dist),
         "-m", "SSIMULACRA2", "--json", str(log),
         "-t", "2", "-g", "3",
         "--cache-index", "--source-index", str(src_idx),
@@ -167,6 +185,7 @@ def _run_ffvship(ref, dist, meta, cache_dir, exe,
         return None
     finally:
         cleanup = [log, dst_idx] if ref_index else [log, src_idx, dst_idx]
+        cleanup += [lk for lk in (ref_link, dist_link) if lk]
         for p in cleanup:
             try:
                 if p.exists():
