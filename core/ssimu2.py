@@ -18,7 +18,7 @@ import json
 import math
 import subprocess
 
-from .tools import find_ffvship_optional
+from .tools import ffprobe_exe, find_ffvship_optional
 from .ui import DIM, RED, RESET
 from .util import (
     _temp_files, ascii_path, make_temp_log, suppress_win_error_dialog,
@@ -41,7 +41,7 @@ def _video_frame_count(path):
         return _frame_counts[key]
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+            [ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
              "-count_packets", "-show_entries", "stream=nb_read_packets",
              "-of", "default=nw=1:nk=1", str(path)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,

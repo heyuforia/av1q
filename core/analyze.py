@@ -5,6 +5,7 @@ import json
 import subprocess
 
 from .probe import detect_hwaccel
+from .tools import ffmpeg_exe, ffprobe_exe
 from .util import _temp_files, clamp, escape_filter_path, make_temp_log
 
 
@@ -35,7 +36,7 @@ def detect_scenes(source, cfg, duration=None):
         attempts = [hw, None] if hw else [None]
 
         for accel in attempts:
-            cmd = ["ffmpeg", "-hide_banner"]
+            cmd = [ffmpeg_exe(), "-hide_banner"]
             if accel:
                 cmd += ["-hwaccel", accel]
             cmd += [
@@ -92,7 +93,7 @@ def analyze_complexity(source):
     """
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+            [ffprobe_exe(), "-v", "quiet", "-select_streams", "v:0",
              "-show_entries", "packet=pts_time,dts_time,size,flags",
              "-of", "json", str(source)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -152,7 +153,7 @@ def get_keyframes(source):
     """
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+            [ffprobe_exe(), "-v", "quiet", "-select_streams", "v:0",
              "-show_entries", "packet=pts_time,dts_time,flags",
              "-of", "json", str(source)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,

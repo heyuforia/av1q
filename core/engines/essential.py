@@ -17,7 +17,7 @@ from ..crop import crop_token
 from ..probe import get_rfps, is_vfr, probe_hdr_metadata
 from ..sampling import clean_sample_source
 from ..segments import mux_with_source_streams
-from ..tools import find_encoder, find_ffvship_optional
+from ..tools import ffmpeg_exe, find_encoder, find_ffvship_optional
 from ..ui import BOLD, DIM, GREEN, MIDDOT, ORANGE, RESET, fmt_time
 from ..util import _temp_files, make_temp_log
 from .base import Engine, Grid
@@ -201,7 +201,7 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
     except OSError:
         pass
 
-    ff_cmd = ["ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats",
+    ff_cmd = [ffmpeg_exe(), "-y", "-hide_banner", "-v", "error", "-nostats",
               "-i", str(source), "-map", "0:v:0"]
     # Full encodes normalize the feed's timeline to the source's nominal
     # frame cadence: setpts zeroes any start offset / edit-list delay and

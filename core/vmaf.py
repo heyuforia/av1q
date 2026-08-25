@@ -7,6 +7,7 @@ import subprocess
 import time
 
 from .probe import detect_hwaccel, get_fps
+from .tools import ffmpeg_exe, ffprobe_exe
 from .ui import RED, RESET
 from .util import _temp_files, atomic_write_json, make_temp_log, run_cmd
 
@@ -32,7 +33,7 @@ def _sw_decode_only(path):
     still falls back to the software attempt)."""
     try:
         r = run_cmd([
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
             "-show_entries", "stream=profile",
             "-of", "default=nw=1:nk=1", str(path),
         ])
@@ -122,7 +123,7 @@ def measure_vmaf(ref, dist, meta, subsample, threads, cache_dir):
         attempts = [hw, None] if hw else [None]
 
         for accel in attempts:
-            cmd = ["ffmpeg", "-v", "error", "-hide_banner"]
+            cmd = [ffmpeg_exe(), "-v", "error", "-hide_banner"]
             if accel:
                 cmd += ["-hwaccel", accel]
             cmd += ["-i", str(ref)]

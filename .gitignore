@@ -6,6 +6,7 @@ CLAUDE.md
 docs/
 tests/
 tools/
+ffmpeg/
 TODO/
 pytest.ini
 

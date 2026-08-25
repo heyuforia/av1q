@@ -17,7 +17,6 @@ Two cache scopes, deliberately distinct:
 
 import math
 import os
-import shutil
 import sys
 import time
 
@@ -44,6 +43,7 @@ from .probe import get_fps, probe_video, res_tier
 from .sampling import (
     complexity_bias_margin, extract_samples, sampling_plan, select_samples,
 )
+from .tools import have_ffmpeg, local_ffmpeg_dir
 from .ui import (
     BOLD, CHECK, CROSS, DIM, GREEN, MIDDOT, ORANGE, PURPLE, RED, RESET, SEP,
     fmt_s2, fmt_size, fmt_time, vmaf_pass_color,
@@ -59,8 +59,8 @@ def process_videos(cfg, engine):
     ext = cfg["container"]
     vmaf_threads = os.cpu_count() or 4
 
-    if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
-        print(f"{CROSS} ffmpeg/ffprobe not found in PATH")
+    if not have_ffmpeg():
+        print(f"{CROSS} ffmpeg/ffprobe not found in PATH or the av1q folder")
         return 1
     try:
         engine.setup(cfg)
@@ -82,6 +82,13 @@ def process_videos(cfg, engine):
         return f" {ORANGE}{tag:<{LBL}}{RESET}"
 
     print(f"{PURPLE}{BOLD}{engine.banner}{RESET}{engine.banner_extra}\n{SEP}")
+
+    # A build dropped into the av1q folder silently outranks whatever
+    # is on PATH, so name the folder that won: a local build missing
+    # libsvtav1 or libvmaf otherwise reads as a broken install.
+    local_ff = local_ffmpeg_dir()
+    if local_ff:
+        print(f"{DIM}ffmpeg: {local_ff}{RESET}\n{SEP}")
 
     # Interactive seed prompt: lets a batch of similar files start the
     # search at a known-good quantizer instead of the automatic seed

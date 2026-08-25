@@ -35,11 +35,13 @@ For every file:
 ## Requirements
 
 - **Python 3.8+**
-- **ffmpeg** and **ffprobe** in PATH, built with:
+- **ffmpeg** and **ffprobe**, built with:
   - `libsvtav1` (SVT-AV1 encoder)
   - `libvmaf` (VMAF quality metrics)
 
 Most ffmpeg builds from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) (Windows) or [BtbN](https://github.com/BtbN/FFmpeg-Builds/releases) (Linux/Windows) include both. On macOS: `brew install ffmpeg`.
+
+av1q uses the ffmpeg on your PATH by default. To run a specific build instead, put `ffmpeg` and `ffprobe` together in a folder named `ffmpeg` next to `av1q.py`. Both files have to be in that folder, otherwise av1q falls back to PATH. When a local build is used, its folder is printed at the top of the run.
 
 ### Optional
 

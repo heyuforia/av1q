@@ -5,6 +5,7 @@ import subprocess
 
 from .calibrate import RATIO_MAX, RATIO_MIN
 from .probe import probe_video
+from .tools import ffprobe_exe
 
 
 def calc_kbps(size_bytes, duration):
@@ -25,7 +26,7 @@ def video_kbps(filepath, duration=None):
         if not duration or duration < 1.0:
             return None
         r = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+            [ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
              "-show_entries", "packet=size", "-of", "csv=p=0", str(filepath)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace", timeout=300,

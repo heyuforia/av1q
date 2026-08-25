@@ -5,6 +5,7 @@ import json
 import platform
 import subprocess
 
+from .tools import ffmpeg_exe, ffprobe_exe
 from .util import run_cmd
 
 _hwaccel = None
@@ -26,7 +27,7 @@ def detect_hwaccel():
     for hw in candidates:
         try:
             r = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-hwaccel", hw,
+                [ffmpeg_exe(), "-hide_banner", "-hwaccel", hw,
                  "-f", "lavfi", "-i", "nullsrc=s=16x16:d=0.01",
                  "-f", "null", "-"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
@@ -44,7 +45,7 @@ def detect_hwaccel():
 def probe_video(filepath):
     """Extract video metadata via ffprobe."""
     r = run_cmd([
-        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
         "-show_entries",
         "stream=width,height,bit_rate,pix_fmt,color_primaries,"
         "color_transfer,color_space,color_range,codec_name",
@@ -85,7 +86,7 @@ def get_fps(filepath):
     """Get frame rate as a rational string to avoid VMAF frame misalignment."""
     try:
         r = run_cmd([
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
             "-show_entries", "stream=avg_frame_rate",
             "-of", "default=nw=1:nk=1", str(filepath),
         ])
@@ -114,7 +115,7 @@ def get_rfps(filepath):
     """
     try:
         r = run_cmd([
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
             "-show_entries", "stream=r_frame_rate",
             "-of", "default=nw=1:nk=1", str(filepath),
         ])
@@ -166,7 +167,7 @@ def probe_hdr_metadata(filepath):
     """
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+            [ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
              "-show_frames", "-read_intervals", "%+#1",
              "-show_entries", "frame=side_data_list",
              "-of", "json", str(filepath)],
@@ -216,7 +217,7 @@ def is_vfr(filepath, meta):
     """
     try:
         r = run_cmd([
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
             "-show_entries", "stream=r_frame_rate,avg_frame_rate",
             "-of", "json", str(filepath),
         ])
@@ -238,7 +239,7 @@ def is_vfr(filepath, meta):
         if duration <= 1:
             return False
         c = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+            [ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
              "-count_packets", "-show_entries", "stream=nb_read_packets",
              "-of", "default=nw=1:nk=1", str(filepath)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,

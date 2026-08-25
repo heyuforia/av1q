@@ -21,6 +21,7 @@ by timestamp — this is what keeps it aligned.
 import json
 import shutil
 
+from .tools import ffmpeg_exe, ffprobe_exe
 from .ui import DIM, ORANGE, RESET
 from .util import atomic_write_json, run_cmd
 
@@ -125,7 +126,7 @@ def _probe_start_ms(path):
     """
     try:
         r = run_cmd([
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
             "-show_entries", "packet=pts", "-of", "csv=p=0",
             "-read_intervals", "%+#1", str(path),
         ])
@@ -145,7 +146,7 @@ def _probe_duration_s(path):
     """Container duration in seconds (finalized segments carry it)."""
     try:
         r = run_cmd([
-            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            ffprobe_exe(), "-v", "error", "-show_entries", "format=duration",
             "-of", "csv=p=0", str(path),
         ])
         return float((r.stdout or "").strip().rstrip(","))
@@ -273,7 +274,7 @@ def concat_segments(seg_dir, segments, out_path,
     except OSError:
         pass
     run_cmd([
-        "ffmpeg", "-y", "-hide_banner", "-v", "error",
+        ffmpeg_exe(), "-y", "-hide_banner", "-v", "error",
         "-f", "concat", "-safe", "0", "-i", str(lst),
         "-map", "0:v:0", "-c", "copy",
         "-output_ts_offset", ms_ts(segments[0]["start_ms"]),
@@ -290,7 +291,7 @@ def mux_with_source_streams(video, source, dest_tmp, attachments=False):
     """
     def mux_cmd(maps, codecs):
         return [
-            "ffmpeg", "-y", "-hide_banner", "-v", "error",
+            ffmpeg_exe(), "-y", "-hide_banner", "-v", "error",
             "-i", str(video), "-i", str(source),
             *maps, "-map_chapters", "1", "-map_metadata", "1",
             *codecs, str(dest_tmp),

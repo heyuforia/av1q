@@ -11,6 +11,7 @@ from .constants import (
     MINI_SAMPLE_COUNT, MINI_SAMPLE_DURATION, MINI_SAMPLE_MIN_RATIO,
     SAMPLE_COUNT_MAX, SAMPLE_SCALE_K, SAMPLE_SCALE_REF,
 )
+from .tools import ffmpeg_exe
 from .ui import DIM, RED, RESET
 from .util import _temp_files, clamp, run_cmd
 
@@ -197,7 +198,7 @@ def extract_samples(source, scenes, keyframes, cfg, file_hash=None):
             # v:0. Samples are video-only by contract: the sample path's
             # kbps math reads their whole byte size as video.
             run_cmd([
-                "ffmpeg", "-y", "-hide_banner", "-v", "error",
+                ffmpeg_exe(), "-y", "-hide_banner", "-v", "error",
                 "-ss", f"{start:.3f}", "-i", str(source),
                 "-t", f"{sc['duration']:.3f}",
                 "-map", "0:v:0",
@@ -221,7 +222,7 @@ def extract_samples(source, scenes, keyframes, cfg, file_hash=None):
 
     try:
         run_cmd([
-            "ffmpeg", "-y", "-hide_banner", "-v", "error",
+            ffmpeg_exe(), "-y", "-hide_banner", "-v", "error",
             "-f", "concat", "-safe", "0", "-i", str(concat_list),
             "-c", "copy", str(concat_out),
         ])
@@ -268,7 +269,7 @@ def clean_sample_source(concat, meta, cfg):
         else "yuv420p"
     )
     cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-v", "error",
+        ffmpeg_exe(), "-y", "-hide_banner", "-v", "error",
         "-i", str(concat), "-map", "0:v:0",
         "-fps_mode", "cfr",
         "-c:v", "libx264", "-preset", "veryfast", "-qp", "0",

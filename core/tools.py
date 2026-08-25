@@ -1,6 +1,7 @@
 """Discovery and first-run download of the external tool binaries that
 live under <repo>/tools (FFVship today; the Essential encoder's lookup
-joins it with the engine split)."""
+joins it with the engine split), plus resolution of ffmpeg/ffprobe —
+a build dropped into the av1q folder is used in preference to PATH."""
 
 import json
 import os
@@ -16,6 +17,84 @@ from .ui import DIM, ORANGE, RESET
 _ROOT = Path(__file__).resolve().parent.parent
 
 _ffvship_exe = False  # False = not probed yet; None = probed, absent
+_ff_pair = None  # memo: (ffmpeg, ffprobe) commands, resolved once
+
+
+def _exe_in(directory, name):
+    """The `name` executable sitting directly in `directory`, or None.
+
+    Windows requires the .exe suffix to execute at all, so accepting an
+    extensionless file there would bless a Linux build extracted by
+    mistake: the preflight would pass and the failure would surface as a
+    RuntimeError cascade deep in a run instead of "ffmpeg not found".
+    """
+    exe = directory / (f"{name}.exe" if os.name == "nt" else name)
+    return exe if exe.is_file() else None
+
+
+def _local_ff_dirs():
+    """Folders that may hold a dropped-in ffmpeg build, in priority order.
+
+    The repo root itself (binaries dropped next to the launchers), then
+    <repo>/ffmpeg, then <repo>/tools alongside the other vendored
+    binaries. The two named folders are searched recursively, shallowest
+    first, so an unzipped release with its binaries in bin/ is found
+    while a copy sitting directly in the folder still wins. The root is
+    NOT recursed: the work folders under it hold whole video libraries.
+    """
+    yield _ROOT
+    for base in (_ROOT / "ffmpeg", _ROOT / "tools"):
+        if not base.is_dir():
+            continue
+        yield base
+        yield from sorted(
+            (d for d in base.rglob("*") if d.is_dir()),
+            key=lambda d: (len(d.parts), d.as_posix()),
+        )
+
+
+def _resolve_ff():
+    """(ffmpeg, ffprobe) commands: a local pair when one exists, else the
+    bare names for PATH lookup.
+
+    Both come from the same folder or neither does — pairing a local
+    ffmpeg with a PATH ffprobe mixes two builds, and the version skew
+    surfaces as parse failures deep in a run instead of as one clear
+    error. The bare names are the fallback (never None) so every command
+    line stays valid and a missing ffmpeg is reported by the pipeline's
+    preflight rather than a traceback.
+    """
+    global _ff_pair
+    if _ff_pair is None:
+        _ff_pair = ("ffmpeg", "ffprobe")
+        for d in _local_ff_dirs():
+            found = (_exe_in(d, "ffmpeg"), _exe_in(d, "ffprobe"))
+            if all(found):
+                _ff_pair = tuple(str(e) for e in found)
+                break
+    return _ff_pair
+
+
+def ffmpeg_exe():
+    """The ffmpeg command every call site invokes."""
+    return _resolve_ff()[0]
+
+
+def ffprobe_exe():
+    """The ffprobe command every call site invokes."""
+    return _resolve_ff()[1]
+
+
+def local_ffmpeg_dir():
+    """Folder the dropped-in ffmpeg came from, or None when the run is
+    using the PATH build."""
+    exe = _resolve_ff()[0]
+    return Path(exe).parent if exe != "ffmpeg" else None
+
+
+def have_ffmpeg():
+    """True when both ffmpeg and ffprobe resolve to something runnable."""
+    return all(os.path.isabs(c) or shutil.which(c) for c in _resolve_ff())
 
 
 def _gpu_vendor():

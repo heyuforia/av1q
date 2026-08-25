@@ -8,6 +8,7 @@ import time
 from .analyze import analyze_complexity, detect_scenes, get_keyframes
 from .probe import detect_hwaccel
 from .sampling import select_samples
+from .tools import ffmpeg_exe
 from .ui import BOLD, CHECK, CROSS, DIM, GREEN, ORANGE, RESET
 from .util import _temp_files, escape_filter_path, make_temp_log
 
@@ -59,7 +60,7 @@ def detect_crop_window(source, start, duration, limit, round_to, cache_dir):
         attempts = [hw, None] if hw else [None]
 
         for accel in attempts:
-            cmd = ["ffmpeg", "-hide_banner", "-v", "error"]
+            cmd = [ffmpeg_exe(), "-hide_banner", "-v", "error"]
             if accel:
                 cmd += ["-hwaccel", accel]
             cmd += [

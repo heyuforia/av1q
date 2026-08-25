@@ -16,7 +16,7 @@ from .. import segments, ssimu2
 from ..constants import FALLBACK_MAXRATE, RESUMABLE_MIN_DURATION, SEGMENT_TIME
 from ..crop import crop_token
 from ..probe import res_tier
-from ..tools import find_ffvship_optional
+from ..tools import ffmpeg_exe, find_ffvship_optional
 from ..ui import BOLD, DIM, GREEN, ORANGE, RESET, fmt_time
 from ..util import _temp_files, clamp, partial_hash, run_cmd
 from .base import Engine, Grid
@@ -276,7 +276,7 @@ def encode_av1(source, dest, meta, cq, cfg, show_progress=False,
     ]
     for attempt, (sub_map, sub_codec, note) in enumerate(sub_attempts):
         cmd = [
-            "ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats",
+            ffmpeg_exe(), "-y", "-hide_banner", "-v", "error", "-nostats",
             "-i", str(source),
             "-map", "0:v:0", "-map", "0:a?", *sub_map,
             *vf_args,
@@ -389,7 +389,7 @@ def _encode_segmented(source, dest, meta, cq, cfg, pix, vf_args, enc_args,
             )
 
         cmd = [
-            "ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats",
+            ffmpeg_exe(), "-y", "-hide_banner", "-v", "error", "-nostats",
             *in_args, "-map", "0:v:0",
             *vf_args, *enc_args, *ts_args,
             "-f", "segment",
