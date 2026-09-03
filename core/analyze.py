@@ -39,8 +39,14 @@ def detect_scenes(source, cfg, duration=None):
             cmd = [ffmpeg_exe(), "-hide_banner"]
             if accel:
                 cmd += ["-hwaccel", accel]
+            # Pin the first video stream. Default selection picks the
+            # LARGEST video stream rather than v:0, so a source carrying
+            # a second video track would have its scenes read off the
+            # wrong picture while probe, sampling, encode and VMAF all
+            # work on v:0. (ffmpeg already skips an attached cover image
+            # here; a genuine second track it does not.)
             cmd += [
-                "-i", str(source), "-an",
+                "-i", str(source), "-map", "0:v:0", "-an",
                 "-vf", f"scale=640:-2,scdet=t={cfg['scene_threshold']},"
                        f"metadata=mode=print:file={log_path}",
                 "-f", "null", "-",

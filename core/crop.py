@@ -63,10 +63,15 @@ def detect_crop_window(source, start, duration, limit, round_to, cache_dir):
             cmd = [ffmpeg_exe(), "-hide_banner", "-v", "error"]
             if accel:
                 cmd += ["-hwaccel", accel]
+            # Pin the first video stream, same as the scene scan: default
+            # selection takes the LARGEST video stream, and detecting
+            # bars on a second video track would write a sidecar whose
+            # crop belongs to a different picture than the one encoded.
             cmd += [
                 "-ss", f"{start:.3f}",
                 "-i", str(source),
                 "-t", f"{duration:.3f}",
+                "-map", "0:v:0",
                 "-an", "-sn",
                 "-vf",
                 f"cropdetect=limit={limit}:round={round_to}:reset_count=0,"
