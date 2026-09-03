@@ -33,6 +33,14 @@ BITRATE_BAND = 1.1
 # and the big margin would over-cap the search and force a wasted refine
 # re-encode. A small margin keeps the video centered in the band above the
 # floor while leaving room for ratio noise.
+#
+# This is a COLD-START cushion, not a belief about the ratio: evenly-spaced
+# files roll their measured ratios into their own cohort (see cohort_keys
+# in core/calibrate.py), and once that cohort exists it supersedes this
+# margin and shrinks toward the structural 1.0 instead. Leaving the cushion
+# in the shrink target held a real file's floor threshold 9% above the
+# truth, which capped its search a step early and bought a second full
+# encode.
 EVEN_SAMPLE_MARGIN = 1.05
 
 # Lower bound for the complexity-derived sample→full margin (see

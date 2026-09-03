@@ -735,14 +735,14 @@ def process_videos(cfg, engine):
                 # samples are the hardest scenes and read systematically
                 # LOW (SCENE_OFFSET_PRIOR, returned directly while the
                 # cohort is empty), evenly-spaced ones are representative
-                # (center 0). Even-sampled files never consume the scene
-                # cohort: its whole content is scene-selection bias that
-                # doesn't apply to them.
+                # (center 0). Each mode reads its OWN cohort: the scene
+                # cohort's whole content is scene-selection bias, which
+                # doesn't apply to an evenly-spaced sample.
                 sample_target = target
                 off, off_src = calibration_offset(
-                    cache.get("calibration"),
-                    None if even_sampling else global_cal,
+                    cache.get("calibration"), global_cal,
                     prior_center=0.0 if even_sampling else SCENE_OFFSET_PRIOR,
+                    even=even_sampling,
                 )
                 if off is not None and abs(off) >= 0.1:
                     sample_target = clamp(target + off, 0.0, 100.0)
@@ -761,9 +761,10 @@ def process_videos(cfg, engine):
                 # selected samples ARE complexity-biased, but how much is
                 # estimated per file from its own complexity spread instead
                 # of a fixed guess — bounded so it can only tighten the
-                # cold-start margin. The cohort ratio prior (below)
-                # supersedes this margin once a few files have been measured;
-                # the margin still seeds that prior's shrink target.
+                # cold-start margin. Either way the cohort ratio prior
+                # (below) supersedes this margin once a few files of the
+                # same sampling mode have been measured; for scene-selected
+                # samples the margin still seeds that prior's shrink target.
                 search_margin = cfg["bitrate_margin"]
                 if even_sampling:
                     search_margin = min(search_margin, EVEN_SAMPLE_MARGIN)
@@ -787,16 +788,16 @@ def process_videos(cfg, engine):
                 # still takes precedence inside effective_sample_floor; this
                 # only kicks in for files that haven't been encoded yet, so a
                 # fresh file aims at the learned floor instead of paying the
-                # conservative-margin tax. Skipped for evenly-spaced samples:
-                # they are representative (ratio ~1.0), so EVEN_SAMPLE_MARGIN
-                # is a better prior than the scene-biased cohort ratio — the
-                # per-file ratio still applies to them on reruns via
-                # effective_sample_floor.
-                rat_prior, rat_src = (None, None)
-                if not even_sampling:
-                    rat_prior, rat_src = ratio_prior(
-                        cache.get("calibration"), global_cal, search_margin
-                    )
+                # conservative-margin tax. Each sampling mode reads its own
+                # cohort: evenly-spaced files used to be denied a cohort
+                # entirely and stayed pinned to EVEN_SAMPLE_MARGIN's implied
+                # ratio however many of them had been measured — a fixed 5%
+                # cushion that on a real file sat 9% off the truth, capped
+                # the search a step early and cost a second full encode.
+                rat_prior, rat_src = ratio_prior(
+                    cache.get("calibration"), global_cal, search_margin,
+                    even=even_sampling,
+                )
                 if (min_kbps and rat_prior is not None and rat_src != "per-file"
                         and abs(rat_prior - 1.0 / search_margin) >= 0.01):
                     print(
@@ -1003,22 +1004,21 @@ def process_videos(cfg, engine):
                 # measurements taken this run are rolled in — values
                 # carried over from a previous run aren't double-counted.
                 # (Each engine has its own cohort file; different
-                # encoders must never share calibration.) Evenly-spaced
-                # samples are representative (offset ~0, ratio ~1.0):
-                # rolling them in would dilute the scene-selection bias
-                # the cohort exists to measure and mis-aim every scene-
-                # sampled file after them, so they keep their per-file
-                # calibration only. Decay is engine physics, not
-                # selection bias — it always rolls.
-                cohort_offset = None if even_sampling else fresh_offset
-                cohort_ratio = None if even_sampling else fresh_ratio
-                if (cohort_offset is not None or cohort_ratio is not None
+                # encoders must never share calibration.) The offset and
+                # ratio go into THIS file's sampling-mode cohort: mixing
+                # representative (evenly-spaced) measurements into the
+                # scene cohort would dilute the selection bias it exists
+                # to measure and mis-aim every scene-sampled file after
+                # them. Decay is engine physics, not selection bias —
+                # both modes share one average.
+                if (fresh_offset is not None or fresh_ratio is not None
                         or fresh_decay is not None):
                     update_global_calibration(
                         root_cache,
-                        vmaf_offset=cohort_offset,
-                        ratio=cohort_ratio,
+                        vmaf_offset=fresh_offset,
+                        ratio=fresh_ratio,
                         decay=fresh_decay,
+                        even=even_sampling,
                     )
                     global_cal = load_global_calibration(root_cache)
 

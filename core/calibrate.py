@@ -29,7 +29,38 @@ def load_global_calibration(cache_dir):
 COHORT_SHRINK_K = 2
 
 
-def calibration_offset(per_file_cal, global_cal, prior_center=0.0):
+# Cohort key names per sampling mode. Scene-selected and evenly-spaced
+# samples measure two different populations: the scene cohort's whole
+# content is complexity-selection bias, which by construction does not
+# exist in an evenly-spaced sample. Mixing them mis-aims both, so each
+# mode keeps its own rolling average under its own keys. The scene keys
+# keep their original names, so a cohort file written before the split
+# stays valid and keeps steering scene-sampled files; the evenly-spaced
+# keys are purely additive.
+#
+# Evenly-spaced files used to be excluded from the cohort outright —
+# never rolled in, never read back — which pinned them to the fixed
+# EVEN_SAMPLE_MARGIN guess forever. A real 34-minute file measured a
+# true sample→full ratio of 1.04 against that guess's implied 0.95: the
+# floor threshold came out 9% high, the search capped a quarter-step
+# early, and the refine loop spent a second full encode recovering the
+# headroom. Their own cohort is what retires that tax permanently.
+_SCENE_KEYS = {
+    "offset": ("vmaf_offset", "n_offset"),
+    "ratio": ("ratio", "n_ratio"),
+}
+_EVEN_KEYS = {
+    "offset": ("even_vmaf_offset", "n_even_offset"),
+    "ratio": ("even_ratio", "n_even_ratio"),
+}
+
+
+def cohort_keys(quantity, even):
+    """(value_key, count_key) in the cohort file for one quantity."""
+    return (_EVEN_KEYS if even else _SCENE_KEYS)[quantity]
+
+
+def calibration_offset(per_file_cal, global_cal, prior_center=0.0, even=False):
     """Pick the sample→full VMAF offset used to aim the sample search.
 
     Per-file calibration is a direct measurement of this exact file and is
@@ -45,6 +76,9 @@ def calibration_offset(per_file_cal, global_cal, prior_center=0.0):
     each; with no cohort at all the center itself is the best estimate
     and is returned directly.
 
+    `even` picks which cohort to read (see cohort_keys): the two sampling
+    modes measure different populations and never share an average.
+
     Returns (offset, source_label); (None, None) when neither source has
     a usable value and the center is 0. Values outside ±3.0 are treated
     as corrupt and skipped.
@@ -54,9 +88,10 @@ def calibration_offset(per_file_cal, global_cal, prior_center=0.0):
         if isinstance(o, (int, float)) and -3.0 <= o <= 3.0:
             return float(o), "per-file"
     if isinstance(global_cal, dict):
-        g_off = global_cal.get("vmaf_offset")
+        k_off, k_n = cohort_keys("offset", even)
+        g_off = global_cal.get(k_off)
         if isinstance(g_off, (int, float)) and -3.0 <= g_off <= 3.0:
-            n = global_cal.get("n_offset")
+            n = global_cal.get(k_n)
             if not isinstance(n, int) or n < 1:
                 n = 1
             w = n / (n + COHORT_SHRINK_K)
@@ -123,7 +158,7 @@ def decay_prior(per_file_cal, global_cal):
 RATIO_MIN, RATIO_MAX = 0.5, 1.3
 
 
-def ratio_prior(per_file_cal, global_cal, margin):
+def ratio_prior(per_file_cal, global_cal, margin, even=False):
     """Pick the sample→full bitrate ratio for the search's floor threshold.
 
     Mirrors decay_prior and calibration_offset: a per-file measured ratio
@@ -140,6 +175,15 @@ def ratio_prior(per_file_cal, global_cal, margin):
     that the refine loop then has to climb back down with a second full
     encode).
 
+    `even` picks which cohort to read (see cohort_keys) and, with it, the
+    shrink target. For scene-selected samples that target is the
+    margin-implied ratio — what effective_sample_floor would otherwise
+    assume. Evenly-spaced samples are representative by construction, so
+    their structural center is 1.0: EVEN_SAMPLE_MARGIN is a cold-start
+    cushion against ratio noise, not a belief about the ratio, and
+    shrinking toward it would hold every even-sampled file's threshold
+    ~5% above the truth no matter how much evidence accumulated.
+
     Returns (ratio, source_label); (None, None) when neither source has a
     usable value (the search then falls back to the raw margin).
     """
@@ -148,12 +192,16 @@ def ratio_prior(per_file_cal, global_cal, margin):
         if isinstance(r, (int, float)) and RATIO_MIN <= r <= RATIO_MAX:
             return float(r), "per-file"
     if isinstance(global_cal, dict):
-        g = global_cal.get("ratio")
+        k_rat, k_n = cohort_keys("ratio", even)
+        g = global_cal.get(k_rat)
         if isinstance(g, (int, float)) and RATIO_MIN <= g <= RATIO_MAX:
-            n = global_cal.get("n_ratio")
+            n = global_cal.get(k_n)
             if not isinstance(n, int) or n < 1:
                 n = 1
-            implied = 1.0 / margin if margin and margin > 0 else 1.0
+            if even:
+                implied = 1.0
+            else:
+                implied = 1.0 / margin if margin and margin > 0 else 1.0
             w = n / (n + COHORT_SHRINK_K)
             shrunk = g * w + implied * (1 - w)
             label = f"cohort n={n}"
@@ -164,7 +212,7 @@ def ratio_prior(per_file_cal, global_cal, margin):
 
 
 def update_global_calibration(cache_dir, vmaf_offset=None, ratio=None,
-                              decay=None):
+                              decay=None, even=False):
     """Roll new measurements into the cohort calibration cache.
 
     Per-file calibration only helps on re-runs of the same file. The
@@ -172,6 +220,12 @@ def update_global_calibration(cache_dir, vmaf_offset=None, ratio=None,
     encounter sample-vs-full mispredict is corrected up front, avoiding
     a wasted second full encode. n is capped so the average stays
     responsive to drift (e.g. encoder/preset changes).
+
+    `even` routes the offset and ratio into that sampling mode's own
+    keys (see cohort_keys). Decay is skipped by the split on purpose: it
+    measures how this ENGINE's quantizer maps to bitrate, which is the
+    same physics however the file was sampled, so both modes feed and
+    read one shared average.
     """
     N_CAP = 50
     g = load_global_calibration(cache_dir)
@@ -190,8 +244,8 @@ def update_global_calibration(cache_dir, vmaf_offset=None, ratio=None,
         g[key] = prev * (1 - weight) + float(val) * weight
         g[n_key] = n_new
 
-    roll("vmaf_offset", "n_offset", vmaf_offset)
-    roll("ratio", "n_ratio", ratio)
+    roll(*cohort_keys("offset", even), vmaf_offset)
+    roll(*cohort_keys("ratio", even), ratio)
     roll("decay", "n_decay", decay)
     g["t"] = time.time()
 
