@@ -50,6 +50,24 @@ SHORT_THRESHOLD = 48
 # reaches the candidate list; a false cut only splits one scene in two.
 SCENE_THRESHOLD = 3
 
+# Packet-stat complexity is measured per window of this many seconds:
+# fine enough to tell one scene from the next, coarse enough that a
+# window's mean packet size averages over a whole GOP's worth of frames
+# instead of reading one keyframe. The scene list and the sample picks
+# map onto these windows (analyze.window_of), so every consumer must
+# bucket time the same way.
+COMPLEXITY_WINDOW = 5.0
+
+# Wall-clock budget for one whole-file pass (the scdet decode, a packet
+# demux, essential's VFR pts scan): 1× the source's runtime, floored so
+# short files get a real allowance and ceiled so a genuinely hung
+# process can't block a batch forever. Decode at 640px runs many times
+# realtime and a demux at I/O speed, so the budget only trips on a
+# stall; a fixed short cap used to kill the scan on exactly the long
+# films that most need complexity-biased selection.
+SCAN_TIMEOUT_MIN = 300
+SCAN_TIMEOUT_MAX = 3600
+
 TARGET_VMAF_BY_RES = {0: 93.0, 720: 94.0, 2160: 90.0}
 
 FALLBACK_MAXRATE = {

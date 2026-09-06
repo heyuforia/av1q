@@ -8,10 +8,29 @@ import platform
 import subprocess
 
 from .tools import ffmpeg_exe, ffprobe_exe
-from .util import clamp, run_cmd
+from .util import run_cmd, scan_budget
 
 _hwaccel = None
 _hwaccel_checked = False
+
+# Profile tags whose streams must never go through a hardware decoder.
+# ffmpeg's hwaccel capability check asks the driver about codec, chroma
+# and bit depth but never the profile, so a stream using profile tools
+# the silicon lacks is CLAIMED supported and decodes to garbage at exit
+# code 0 — scores and scene cuts read off it are silently wrong. x264's
+# lossless mode tags High 4:4:4 Predictive even for 4:2:0 content and
+# its transform-bypass frames mis-decode on Blackwell; 4:2:2 and the
+# HEVC range extensions are the same trap.
+HW_UNSAFE_PROFILES = ("4:4:4", "4:2:2", "444", "422", "rext")
+
+
+def hw_decode_unsafe(profile):
+    """True when a stream's ffprobe profile string is on the hw-unsafe
+    list. Unknown or empty profiles are False: mainstream profiles are
+    the overwhelmingly common case, and a hardware decode that errors
+    out still falls back to the software attempt."""
+    prof = (profile or "").lower()
+    return any(t in prof for t in HW_UNSAFE_PROFILES)
 
 
 def detect_hwaccel():
@@ -85,9 +104,10 @@ def probe_video(filepath):
     """Extract video metadata via ffprobe: the one header read of a
     source, which every stage works from instead of re-probing.
 
-    Alongside the dimension, color, bitrate, and codec facts, it carries
-    the timing facts the essential engine's VFR verdict and CFR feed
-    need:
+    Alongside the dimension, color, bitrate, and codec facts (`profile`
+    is the stream's profile string, lowercased, for the hardware-decode
+    gate), it carries the timing facts the essential engine's VFR
+    verdict and CFR feed need:
       fps       avg_frame_rate as a rational string, or None
       rfps      r_frame_rate as a rational string, or None: the nominal
                 cadence, the finest the stream's timestamps fall on
@@ -102,7 +122,7 @@ def probe_video(filepath):
         ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
         "-show_entries",
         "stream=width,height,bit_rate,pix_fmt,color_primaries,"
-        "color_transfer,color_space,color_range,codec_name,"
+        "color_transfer,color_space,color_range,codec_name,profile,"
         "r_frame_rate,avg_frame_rate,nb_frames,duration"
         ":stream_tags:format=duration,bit_rate",
         "-of", "json", str(filepath),
@@ -125,6 +145,7 @@ def probe_video(filepath):
     cs = (s.get("color_space") or "").lower()
     cr = (s.get("color_range") or "").lower()
     codec = (s.get("codec_name") or "").lower()
+    profile = str(s.get("profile") or "").lower()
     pf = s.get("pix_fmt") or ""
     hdr = ct in {"smpte2084", "arib-std-b67"} or cp == "bt2020"
     duration = float(fmt.get("duration") or 0)
@@ -159,7 +180,7 @@ def probe_video(filepath):
         "pix_fmt": pf, "bitrate": bitrate,
         "duration": duration,
         "cp": cp, "ct": ct, "cs": cs, "cr": cr,
-        "codec": codec, "hdr": hdr,
+        "codec": codec, "profile": profile, "hdr": hdr,
         "fps": fps if parse_rate(fps) else None,
         "rfps": rfps if parse_rate(rfps) else None,
         "mean_fps": mean_fps,
@@ -274,9 +295,7 @@ VFR_IRREGULAR_MAX = 0.01
 def _frame_intervals(filepath, duration):
     """Presentation-order frame intervals of v:0 in seconds, from every
     packet's pts (demux only, no decode); None when the timeline can't be
-    read. The budget scales with runtime like the scene scan's: a demux
-    pass runs many times faster than realtime, so it only trips on a
-    stalled read."""
+    read."""
     try:
         r = subprocess.run(
             [ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
@@ -284,8 +303,7 @@ def _frame_intervals(filepath, duration):
              "-of", "default=nw=1:nk=1", str(filepath)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace",
-            timeout=(int(clamp(duration, 300, 3600))
-                     if duration and duration > 0 else 300),
+            timeout=scan_budget(duration),
         )
     except (subprocess.TimeoutExpired, OSError):
         return None

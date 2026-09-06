@@ -6,7 +6,7 @@ import math
 import os
 import time
 
-from .analyze import get_keyframes
+from .analyze import get_keyframes, window_of
 from .constants import (
     MINI_SAMPLE_COUNT, MINI_SAMPLE_DURATION, MINI_SAMPLE_MIN_RATIO,
     SAMPLE_COUNT_MAX, SAMPLE_SCALE_K, SAMPLE_SCALE_REF,
@@ -79,12 +79,12 @@ def select_samples(scenes, complexity, duration, count, keyframes, cfg):
             for i in range(count)
         ]
 
-    comp_map = {int(c["time"] / 5) * 5: c["complexity"] for c in complexity}
+    comp_map = {window_of(c["time"]): c["complexity"] for c in complexity}
     scored = [
         {
             "time": sc["time"],
             "duration": sc["duration"],
-            "complexity": comp_map.get(int(sc["time"] / 5) * 5, 50),
+            "complexity": comp_map.get(window_of(sc["time"]), 50),
         }
         for sc in scenes
         if sc["duration"] >= cfg["min_scene_duration"]
@@ -129,20 +129,20 @@ def complexity_bias(complexity, sample_scenes):
     single cause. Returns None when the complexity data is missing or
     degenerate, and callers fall back to their fixed cold-start guess.
 
-    complexity is analyze_complexity's per-5s-window list; sample_scenes is
+    complexity is analyze_complexity's per-window list; sample_scenes is
     select_samples' output (only `time`/`duration`), so the selected scenes
     are mapped back to their windows the same way select_samples does.
     """
     if not complexity or not sample_scenes:
         return None
-    comp_map = {int(c["time"] / 5) * 5: c["complexity"] for c in complexity}
+    comp_map = {window_of(c["time"]): c["complexity"] for c in complexity}
     all_vals = [
         c["complexity"] for c in complexity
         if isinstance(c.get("complexity"), (int, float)) and c["complexity"] > 0
     ]
     sel_vals = []
     for s in sample_scenes:
-        v = comp_map.get(int(s["time"] / 5) * 5)
+        v = comp_map.get(window_of(s["time"]))
         if isinstance(v, (int, float)) and v > 0:
             sel_vals.append(v)
     if not all_vals or not sel_vals:

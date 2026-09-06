@@ -127,7 +127,7 @@ python av1q.py
 
 The search is adaptive, similar to Newton's method: it converges on the right CQ in 2 to 4 iterations instead of testing every value.
 
-1. **Analyze.** Scene detection finds visually distinct segments, and packet-size analysis ranks them by complexity. Both read the container without decoding, so this stays fast on long 4K sources.
+1. **Analyze.** Scene detection finds visually distinct segments, and packet-size analysis ranks them by complexity. The scene scan decodes at a reduced resolution, and the ranking reads the container without decoding, so this stays fast on long 4K sources. The analysis is stored once per source and reused by every later run.
 2. **Sample.** The most complex scenes are cut out and concatenated into one short clip. The number of scenes sampled grows with duration, so a feature-length film is represented as well as a short one. Files roughly 15 to 60 seconds long get a smaller plan of 3 clips at 2 seconds each. Files at 15 seconds and under skip sampling and search on the full file, where a probe would cover most of the file anyway.
 3. **Search.** The sample is encoded at a seed CQ derived from the source's bitrate headroom over the floor, VMAF is measured, and the next CQ is estimated from the slope of quality against CQ. The search also tracks the bitrate floor and estimates a ceiling from the measured data, so it never jumps past it. When the floor is the binding constraint rather than VMAF, the search switches to bitrate targeting: it measures the exact bitrate decay rate for the content and interpolates to the CQ that lands on the floor.
 4. **Encode.** The full video is encoded at the best CQ found.

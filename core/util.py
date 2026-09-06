@@ -11,6 +11,8 @@ import time
 import traceback
 from pathlib import Path
 
+from .constants import SCAN_TIMEOUT_MAX, SCAN_TIMEOUT_MIN
+
 _temp_files = set()
 
 
@@ -126,11 +128,28 @@ def make_temp_log(cache_dir, prefix, ext):
 
 def escape_filter_path(path):
     """Escape a Path for use as a log-file option inside an ffmpeg filter
-    graph (scdet/cropdetect metadata). Filter-graph colons collide with
-    Windows drive-letter colons, so they're double-escaped to survive both
-    the filtergraph and option parsing stages.
+    graph (scdet/cropdetect metadata).
+
+    A filter graph is parsed twice, and each pass has its own special
+    characters: the option value's separator ':' (which collides with a
+    Windows drive letter) plus the quote and escape characters, then the
+    graph's own '[],;' plus the same two. Each level is escaped in turn
+    with a backslash, so a drive colon becomes '\\\\:' and an apostrophe
+    or comma in a folder name survives instead of ending the option.
     """
-    return path.as_posix().replace(":", "\\\\:")
+    s = path.as_posix()
+    for special in ("\\':", "\\'[],;"):
+        s = "".join(f"\\{c}" if c in special else c for c in s)
+    return s
+
+
+def scan_budget(duration):
+    """Timeout in seconds for one whole-file pass over a source of this
+    runtime (see SCAN_TIMEOUT_* in constants); the floor when the
+    duration is unknown."""
+    if duration and duration > 0:
+        return int(clamp(duration, SCAN_TIMEOUT_MIN, SCAN_TIMEOUT_MAX))
+    return SCAN_TIMEOUT_MIN
 
 
 def _short_path_win(s):

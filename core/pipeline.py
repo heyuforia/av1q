@@ -8,8 +8,9 @@ cleanup. Everything engine-specific goes through the Engine interface,
 including the printed output's quantizer labels and grid formatting.
 
 Two cache scopes, deliberately distinct:
-  cfg["cache_dir"]        shared between pipelines — sample extraction,
-                          crop temp logs (the formats are identical).
+  cfg["cache_dir"]        shared between pipelines — scene analysis,
+                          sample extraction, crop temp logs (source
+                          facts; the formats are identical).
   engine.cache_root(cfg)  per-pipeline — result caches, calibration,
                           sample encodes, FFMS2 indexes. Different
                           encoders must never share these.
@@ -264,16 +265,13 @@ def process_videos(cfg, engine):
                 # User chose a fresh seeded search over the previous
                 # result: drop every search product (entries,
                 # calibration, recommended) so nothing resumes or skips
-                # below. Scene analysis is a fact about the source, not
-                # the search, and the forced block belongs to forced
-                # mode — both survive, so the redo costs no re-scan.
-                keep = {
-                    k: cache[k]
-                    for k in ("scenes", "complexity", "keyframes",
-                              "scene_cfg", "forced")
-                    if k in cache
-                }
-                cache = {"sig": engine.sig, "entries": {}, **keep}
+                # below. The forced block belongs to forced mode and
+                # survives; scene analysis lives in the shared store
+                # and is untouched.
+                forced = cache.get("forced")
+                cache = {"sig": engine.sig, "entries": {}}
+                if forced is not None:
+                    cache["forced"] = forced
                 atomic_write_json(cp, cache)
 
             # Output names carry the crop token so cropped and uncropped
@@ -436,7 +434,6 @@ def process_videos(cfg, engine):
                 try:
                     data = detect_crop_for_file(
                         filepath, meta, crop_scan_cfg(cfg), file_hash,
-                        cache, cp,
                     )
                 except Exception as e:
                     print(f"{label('crop err')}{e}")
@@ -593,10 +590,11 @@ def process_videos(cfg, engine):
                     )
                 if meta["codec"] in INTRA_ONLY_CODECS:
                     print(f"{label('skip')}Intra-only codec ({meta['codec']}), using even samples")
-                # Cached per file, and shared with the inline crop scan
-                # (which may already have paid for it this run).
+                # Stored per source in the shared cache root, so the
+                # inline crop scan, av1q-crop, and the other pipeline
+                # all read the one scan.
                 scenes, complexity, keyframes = scene_analysis(
-                    filepath, meta, cfg, cache, cp
+                    filepath, meta, cfg, file_hash
                 )
 
                 # The plan already decided sampling applies, so disarm

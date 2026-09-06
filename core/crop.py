@@ -329,13 +329,13 @@ def aggregate_crops(windows, frame_w, frame_h, min_keep_ratio, agree_ratio):
     }
 
 
-def _scan_windows(source, meta, cfg, cache, cache_path):
+def _scan_windows(source, meta, cfg, file_hash):
     """Where to look: the most complex scenes of the middle 90% of the
     runtime (bright, detailed picture is where bar edges read cleanly),
-    from the same scene analysis the sample stage uses — passed the
-    per-file cache, the scan is paid once per file however many stages
-    ask. Short sources, and any without usable scenes, get evenly
-    spaced windows instead."""
+    from the same stored scene analysis the sample stage uses, so the
+    scan is paid once per source however many stages ask. Short
+    sources, and any without usable scenes, get evenly spaced windows
+    instead."""
     duration = meta["duration"]
     safe_start = duration * SAFE_MARGIN
     safe_end = duration * (1 - SAFE_MARGIN)
@@ -343,7 +343,7 @@ def _scan_windows(source, meta, cfg, cache, cache_path):
     samples = None
     if duration >= cfg["short_threshold"]:
         scenes, complexity, keyframes = scene_analysis(
-            source, meta, cfg, cache, cache_path
+            source, meta, cfg, file_hash
         )
         scoped = [s for s in scenes if safe_start <= s["time"] <= safe_end]
         if scoped:
@@ -372,16 +372,10 @@ def _scan_windows(source, meta, cfg, cache, cache_path):
     ]
 
 
-def detect_crop_for_file(source, meta, cfg, file_hash, cache=None,
-                         cache_path=None):
+def detect_crop_for_file(source, meta, cfg, file_hash):
     """Detect crop for one video. Returns the sidecar dict; does NOT
     write it. Prints per-window progress and a confidence-marked
     summary in the pipeline's label column.
-
-    `cache`/`cache_path` are the per-file result cache when the caller
-    has one (the inline --auto-crop scan), so the scene analysis the
-    window choice needs is shared with the sample stage instead of
-    scanned twice; av1q-crop passes neither and scans.
     """
     is_hdr = bool(meta["hdr"])
     src_type = "HDR" if is_hdr else "SDR"
@@ -409,7 +403,7 @@ def detect_crop_for_file(source, meta, cfg, file_hash, cache=None,
             "reason": "source carries a rotation or flip; not scanned",
         }
     else:
-        samples = _scan_windows(source, meta, cfg, cache, cache_path)
+        samples = _scan_windows(source, meta, cfg, file_hash)
         print(
             f"{label('crop scan')}{BOLD}{len(samples)}{RESET} windows · "
             f"{cfg['window_duration']:g}s each · "
