@@ -14,7 +14,7 @@ import time
 
 from .. import ssimu2
 from ..crop import crop_token
-from ..probe import get_rfps, is_vfr, probe_hdr_metadata
+from ..probe import is_vfr, probe_hdr_metadata
 from ..sampling import clean_sample_source
 from ..segments import mux_with_source_streams
 from ..tools import ffmpeg_exe, find_encoder, find_ffvship_optional
@@ -506,13 +506,12 @@ class EssentialEngine(Engine):
 
     def prepare_meta(self, source, meta, cfg):
         # HDR10 static metadata rides the encoder flags (Y4M carries
-        # none); fetched once per file, used by every encode of it.
+        # none); fetched once per file, used by every encode of it. The
+        # CFR feed's nominal cadence (meta["rfps"]) already arrives with
+        # probe_video's metadata.
         meta["mastering"] = meta["cll"] = None
         if meta["hdr"]:
             meta["mastering"], meta["cll"] = probe_hdr_metadata(source)
-        # Nominal frame cadence for the full-encode feed's CFR
-        # normalization (see encode_essential). Fetched once per file.
-        meta["rfps"] = get_rfps(source)
         return bool(meta["mastering"] or meta["cll"])
 
     def prep_sample(self, concat, meta, cfg):

@@ -77,3 +77,12 @@ def fmt_s2(s2):
     if not s2:
         return ""
     return f"  {DIM}SSIMU2 {s2['mean']:.2f}  P5 {s2['p5']:.2f}{RESET}"
+
+
+LABEL_W = 10  # width of the stage-label column on every per-file line
+
+
+def label(tag):
+    """Orange, left-aligned stage label (' analyze   ') that opens a
+    per-file progress line; the column width keeps the values aligned."""
+    return f" {ORANGE}{tag:<{LABEL_W}}{RESET}"

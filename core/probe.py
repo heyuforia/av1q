@@ -1,12 +1,14 @@
-"""Source inspection: ffprobe metadata, frame rate, the cached
+"""Source inspection: ffprobe metadata (one call per source, timing facts
+included), the VFR verdict, HDR10 static metadata, the cached
 hardware-decode probe, and resolution tiering."""
 
 import json
+import math
 import platform
 import subprocess
 
 from .tools import ffmpeg_exe, ffprobe_exe
-from .util import run_cmd
+from .util import clamp, run_cmd
 
 _hwaccel = None
 _hwaccel_checked = False
@@ -42,19 +44,73 @@ def detect_hwaccel():
     return _hwaccel
 
 
+def parse_rate(v):
+    """Frame rate as a float from ffprobe's rational or decimal spelling
+    ('24000/1001', '25'); None for missing, 'N/A', '0/0', or anything
+    not a positive finite number."""
+    if not v:
+        return None
+    try:
+        s = str(v)
+        if "/" in s:
+            a, b = s.split("/", 1)
+            b = float(b)
+            f = float(a) / b if b else 0.0
+        else:
+            f = float(s)
+    except (ValueError, TypeError):
+        return None
+    return f if f > 0 and math.isfinite(f) else None
+
+
+def _tag(tags, name):
+    """A Matroska statistics tag by name. ffmpeg suffixes tag keys with
+    their language ('NUMBER_OF_FRAMES-eng'), so match the stem."""
+    for k, v in (tags or {}).items():
+        if str(k).upper().split("-", 1)[0] == name:
+            return v
+    return None
+
+
+def _parse_tag_duration(v):
+    """mkvmerge's DURATION tag ('01:52:33.093000000') in seconds."""
+    try:
+        h, m, s = str(v).split(":")
+        return int(h) * 3600 + int(m) * 60 + float(s)
+    except (ValueError, AttributeError):
+        return None
+
+
 def probe_video(filepath):
-    """Extract video metadata via ffprobe."""
+    """Extract video metadata via ffprobe: the one header read of a
+    source, which every stage works from instead of re-probing.
+
+    Alongside the dimension, color, bitrate, and codec facts, it carries
+    the timing facts the essential engine's VFR verdict and CFR feed
+    need:
+      fps       avg_frame_rate as a rational string, or None
+      rfps      r_frame_rate as a rational string, or None: the nominal
+                cadence, the finest the stream's timestamps fall on
+      mean_fps  the exact whole-file mean frame rate when the container
+                states its frame count (MP4/MOV sample tables; the
+                NUMBER_OF_FRAMES statistics tag mkvmerge writes), else
+                None. Not avg_frame_rate: ffmpeg derives that from the
+                frame count only for MP4/MOV and takes the nominal
+                DefaultDuration for Matroska (see is_vfr).
+    """
     r = run_cmd([
         ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
         "-show_entries",
         "stream=width,height,bit_rate,pix_fmt,color_primaries,"
-        "color_transfer,color_space,color_range,codec_name",
-        "-show_entries", "format=duration,bit_rate",
+        "color_transfer,color_space,color_range,codec_name,"
+        "r_frame_rate,avg_frame_rate,nb_frames,duration"
+        ":stream_tags:format=duration,bit_rate",
         "-of", "json", str(filepath),
     ])
     data = json.loads(r.stdout or "{}")
     s = (data.get("streams") or [{}])[0]
     fmt = data.get("format") or {}
+    tags = s.get("tags") if isinstance(s.get("tags"), dict) else {}
 
     bitrate = None
     for v in (fmt.get("bit_rate"), s.get("bit_rate")):
@@ -71,66 +127,61 @@ def probe_video(filepath):
     codec = (s.get("codec_name") or "").lower()
     pf = s.get("pix_fmt") or ""
     hdr = ct in {"smpte2084", "arib-std-b67"} or cp == "bt2020"
+    duration = float(fmt.get("duration") or 0)
+
+    fps = s.get("avg_frame_rate")
+    rfps = s.get("r_frame_rate")
+
+    frames = None
+    for v in (s.get("nb_frames"), _tag(tags, "NUMBER_OF_FRAMES")):
+        try:
+            frames = int(v)
+            break
+        except (ValueError, TypeError):
+            pass
+    # The stream's own duration pairs with its frame count. The format
+    # duration is the fallback; it can run a little long on a trailing
+    # audio track, which only costs a short file the cheap verdict.
+    vid_duration = None
+    for v in (s.get("duration"),
+              _parse_tag_duration(_tag(tags, "DURATION")), duration):
+        try:
+            if v is not None and float(v) > 0:
+                vid_duration = float(v)
+                break
+        except (ValueError, TypeError):
+            pass
+    mean_fps = frames / vid_duration if frames and vid_duration else None
 
     return {
         "w": int(s.get("width") or 0),
         "h": int(s.get("height") or 0),
         "pix_fmt": pf, "bitrate": bitrate,
-        "duration": float(fmt.get("duration") or 0),
+        "duration": duration,
         "cp": cp, "ct": ct, "cs": cs, "cr": cr,
         "codec": codec, "hdr": hdr,
+        "fps": fps if parse_rate(fps) else None,
+        "rfps": rfps if parse_rate(rfps) else None,
+        "mean_fps": mean_fps,
     }
 
 
 def get_fps(filepath):
-    """Get frame rate as a rational string to avoid VMAF frame misalignment."""
+    """avg_frame_rate of v:0 as a rational string, or None.
+
+    For encodes (the VMAF pair's distorted side): a source's rates ride
+    in probe_video's meta, so no stage re-probes a source for them.
+    """
     try:
         r = run_cmd([
             ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
             "-show_entries", "stream=avg_frame_rate",
             "-of", "default=nw=1:nk=1", str(filepath),
         ])
-        v = r.stdout.strip()
-        if not v or v in ("0/0", "N/A"):
-            return None
-        if "/" in v:
-            a, b = v.split("/", 1)
-            if float(b) == 0 or float(a) / float(b) <= 0:
-                return None
-        elif float(v) <= 0:
-            return None
-        return v
-    except (RuntimeError, ValueError):
+    except RuntimeError:
         return None
-
-
-def get_rfps(filepath):
-    """Nominal frame cadence (r_frame_rate) as a rational string, or None.
-
-    Distinct from get_fps, which reports avg_frame_rate: on an irregular
-    source (e.g. a stream-copy concatenation with per-join timing gaps)
-    the average drifts off the true cadence, while r_frame_rate stays the
-    intended rate. The CFR feed normalizes to this nominal rate so the
-    encode and the VMAF reference resample onto the same grid.
-    """
-    try:
-        r = run_cmd([
-            ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=r_frame_rate",
-            "-of", "default=nw=1:nk=1", str(filepath),
-        ])
-        v = r.stdout.strip()
-        if not v or v in ("0/0", "N/A"):
-            return None
-        if "/" in v:
-            a, b = v.split("/", 1)
-            if float(b) == 0 or float(a) / float(b) <= 0:
-                return None
-        elif float(v) <= 0:
-            return None
-        return v
-    except (RuntimeError, ValueError):
-        return None
+    v = r.stdout.strip()
+    return v if parse_rate(v) else None
 
 
 def res_tier(w, h):
@@ -206,52 +257,103 @@ def probe_hdr_metadata(filepath):
     return mastering, cll
 
 
-def is_vfr(filepath, meta):
-    """True when the source is genuinely variable-frame-rate.
+# A frame interval this far off the median is irregular. Container
+# timestamp rounding jitters a CFR stream's intervals by one tick — 2.4%
+# for 23.976fps in Matroska's 1ms ticks, 12% at 120fps — while a dropped
+# or held frame at least doubles the interval; 25% separates the two
+# with room on both sides.
+VFR_INTERVAL_TOLERANCE = 0.25
 
-    Y4M is CFR-only, so piping a VFR source would silently desync audio
-    AND misalign FFVship's frame pairing (it decodes source and encode
-    independently). Header r_frame_rate vs avg_frame_rate mismatch alone
-    is full of false positives, so a mismatch is confirmed by counting
-    real packets against duration x avg_fps before rejecting a file.
-    """
+# Up to this fraction of irregular frames — or, on the header fast path,
+# of frames missing against the nominal cadence — is a CFR source with
+# glitches, not a variable one: the CFR feed's dup/drop then touches at
+# most one frame in a hundred.
+VFR_IRREGULAR_MAX = 0.01
+
+
+def _frame_intervals(filepath, duration):
+    """Presentation-order frame intervals of v:0 in seconds, from every
+    packet's pts (demux only, no decode); None when the timeline can't be
+    read. The budget scales with runtime like the scene scan's: a demux
+    pass runs many times faster than realtime, so it only trips on a
+    stalled read."""
     try:
-        r = run_cmd([
-            ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=r_frame_rate,avg_frame_rate",
-            "-of", "json", str(filepath),
-        ])
-        s = (json.loads(r.stdout or "{}").get("streams") or [{}])[0]
-
-        def _fps(v):
-            if not v or v in ("0/0", "N/A"):
-                return None
-            if "/" in v:
-                a, b = v.split("/", 1)
-                return float(a) / float(b) if float(b) else None
-            return float(v)
-
-        rf, af = _fps(s.get("r_frame_rate")), _fps(s.get("avg_frame_rate"))
-        if not rf or not af or abs(rf - af) / af <= 0.01:
-            return False
-
-        duration = meta.get("duration") or 0
-        if duration <= 1:
-            return False
-        c = subprocess.run(
+        r = subprocess.run(
             [ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
-             "-count_packets", "-show_entries", "stream=nb_read_packets",
+             "-show_entries", "packet=pts_time",
              "-of", "default=nw=1:nk=1", str(filepath)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace", timeout=600,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=(int(clamp(duration, 300, 3600))
+                     if duration and duration > 0 else 300),
         )
-        if c.returncode != 0:
-            return True  # suspicious header and uncountable: don't risk it
-        n = int(c.stdout.strip() or 0)
-        expected = duration * af
-        return expected > 0 and abs(n - expected) / expected > 0.005
-    except Exception:
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    pts = []
+    for tok in (r.stdout or "").split():
+        try:
+            pts.append(float(tok))
+        except ValueError:
+            continue  # N/A: a packet without a timestamp
+    pts.sort()
+    return [b - a for a, b in zip(pts, pts[1:])]
+
+
+def is_vfr(filepath, meta):
+    """True when the source's frame timing is genuinely variable.
+
+    The Y4M pipe's CFR feed resamples every source onto its nominal
+    cadence (fps=r_frame_rate): irregular frame intervals become dups
+    and drops and the frame count changes, where av1q's ffmpeg path
+    passes VFR timing through untouched. So the essential engine refuses
+    such files and points at av1q.
+
+    The container headers alone cannot say. ffmpeg derives
+    avg_frame_rate from the exact frame count for MP4/MOV, but for
+    Matroska it takes the nominal DefaultDuration and sets r_frame_rate
+    to the same value: header agreement proves nothing there, and on
+    MP4 the header mismatch IS the signal (a packet count compared
+    against avg_frame_rate would only re-derive the header). Two stages:
+
+      1. When the container states its frame count (meta["mean_fps"]),
+         the exact mean cadence against the nominal r_frame_rate settles
+         it without touching the packets: intervals never fall below the
+         nominal one, so a mean within VFR_IRREGULAR_MAX of it leaves no
+         room for irregular intervals. Interlaced streams report a
+         field-rate r_frame_rate and fall through to the scan, which
+         clears them.
+      2. Otherwise (no count: Matroska without mkvmerge statistics tags,
+         MPEG-TS; or a mismatch to explain) every packet's pts is read
+         and the intervals judged directly: more than VFR_IRREGULAR_MAX
+         of them off the median means variable timing.
+
+    An unreadable timeline refuses the file only when the headers
+    already disagreed; with nothing suspicious, a broken probe must not
+    gate the file.
+    """
+    rf = parse_rate(meta.get("rfps"))
+    mean = meta.get("mean_fps")
+    header_mismatch = None
+    if rf and mean:
+        header_mismatch = abs(mean - rf) / rf > VFR_IRREGULAR_MAX
+        if not header_mismatch:
+            return False
+
+    intervals = _frame_intervals(filepath, meta.get("duration"))
+    if intervals is None:
+        return bool(header_mismatch)
+    if len(intervals) < 2:
         return False
+    median = sorted(intervals)[len(intervals) // 2]
+    if median <= 0:
+        return False
+    irregular = sum(
+        1 for d in intervals
+        if abs(d - median) > VFR_INTERVAL_TOLERANCE * median
+    )
+    return irregular / len(intervals) > VFR_IRREGULAR_MAX
 
 
 def frame_geometry(filepath):

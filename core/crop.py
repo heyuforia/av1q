@@ -5,12 +5,63 @@ import json
 import subprocess
 import time
 
-from .analyze import analyze_complexity, detect_scenes, get_keyframes
-from .probe import detect_hwaccel
+from .analyze import scene_analysis
+from .constants import MIN_SCENE_DURATION
+from .probe import frame_geometry
 from .sampling import select_samples
 from .tools import ffmpeg_exe
-from .ui import BOLD, CHECK, CROSS, DIM, GREEN, ORANGE, RESET
+from .ui import BOLD, CHECK, CROSS, DIM, GREEN, ORANGE, RESET, label
 from .util import _temp_files, escape_filter_path, make_temp_log
+
+# Scan policy: one home for av1q-crop's CLI defaults and the inline
+# --auto-crop scan, so the two can never drift apart.
+SCAN_WINDOWS = 8       # windows spread across the runtime
+WINDOW_DURATION = 2.0  # seconds of cropdetect per window
+# cropdetect's darkness threshold, as a code value at the depth each was
+# tuned for: SDR 8-bit, HDR 10-bit. Both reach the filter as a fraction
+# of full scale, so the DECODED depth sets the real threshold and a
+# 10-bit SDR rip is judged at the same darkness as an 8-bit one (24 at
+# 8 bits is 96 at 10) instead of at 24/1023. HDR sits higher because
+# PQ spends a wide run of low code values on its darkest stops: shadow
+# detail beside a bar edge reads as black at the SDR threshold.
+LIMIT_SDR = 24
+LIMIT_HDR = 128
+ROUND = 2              # output-dimension divisibility; 16 is codec-friendly
+# Confidence gates. A crop keeping less of the frame than the keep ratio
+# is a misdetection whatever the windows agree on (the floor only catches
+# the catastrophic kind); agreement is the share of valid windows that
+# place each cropped edge within EDGE_TOL pixels of the union's.
+MIN_KEEP_RATIO = 0.10
+AGREE_RATIO = 0.75
+EDGE_TOL = 4
+# Fewer valid windows than this share of the scan means it mostly hit
+# black and says nothing about where the bars are.
+MIN_VALID_SHARE = 0.7
+# Windows stay inside the middle of the runtime: studio logos and end
+# credits put text boxes where the picture should be.
+SAFE_MARGIN = 0.05
+# One window's ceiling. A seek plus two seconds of decode is well under
+# this even on 4K in software; hitting it means a stalled decode.
+WINDOW_TIMEOUT = 120
+
+
+def crop_scan_cfg(cfg, **overrides):
+    """The crop scan's settings: the policy defaults above plus what the
+    scan borrows from the launcher cfg (the temp-log dir and the scene
+    and short-file thresholds). av1q-crop overrides from its CLI."""
+    return {
+        "cache_dir": cfg["cache_dir"],
+        "scene_threshold": cfg["scene_threshold"],
+        "short_threshold": cfg["short_threshold"],
+        "sample_count": SCAN_WINDOWS,
+        "window_duration": WINDOW_DURATION,
+        "limit_sdr": LIMIT_SDR,
+        "limit_hdr": LIMIT_HDR,
+        "round": ROUND,
+        "min_keep_ratio": MIN_KEEP_RATIO,
+        "agree_ratio": AGREE_RATIO,
+        **overrides,
+    }
 
 
 def crop_token(crop):
@@ -22,74 +73,112 @@ def crop_token(crop):
     return f"_c{crop.replace(':', 'x')}" if crop else ""
 
 
-def load_crop_sidecar(filepath, file_hash):
-    """Read <file>.crop.json from av1q-crop. Returns 'W:H:X:Y' or None.
+def sidecar_crop(data, file_hash):
+    """The crop a sidecar dict puts on the file, as (crop, note).
 
-    Only confidence='high' sidecars are auto-applied; 'low' is for manual
-    review. Hash mismatch means the file was replaced after detection.
+    crop is 'W:H:X:Y' from a high-confidence sidecar that still matches
+    the file, else None. note is None when there is nothing to say (a
+    'none' verdict found the full frame) and otherwise why a present
+    sidecar is not applied — worth a line, because a file the user
+    scanned is about to be encoded uncropped. Hash mismatch means the
+    file was replaced after detection; a missing hash (hand-written
+    sidecar) is trusted.
     """
-    sidecar = filepath.with_suffix(filepath.suffix + ".crop.json")
-    if not sidecar.exists():
-        return None
-    try:
-        data = json.loads(sidecar.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
-    if data.get("confidence") != "high":
-        return None
+    conf = data.get("confidence")
+    if conf == "none":
+        return None, None
+    if conf != "high":
+        why = data.get("reason")
+        return None, (
+            f"sidecar confidence {conf}, not applied"
+            + (f" ({why})" if isinstance(why, str) and why else "")
+        )
     if data.get("source_hash") and data["source_hash"] != file_hash:
-        return None
+        return None, "sidecar predates a change to the file, ignored"
     try:
         w, h, x, y = data["width"], data["height"], data["x"], data["y"]
     except KeyError:
-        return None
+        return None, "sidecar malformed, ignored"
     if not all(isinstance(v, int) and v >= 0 for v in (w, h, x, y)):
-        return None
+        return None, "sidecar malformed, ignored"
     if w <= 0 or h <= 0:
-        return None
-    return f"{w}:{h}:{x}:{y}"
+        return None, "sidecar malformed, ignored"
+    fw, fh = data.get("frame_width"), data.get("frame_height")
+    if (isinstance(fw, int) and isinstance(fh, int)
+            and (x + w > fw or y + h > fh)):
+        return None, "sidecar crop exceeds its own frame, ignored"
+    return f"{w}:{h}:{x}:{y}", None
+
+
+def read_crop_sidecar(filepath, file_hash):
+    """<file>.crop.json's verdict on this file, as (crop, note) per
+    sidecar_crop; (None, None) when there is no sidecar."""
+    sidecar = filepath.with_suffix(filepath.suffix + ".crop.json")
+    if not sidecar.exists():
+        return None, None
+    try:
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None, "sidecar unreadable, ignored"
+    if not isinstance(data, dict):
+        return None, "sidecar malformed, ignored"
+    return sidecar_crop(data, file_hash)
+
+
+def load_crop_sidecar(filepath, file_hash):
+    """'W:H:X:Y' from a high-confidence sidecar that still matches the
+    file, else None (see sidecar_crop for the rules)."""
+    return read_crop_sidecar(filepath, file_hash)[0]
 
 
 def detect_crop_window(source, start, duration, limit, round_to, cache_dir):
-    """Run cropdetect on a single time window. Returns (w, h, x, y) or None."""
+    """cropdetect over one window: the bounding box of everything
+    brighter than `limit` (a fraction of full scale) across all of its
+    frames, as (w, h, x, y); None when the window is unreadable or
+    entirely black.
+
+    Software decode only. A hardware decoder that misreads a profile
+    hands back garbage frames at exit code 0 (the trap core.vmaf guards
+    against), and a crop read off garbage would be applied at high
+    confidence to every frame of the encode. A few seconds of CPU
+    decode per window is the whole price of never finding out that way.
+    """
     log = make_temp_log(cache_dir, "crop", "txt")
     log_path = escape_filter_path(log)
 
     try:
-        hw = detect_hwaccel()
-        attempts = [hw, None] if hw else [None]
-
-        for accel in attempts:
-            cmd = [ffmpeg_exe(), "-hide_banner", "-v", "error"]
-            if accel:
-                cmd += ["-hwaccel", accel]
-            # Pin the first video stream, same as the scene scan: default
-            # selection takes the LARGEST video stream, and detecting
-            # bars on a second video track would write a sidecar whose
-            # crop belongs to a different picture than the one encoded.
-            cmd += [
-                "-ss", f"{start:.3f}",
-                "-i", str(source),
-                "-t", f"{duration:.3f}",
-                "-map", "0:v:0",
-                "-an", "-sn",
-                "-vf",
-                f"cropdetect=limit={limit}:round={round_to}:reset_count=0,"
-                f"metadata=mode=print:file={log_path}",
-                "-f", "null", "-",
-            ]
+        # Pin the first video stream, same as the scene scan: default
+        # selection takes the LARGEST video stream, and detecting bars
+        # on a second video track would write a sidecar whose crop
+        # belongs to a different picture than the one encoded.
+        cmd = [
+            ffmpeg_exe(), "-hide_banner", "-v", "error",
+            "-ss", f"{start:.3f}",
+            "-i", str(source),
+            "-t", f"{duration:.3f}",
+            "-map", "0:v:0",
+            "-an", "-sn",
+            "-vf",
+            f"cropdetect=limit={limit:.6f}:round={round_to}:reset_count=0,"
+            f"metadata=mode=print:file={log_path}",
+            "-f", "null", "-",
+        ]
+        try:
             r = subprocess.run(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace", timeout=120,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=WINDOW_TIMEOUT,
             )
-            if r.returncode == 0:
-                break
-        else:
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"cropdetect stalled for {WINDOW_TIMEOUT}s at {start:.0f}s"
+            )
+        if r.returncode != 0 or not log.exists():
             return None
 
-        if not log.exists():
-            return None
-
+        # cropdetect prints its running box on every frame and never
+        # resets it here, so the last frame's values are the union over
+        # the whole window.
         w = h = x = y = None
         for line in log.read_text(encoding="utf-8", errors="ignore").splitlines():
             line = line.strip()
@@ -143,8 +232,6 @@ def aggregate_crops(windows, frame_w, frame_h, min_keep_ratio, agree_ratio):
     content disagrees on the cropped axis itself and still fails the
     agreement threshold.
     """
-    EDGE_TOL = 4  # px tolerance per edge
-
     valid = [c for c in windows if c is not None]
     n_total = len(windows)
     n_valid = len(valid)
@@ -155,7 +242,7 @@ def aggregate_crops(windows, frame_w, frame_h, min_keep_ratio, agree_ratio):
             "reason": "no windows returned crop values (source too dark or unreadable)",
         }
 
-    if n_valid < n_total * 0.7:
+    if n_valid < n_total * MIN_VALID_SHARE:
         return {
             "crop": None, "confidence": "low",
             "reason": (
@@ -164,10 +251,26 @@ def aggregate_crops(windows, frame_w, frame_h, min_keep_ratio, agree_ratio):
             ),
         }
 
+    # A box past the frame edge means the decoded picture is not the
+    # size the probe reported (a rotated source seen upright, for one),
+    # and every coordinate below would be measured against the wrong
+    # frame. Clamping it into the frame used to turn exactly that into
+    # a plausible-looking crop at high confidence.
+    for w, h, x, y in valid:
+        if x + w > frame_w or y + h > frame_h:
+            return {
+                "crop": None, "confidence": "low",
+                "reason": (
+                    f"a window's crop {w}:{h}:{x}:{y} exceeds the "
+                    f"{frame_w}x{frame_h} frame (decoded picture differs "
+                    f"from the probed size)"
+                ),
+            }
+
     x_min = min(c[2] for c in valid)
     y_min = min(c[3] for c in valid)
-    x_max = min(frame_w, max(c[2] + c[0] for c in valid))
-    y_max = min(frame_h, max(c[3] + c[1] for c in valid))
+    x_max = max(c[2] + c[0] for c in valid)
+    y_max = max(c[3] + c[1] for c in valid)
     w = x_max - x_min
     h = y_max - y_min
     x = x_min
@@ -192,12 +295,6 @@ def aggregate_crops(windows, frame_w, frame_h, min_keep_ratio, agree_ratio):
     if x_max < frame_w:
         m = sum(1 for c in valid if abs(c[2] + c[0] - x_max) <= EDGE_TOL)
         edges.append(("right", m))
-
-    if not edges:
-        return {
-            "crop": None, "confidence": "none",
-            "reason": "full frame — no letterbox/pillarbox detected",
-        }
 
     worst_name, worst_match = min(edges, key=lambda e: e[1])
     agreement = worst_match / n_valid
@@ -232,87 +329,109 @@ def aggregate_crops(windows, frame_w, frame_h, min_keep_ratio, agree_ratio):
     }
 
 
-def detect_crop_for_file(source, meta, cfg, file_hash, label_prefix=" "):
-    """Detect crop for one video. Returns sidecar dict; does NOT write it.
-
-    Prints per-window progress and a confidence-marked summary using
-    label_prefix for indentation (single space matches av1q's main loop,
-    two spaces matches av1q-crop's batch output).
-    """
-    LBL = 10
-
-    def lbl(tag):
-        return f"{label_prefix}{ORANGE}{tag:<{LBL}}{RESET}"
-
-    is_hdr = meta["hdr"] or "10le" in meta["pix_fmt"]
-    limit = cfg["limit_hdr"] if is_hdr else cfg["limit_sdr"]
-
-    sample_cfg = {
-        "scene_threshold": cfg["scene_threshold"],
-        "cache_dir": cfg["cache_dir"],
-        "short_threshold": cfg["short_threshold"],
-        "sample_duration": cfg["window_duration"],
-        "min_scene_duration": 2.0,
-    }
-
-    safe_start = meta["duration"] * 0.05
-    safe_end = meta["duration"] * 0.95
-
-    scenes = []
-    complexity = []
-    keyframes = []
-    if meta["duration"] >= cfg["short_threshold"]:
-        scenes = detect_scenes(source, sample_cfg, meta["duration"])
-        complexity = analyze_complexity(source)
-        keyframes = get_keyframes(source)
+def _scan_windows(source, meta, cfg, cache, cache_path):
+    """Where to look: the most complex scenes of the middle 90% of the
+    runtime (bright, detailed picture is where bar edges read cleanly),
+    from the same scene analysis the sample stage uses — passed the
+    per-file cache, the scan is paid once per file however many stages
+    ask. Short sources, and any without usable scenes, get evenly
+    spaced windows instead."""
+    duration = meta["duration"]
+    safe_start = duration * SAFE_MARGIN
+    safe_end = duration * (1 - SAFE_MARGIN)
 
     samples = None
-    if scenes:
+    if duration >= cfg["short_threshold"]:
+        scenes, complexity, keyframes = scene_analysis(
+            source, meta, cfg, cache, cache_path
+        )
         scoped = [s for s in scenes if safe_start <= s["time"] <= safe_end]
         if scoped:
             samples = select_samples(
-                scoped, complexity, meta["duration"],
-                cfg["sample_count"], keyframes, sample_cfg,
+                scoped, complexity, duration, cfg["sample_count"], keyframes,
+                {
+                    "short_threshold": cfg["short_threshold"],
+                    "sample_duration": cfg["window_duration"],
+                    "min_scene_duration": MIN_SCENE_DURATION,
+                },
             )
+    if samples:
+        return samples
 
-    if not samples:
-        n = cfg["sample_count"]
-        span = max(0.0, safe_end - safe_start)
-        if span <= 0:
-            n = 1
-            span = max(meta["duration"], 1.0)
-            safe_start = 0.0
-        samples = [
-            {"time": safe_start + span * (i + 0.5) / n,
-             "duration": cfg["window_duration"]}
-            for i in range(n)
-        ]
+    n = cfg["sample_count"]
+    span = max(0.0, safe_end - safe_start)
+    if span <= 0:
+        # Unknown duration: one window, just past the start.
+        n = 1
+        span = 1.0
+        safe_start = 0.0
+    return [
+        {"time": safe_start + span * (i + 0.5) / n,
+         "duration": cfg["window_duration"]}
+        for i in range(n)
+    ]
 
+
+def detect_crop_for_file(source, meta, cfg, file_hash, cache=None,
+                         cache_path=None):
+    """Detect crop for one video. Returns the sidecar dict; does NOT
+    write it. Prints per-window progress and a confidence-marked
+    summary in the pipeline's label column.
+
+    `cache`/`cache_path` are the per-file result cache when the caller
+    has one (the inline --auto-crop scan), so the scene analysis the
+    window choice needs is shared with the sample stage instead of
+    scanned twice; av1q-crop passes neither and scans.
+    """
+    is_hdr = bool(meta["hdr"])
     src_type = "HDR" if is_hdr else "SDR"
-    print(
-        f"{lbl('crop scan')}{BOLD}{len(samples)}{RESET} windows · "
-        f"{cfg['window_duration']:.0f}s each · "
-        f"{DIM}limit={limit} {src_type}{RESET}"
+    limit_code, scale = (
+        (cfg["limit_hdr"], 1023) if is_hdr else (cfg["limit_sdr"], 255)
     )
+    # A fraction of full scale, so cropdetect scales it to the decoded
+    # bit depth (see LIMIT_SDR). The half step keeps the filter's float
+    # truncation from landing one code value under the configured one at
+    # the depth it was tuned for.
+    limit = (limit_code + 0.5) / scale
 
-    crops = []
-    for i, s in enumerate(samples):
-        c = detect_crop_window(
-            source, s["time"], cfg["window_duration"],
-            limit, cfg["round"], cfg["cache_dir"],
-        )
-        crops.append(c)
-        marker = CHECK if c else CROSS
-        cstr = f"{c[0]}:{c[1]}:{c[2]}:{c[3]}" if c else "—"
+    # ffmpeg auto-rotates on decode, so the picture cropdetect measures
+    # is upright while the probe reports the stored (unrotated) size and
+    # a stream-copied sample keeps whatever orientation its muxer carries.
+    # No single crop geometry is right for all of those, so a source with
+    # a display matrix is not scanned: an upright portrait measured
+    # against landscape dimensions used to come out as a confident
+    # square crop.
+    geo = frame_geometry(source)
+    if geo and geo["transformed"]:
+        samples, crops = [], []
+        result = {
+            "crop": None, "confidence": "low",
+            "reason": "source carries a rotation or flip; not scanned",
+        }
+    else:
+        samples = _scan_windows(source, meta, cfg, cache, cache_path)
         print(
-            f"{lbl('window')}{i + 1}/{len(samples)} @ "
-            f"{s['time']:.0f}s {marker} {DIM}{cstr}{RESET}"
+            f"{label('crop scan')}{BOLD}{len(samples)}{RESET} windows · "
+            f"{cfg['window_duration']:g}s each · "
+            f"{DIM}limit={limit_code} {src_type}{RESET}"
         )
-
-    result = aggregate_crops(
-        crops, meta["w"], meta["h"],
-        cfg["min_keep_ratio"], cfg["agree_ratio"],
-    )
+        crops = []
+        for i, s in enumerate(samples):
+            c = detect_crop_window(
+                source, s["time"], cfg["window_duration"],
+                limit, cfg["round"], cfg["cache_dir"],
+            )
+            crops.append(c)
+            marker = CHECK if c else CROSS
+            cstr = f"{c[0]}:{c[1]}:{c[2]}:{c[3]}" if c else "—"
+            print(
+                f"{label('window')}{i + 1}/{len(samples)} @ "
+                f"{s['time']:.0f}s {marker} {DIM}{cstr}{RESET}"
+            )
+        result = aggregate_crops(
+            crops, meta["w"], meta["h"],
+            cfg["min_keep_ratio"], cfg["agree_ratio"],
+        )
 
     sidecar_data = {
         "version": 1,
@@ -321,7 +440,7 @@ def detect_crop_for_file(source, meta, cfg, file_hash, label_prefix=" "):
         "frame_width": meta["w"],
         "frame_height": meta["h"],
         "hdr": is_hdr,
-        "limit": limit,
+        "limit": limit_code,
         "round": cfg["round"],
         "confidence": result["confidence"],
         "reason": result["reason"],
@@ -346,7 +465,7 @@ def detect_crop_for_file(source, meta, cfg, file_hash, label_prefix=" "):
     else:
         out = "(none)"
     print(
-        f"{lbl('crop')}{color}{BOLD}{conf}{RESET}  "
+        f"{label('crop')}{color}{BOLD}{conf}{RESET}  "
         f"{BOLD}{out}{RESET}  {DIM}({result['reason']}){RESET}"
     )
 

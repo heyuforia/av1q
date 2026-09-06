@@ -23,9 +23,9 @@ import time
 from . import search as core_search
 from . import segments as core_segments
 from . import vmaf as core_vmaf
-from .analyze import analyze_complexity, detect_scenes, get_keyframes
+from .analyze import scene_analysis
 from .bitrate import calc_kbps, video_kbps
-from .cache import load_cache
+from .cache import load_cache, recommended_matches
 from .calibrate import (
     DECAY_MAX, DECAY_MIN, RATIO_MAX, RATIO_MIN, calibration_offset,
     decay_prior, ratio_prior, load_global_calibration,
@@ -37,16 +37,19 @@ from .constants import (
     MINI_SAMPLE_COUNT, MINI_SAMPLE_DURATION, MINI_SAMPLE_MIN_RATIO,
     TARGET_VMAF_BY_RES, VIDEO_EXTENSIONS, VMAF_OVERSHOOT,
 )
-from .crop import crop_token, detect_crop_for_file, load_crop_sidecar
-from .probe import get_fps, probe_video, res_tier
+from .crop import (
+    crop_scan_cfg, crop_token, detect_crop_for_file, load_crop_sidecar,
+    read_crop_sidecar, sidecar_crop,
+)
+from .probe import parse_rate, probe_video, res_tier
 from .sampling import (
     complexity_bias, complexity_bias_margin, extract_samples, sampling_plan,
     select_samples,
 )
 from .tools import have_ffmpeg, local_ffmpeg_dir, missing_ffmpeg_components
 from .ui import (
-    BOLD, CHECK, CROSS, DIM, GREEN, MIDDOT, ORANGE, PURPLE, RED, RESET, SEP,
-    fmt_s2, fmt_size, fmt_time, vmaf_pass_color,
+    BOLD, CHECK, CROSS, DIM, GREEN, LABEL_W, MIDDOT, ORANGE, PURPLE, RED,
+    RESET, SEP, fmt_s2, fmt_size, fmt_time, label, vmaf_pass_color,
 )
 from .util import atomic_write_json, clamp, cleanup_temp, partial_hash
 
@@ -112,10 +115,6 @@ def process_videos(cfg, engine):
     # --force-crf); deliberately NOT clamped to the search bounds —
     # they bound the search, and there is no search.
     force_q = cfg.get("force_q")
-
-    LBL = 10  # label column width for aligned output
-    def lbl(tag):
-        return f" {ORANGE}{tag:<{LBL}}{RESET}"
 
     print(f"{PURPLE}{BOLD}{engine.banner}{RESET}{engine.banner_extra}\n{SEP}")
 
@@ -208,18 +207,10 @@ def process_videos(cfg, engine):
             except OSError:
                 continue
             c, _ = load_cache(root_cache, fh, engine.sig)
-            rec = c.get("recommended")
-            if (isinstance(rec, dict)
-                    and all(
-                        rec.get(k) == cfg[k]
-                        for k in (*engine.rec_bound_keys, "preset",
-                                  "film_grain", *engine.rec_extra_keys)
-                    )
-                    and rec.get("crop") == (
-                        load_crop_sidecar(f, fh) if cfg["use_crops"] else None
-                    )
-                    and (cfg["target_vmaf"] is None
-                         or rec.get("target") == cfg["target_vmaf"])):
+            if recommended_matches(
+                    c.get("recommended"), engine, cfg,
+                    load_crop_sidecar(f, fh) if cfg["use_crops"] else None,
+                    cfg["target_vmaf"]):
                 prior.append((f, fh))
         if prior:
             print(
@@ -358,21 +349,11 @@ def process_videos(cfg, engine):
                     # post-refine `recommended` update) a verified VMAF
                     # inside the acceptance band.
                     rec = cache.get("recommended")
-                    rec_ok = (
-                        isinstance(rec, dict)
-                        and all(
-                            rec.get(k) == cfg[k]
-                            for k in (*engine.rec_bound_keys, "preset",
-                                      "film_grain", *engine.rec_extra_keys)
-                        )
-                        and rec.get("crop") == expected_crop
-                        # Auto targets vary by resolution and the file
-                        # hasn't been probed yet, so a target check is
-                        # only possible against an explicit --vmaf.
-                        and (cfg["target_vmaf"] is None
-                             or rec.get("target") == cfg["target_vmaf"])
-                    )
-                    if rec_ok:
+                    # Auto targets vary by resolution and the file hasn't
+                    # been probed yet, so only an explicit --vmaf can be
+                    # checked here.
+                    if recommended_matches(rec, engine, cfg, expected_crop,
+                                           cfg["target_vmaf"]):
                         rec_target = rec.get("target")
                         for c in all_qs:
                             d = dst_path(c)
@@ -405,7 +386,7 @@ def process_videos(cfg, engine):
             print(f"{PURPLE}{BOLD}[{idx}/{total}]{RESET} {PURPLE}{filepath.name}{RESET}")
             if file_hash in seeded_redo:
                 print(
-                    f"{lbl('redo')}{DIM}previous results cleared, searching"
+                    f"{label('redo')}{DIM}previous results cleared, searching"
                     f" from seed {engine.qname}"
                     f" {grid.fmt(grid.quantize(user_seed))}{RESET}"
                 )
@@ -424,6 +405,13 @@ def process_videos(cfg, engine):
             sep = f" {MIDDOT} "
             print(f"      {DIM}{sep.join(info_parts)}{RESET}")
 
+            # An audio-only container (a podcast .mp4, a music .webm)
+            # probes with no picture at all; every stage below maps
+            # 0:v:0 and would fail one by one.
+            if not meta["w"] or not meta["h"]:
+                print(f" {CROSS} No video stream, skipping")
+                continue
+
             if meta["codec"] == "av1":
                 print(f" {CHECK} Already AV1, skipping")
                 continue
@@ -435,59 +423,51 @@ def process_videos(cfg, engine):
                 print(f" {CROSS} {gate_reason}")
                 continue
 
-            just_detected = False
-            if cfg["auto_crop"]:
-                sidecar = filepath.with_suffix(filepath.suffix + ".crop.json")
-                if not sidecar.exists():
-                    crop_cfg = {
-                        "cache_dir": cache_dir,
-                        "sample_count": 8,
-                        "window_duration": 2.0,
-                        "limit_sdr": 24,
-                        "limit_hdr": 128,
-                        "round": 2,
-                        "min_keep_ratio": 0.10,
-                        "agree_ratio": 0.75,
-                        "scene_threshold": cfg["scene_threshold"],
-                        "short_threshold": cfg["short_threshold"],
-                    }
-                    try:
-                        data = detect_crop_for_file(
-                            filepath, meta, crop_cfg, file_hash
-                        )
-                        atomic_write_json(sidecar, data, indent=2)
-                        just_detected = True
-                    except Exception as e:
-                        print(f"{lbl('crop err')}{e}")
-
+            # Crop resolution. A fresh --auto-crop scan applies its own
+            # result directly (its verdict line was just printed) and
+            # writes the sidecar for next time; a sidecar write that
+            # fails costs only that re-scan. A sidecar read back from
+            # disk says so, and one that is present but not applied
+            # says why — a scanned file about to be encoded uncropped
+            # is worth a line.
             meta["crop"] = None
-            if cfg["use_crops"]:
-                crop = load_crop_sidecar(filepath, file_hash)
-                if crop:
-                    meta["crop"] = crop
-                    # detect_crop_for_file already printed the summary line
-                    if not just_detected:
-                        print(f"{lbl('crop')}{BOLD}{crop}{RESET}")
+            sidecar = filepath.with_suffix(filepath.suffix + ".crop.json")
+            if cfg["auto_crop"] and not sidecar.exists():
+                try:
+                    data = detect_crop_for_file(
+                        filepath, meta, crop_scan_cfg(cfg), file_hash,
+                        cache, cp,
+                    )
+                except Exception as e:
+                    print(f"{label('crop err')}{e}")
+                else:
+                    try:
+                        atomic_write_json(sidecar, data, indent=2)
+                    except OSError as e:
+                        print(
+                            f"{label('crop')}{DIM}sidecar not written"
+                            f" ({e}); the next run scans again{RESET}"
+                        )
+                    if cfg["use_crops"]:
+                        meta["crop"] = sidecar_crop(data, file_hash)[0]
+            elif cfg["use_crops"]:
+                meta["crop"], note = read_crop_sidecar(filepath, file_hash)
+                if meta["crop"]:
+                    print(f"{label('crop')}{BOLD}{meta['crop']}{RESET}")
+                elif note:
+                    print(f"{label('crop')}{DIM}{note}{RESET}")
             dst_path = make_dst_path(meta["crop"])
 
             # Engine-specific metadata enrichment (e.g. HDR10 static
             # metadata restated as encoder flags on the Y4M-pipe path).
             if engine.prepare_meta(filepath, meta, cfg):
-                print(f"{lbl('hdr')}{DIM}static metadata carried over{RESET}")
+                print(f"{label('hdr')}{DIM}static metadata carried over{RESET}")
 
             expected_frames = 0
             if engine.needs_expected_frames:
-                fps_str = get_fps(filepath)
-                if fps_str and meta["duration"] > 0:
-                    try:
-                        if "/" in fps_str:
-                            a, b = fps_str.split("/", 1)
-                            fps_f = float(a) / float(b)
-                        else:
-                            fps_f = float(fps_str)
-                        expected_frames = int(meta["duration"] * fps_f)
-                    except (ValueError, ZeroDivisionError):
-                        pass
+                fps_f = parse_rate(meta.get("fps"))
+                if fps_f and meta["duration"] > 0:
+                    expected_frames = int(meta["duration"] * fps_f)
 
             # Forced mode: one full encode at the user's quantizer and
             # done. Probe/crop/gate/meta prep above still apply (they are
@@ -503,7 +483,7 @@ def process_videos(cfg, engine):
             # compression bet.
             if force_q is not None:
                 print(
-                    f"{lbl('forced')}{engine.qname}"
+                    f"{label('forced')}{engine.qname}"
                     f" {BOLD}{grid.fmt(force_q)}{RESET}"
                     f" {DIM}(skipping search){RESET}"
                 )
@@ -583,13 +563,7 @@ def process_videos(cfg, engine):
             # interruption stays cheap.
             existing_q = None
             rec = cache.get("recommended")
-            if (rec and rec.get("target") == target
-                    and all(
-                        rec.get(k) == cfg[k]
-                        for k in (*engine.rec_bound_keys, "preset",
-                                  "film_grain", *engine.rec_extra_keys)
-                    )
-                    and rec.get("crop") == meta["crop"]):
+            if recommended_matches(rec, engine, cfg, meta["crop"], target):
                 existing_q = grid.quantize(rec[engine.rec_q_key])
                 seed_note = ""
                 if user_seed is not None:
@@ -601,7 +575,7 @@ def process_videos(cfg, engine):
                         f" search already done){RESET}"
                     )
                 print(
-                    f"{lbl('resume')}{engine.qname} {BOLD}{grid.fmt(existing_q)}{RESET}"
+                    f"{label('resume')}{engine.qname} {BOLD}{grid.fmt(existing_q)}{RESET}"
                     f" from previous search{seed_note}"
                 )
 
@@ -614,30 +588,16 @@ def process_videos(cfg, engine):
                 n_samples, s_dur, plan_mode = plan
                 if plan_mode == "mini":
                     print(
-                        f"{lbl('short')}{meta['duration']:.0f}s source →"
+                        f"{label('short')}{meta['duration']:.0f}s source →"
                         f" mini-samples ({n_samples}×{s_dur:.0f}s)"
                     )
                 if meta["codec"] in INTRA_ONLY_CODECS:
-                    print(f"{lbl('skip')}Intra-only codec ({meta['codec']}), using even samples")
-                    scenes = []
-                    complexity = []
-                    keyframes = []
-                else:
-                    scene_cfg = {"scene_threshold": cfg["scene_threshold"]}
-                    if (all(k in cache for k in ("scenes", "complexity", "keyframes"))
-                            and cache.get("scene_cfg") == scene_cfg):
-                        print(f"{lbl('cache')}Using cached scene data")
-                        scenes = cache["scenes"]
-                        complexity = cache["complexity"]
-                        keyframes = cache["keyframes"]
-                    else:
-                        print(f"{lbl('analyze')}Detecting scenes...")
-                        scenes = detect_scenes(filepath, cfg, meta["duration"])
-                        complexity = analyze_complexity(filepath)
-                        keyframes = get_keyframes(filepath)
-                        cache.update(scenes=scenes, complexity=complexity,
-                                     keyframes=keyframes, scene_cfg=scene_cfg)
-                        atomic_write_json(cp, cache)
+                    print(f"{label('skip')}Intra-only codec ({meta['codec']}), using even samples")
+                # Cached per file, and shared with the inline crop scan
+                # (which may already have paid for it this run).
+                scenes, complexity, keyframes = scene_analysis(
+                    filepath, meta, cfg, cache, cp
+                )
 
                 # The plan already decided sampling applies, so disarm
                 # select_samples' own short-file bail-out and use the
@@ -669,7 +629,7 @@ def process_videos(cfg, engine):
                 if (not even_sampling and sample_scenes
                         and len(sample_scenes) < min_scene_samples):
                     print(
-                        f"{lbl('fallback')}scenes fill only"
+                        f"{label('fallback')}scenes fill only"
                         f" {len(sample_scenes)} of {n_samples} samples,"
                         f" switching to evenly-spaced"
                     )
@@ -683,8 +643,8 @@ def process_videos(cfg, engine):
                         f"samples from {BOLD}{len(scenes)}{RESET} scenes"
                         if not even_sampling else "evenly-spaced samples"
                     )
-                    print(f"{lbl('scenes')}{BOLD}{len(sample_scenes)}{RESET} {info}")
-                    print(f"{lbl('extract')}Extracting samples...")
+                    print(f"{label('scenes')}{BOLD}{len(sample_scenes)}{RESET} {info}")
+                    print(f"{label('extract')}Extracting samples...")
                     sample_concat = extract_samples(
                         filepath, sample_scenes, keyframes, cfg,
                         file_hash=file_hash,
@@ -697,12 +657,12 @@ def process_videos(cfg, engine):
                         if sample_concat else None
                     )
                     if not sample_src:
-                        print(f"{lbl('fallback')}Extraction failed, using full encode")
+                        print(f"{label('fallback')}Extraction failed, using full encode")
                         sample_scenes = None
                 else:
-                    print(f"{lbl('scenes')}Using full VMAF")
+                    print(f"{label('scenes')}Using full VMAF")
             elif existing_q is None:
-                print(f"{lbl('short')}≤{mini_min:.0f}s, full VMAF")
+                print(f"{label('short')}≤{mini_min:.0f}s, full VMAF")
 
             t_enc = t_vmaf = 0.0
             sample_enc_dir = root_cache / "_sample_enc"
@@ -751,7 +711,7 @@ def process_videos(cfg, engine):
                 f" {DIM}{MIDDOT}{RESET} floor {BOLD}{min_kbps}kbps{RESET}"
                 if min_kbps else ""
             )
-            print(f"{lbl('target')}VMAF {BOLD}{target:.1f}{RESET}{floor_str}")
+            print(f"{label('target')}VMAF {BOLD}{target:.1f}{RESET}{floor_str}")
 
             # Engine-cohort bitrate-decay prior for the search's floor
             # model: how fast THIS encoder's bitrate falls per quantizer
@@ -766,7 +726,7 @@ def process_videos(cfg, engine):
                     and abs(dec_prior - engine_decay)
                     >= 0.15 * engine_decay):
                 print(
-                    f"{lbl('calibr')}bitrate decay {BOLD}{dec_prior:.3f}{RESET}"
+                    f"{label('calibr')}bitrate decay {BOLD}{dec_prior:.3f}{RESET}"
                     f"/{engine.qname} {DIM}({dec_src}){RESET}"
                 )
 
@@ -802,7 +762,7 @@ def process_videos(cfg, engine):
                 if off is not None and abs(off) >= 0.1:
                     sample_target = clamp(target + off, 0.0, 100.0)
                     print(
-                        f"{lbl('calibr')}sample target"
+                        f"{label('calibr')}sample target"
                         f" {BOLD}{sample_target:.2f}{RESET}"
                         f" {DIM}(offset {off:+.2f} {off_src}){RESET}"
                     )
@@ -833,7 +793,7 @@ def process_videos(cfg, engine):
                     search_cfg = {**cfg, "bitrate_margin": search_margin}
                     if min_kbps and not even_sampling:
                         print(
-                            f"{lbl('calibr')}sample margin"
+                            f"{label('calibr')}sample margin"
                             f" {BOLD}{search_margin:.2f}{RESET}"
                             f" {DIM}(complexity spread){RESET}"
                         )
@@ -856,7 +816,7 @@ def process_videos(cfg, engine):
                 if (min_kbps and rat_prior is not None and rat_src != "per-file"
                         and abs(rat_prior - 1.0 / search_margin) >= 0.01):
                     print(
-                        f"{lbl('calibr')}bitrate ratio {BOLD}{rat_prior:.2f}{RESET}"
+                        f"{label('calibr')}bitrate ratio {BOLD}{rat_prior:.2f}{RESET}"
                         f" {DIM}({rat_src}){RESET}"
                     )
 
@@ -960,11 +920,11 @@ def process_videos(cfg, engine):
                     t_enc += time.time() - t0
                 else:
                     print(
-                        f"{lbl('reuse')}{engine.qname}"
+                        f"{label('reuse')}{engine.qname}"
                         f" {BOLD}{grid.fmt(best_q)}{RESET} encode exists"
                     )
 
-                print(f"{lbl('verify')}Full VMAF...")
+                print(f"{label('verify')}Full VMAF...")
                 t0 = time.time()
                 best_vmaf = measure(filepath, dst_path(best_q), best_q)
                 s2_seen[best_q] = engine.ssimu2_info(
@@ -978,7 +938,7 @@ def process_videos(cfg, engine):
                 )
                 vc = vmaf_pass_color(best_vmaf["mean"], target, cfg["vmaf_tolerance"])
                 print(
-                    f"{'':>{LBL + 1}}VMAF {BOLD}{vc}{best_vmaf['mean']:.2f}{RESET}"
+                    f"{'':>{LABEL_W + 1}}VMAF {BOLD}{vc}{best_vmaf['mean']:.2f}{RESET}"
                     f"  {DIM}P5 {best_vmaf['p5']:.2f}{RESET}"
                     f"{fmt_s2(s2_seen[best_q])}"
                     f"{size_kbps_suffix(dst_path(best_q), actual_kbps_now)}"
@@ -1019,7 +979,7 @@ def process_videos(cfg, engine):
                     cal_updated = True
                     fresh_ratio = ratio
                     print(
-                        f"{lbl('calibr')}sample {sample_kbps_at_best}kbps ->"
+                        f"{label('calibr')}sample {sample_kbps_at_best}kbps ->"
                         f" video {actual_kbps_now}kbps (ratio {ratio:.2f})"
                     )
 
@@ -1141,7 +1101,7 @@ def process_videos(cfg, engine):
                         # selection keeps this point.
                         if not deficits:
                             print(
-                                f"{lbl('refine')}{cur_kbps}kbps is within"
+                                f"{label('refine')}{cur_kbps}kbps is within"
                                 f" {ENDGAME_SNAP_GAIN:.0%} of the"
                                 f" {min_kbps}kbps floor — accepting"
                             )
@@ -1171,7 +1131,7 @@ def process_videos(cfg, engine):
                     if best_q <= min_q:
                         short_names = ", ".join(n for n, _ in deficits)
                         print(
-                            f"{lbl('refine')}at min {engine.qname}"
+                            f"{label('refine')}at min {engine.qname}"
                             f" {BOLD}{grid.fmt(min_q)}{RESET},"
                             f" accepting ({short_names} short)"
                         )
@@ -1227,7 +1187,7 @@ def process_videos(cfg, engine):
                     if ((try_q - best_q) * decay_b
                             < -math.log1p(-ENDGAME_SNAP_GAIN)):
                         print(
-                            f"{lbl('refine')}{engine.qname}"
+                            f"{label('refine')}{engine.qname}"
                             f" {grid.fmt(try_q)} would trim under"
                             f" {ENDGAME_SNAP_GAIN:.0%} bitrate — keeping"
                             f" {engine.qname} {BOLD}{grid.fmt(best_q)}{RESET}"
@@ -1239,7 +1199,7 @@ def process_videos(cfg, engine):
                     break
 
                 print(
-                    f"{lbl('refine')}{desc} -> {engine.qname}"
+                    f"{label('refine')}{desc} -> {engine.qname}"
                     f" {BOLD}{grid.fmt(try_q)}{RESET}"
                     f" {DIM}(jump {grid.fmt_delta(try_q - best_q)}){RESET}"
                 )
@@ -1268,7 +1228,7 @@ def process_videos(cfg, engine):
                 )
                 vc_a = vmaf_pass_color(adj["mean"], target, cfg["vmaf_tolerance"])
                 print(
-                    f"{'':>{LBL + 1}}VMAF {BOLD}{vc_a}{adj['mean']:.2f}{RESET}"
+                    f"{'':>{LABEL_W + 1}}VMAF {BOLD}{vc_a}{adj['mean']:.2f}{RESET}"
                     f"  {DIM}P5 {adj['p5']:.2f}{RESET}"
                     f"{fmt_s2(s2_seen.get(try_q))}"
                     f"{size_kbps_suffix(dst_path(try_q), adj_kbps)}"

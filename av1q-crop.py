@@ -8,8 +8,9 @@ run av1q.py --auto-crop instead — it does the same detection inline
 before each encode.
 
 Conservative by design: only marks high-confidence crops for auto-apply.
-Ambiguous results (dark sources, mixed aspect ratios) are written with
-confidence="low" for manual review — never silently applied.
+Ambiguous results (dark sources, mixed aspect ratios, rotated sources)
+are written with confidence="low" for manual review — never silently
+applied.
 """
 
 import argparse
@@ -21,9 +22,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.dont_write_bytecode = True  # don't litter the script dir with __pycache__
 from av1q import (
     VIDEO_EXTENSIONS, SCENE_THRESHOLD, SHORT_THRESHOLD,
-    PURPLE, RESET, BOLD, DIM, CHECK, CROSS, SEP,
+    SCAN_WINDOWS, WINDOW_DURATION, LIMIT_SDR, LIMIT_HDR, ROUND,
+    MIN_KEEP_RATIO, AGREE_RATIO,
+    PURPLE, RESET, BOLD, DIM, CHECK, CROSS, SEP, label,
     atomic_write_json,
     cleanup_temp,
+    crop_scan_cfg,
     partial_hash,
     probe_video,
     detect_crop_for_file,
@@ -34,26 +38,30 @@ from av1q import (
 def process_file(source, cfg):
     sidecar = source.with_suffix(source.suffix + ".crop.json")
     if sidecar.exists() and not cfg["force"]:
-        print(f"  {DIM}sidecar exists — skipping (use --force to rewrite){RESET}")
+        print(f"{label('skip')}{DIM}sidecar exists (--force rewrites it){RESET}")
         return
 
     try:
         meta = probe_video(source)
     except Exception as e:
-        print(f"  {CROSS} probe failed: {e}")
+        print(f" {CROSS} probe failed: {e}")
         return
 
-    if meta["w"] <= 0 or meta["h"] <= 0 or meta["duration"] <= 0:
-        print(f"  {CROSS} invalid source dimensions or duration")
+    # The same sources the encoders pass over: an audio-only container
+    # has no picture to scan, and an AV1 source is never encoded, so a
+    # sidecar for it would only ever be read by hand.
+    if not meta["w"] or not meta["h"]:
+        print(f" {CROSS} No video stream, skipping")
+        return
+    if meta["codec"] == "av1":
+        print(f" {CHECK} Already AV1, skipping")
         return
 
     file_hash = partial_hash(source)
-    sidecar_data = detect_crop_for_file(
-        source, meta, cfg, file_hash, label_prefix="  ",
-    )
+    sidecar_data = detect_crop_for_file(source, meta, cfg, file_hash)
 
     if cfg["dry_run"]:
-        print(f"  {DIM}(dry-run, sidecar not written){RESET}")
+        print(f"{label('dry-run')}{DIM}sidecar not written{RESET}")
         return
 
     atomic_write_json(sidecar, sidecar_data, indent=2)
@@ -74,37 +82,45 @@ def main():
     p.add_argument("--force", action="store_true",
                    help="rewrite existing sidecars")
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--sample-count", type=int, default=8)
-    p.add_argument("--window-duration", type=float, default=2.0,
-                   help="seconds of cropdetect per window (default: 2.0)")
-    p.add_argument("--limit-sdr", type=int, default=24,
-                   help="cropdetect darkness threshold for SDR (0-255)")
-    p.add_argument("--limit-hdr", type=int, default=128,
-                   help="cropdetect darkness threshold for HDR (0-255)")
-    p.add_argument("--round", type=int, default=2,
-                   help="output dim divisibility (2=accurate, 16=codec-friendly)")
-    p.add_argument("--min-keep-ratio", type=float, default=0.10,
+    p.add_argument("--sample-count", type=int, default=SCAN_WINDOWS,
+                   help=f"windows scanned per file (default: {SCAN_WINDOWS})")
+    p.add_argument("--window-duration", type=float, default=WINDOW_DURATION,
+                   help=f"seconds of cropdetect per window (default: {WINDOW_DURATION:g})")
+    p.add_argument("--limit-sdr", type=int, default=LIMIT_SDR,
+                   help="cropdetect darkness threshold for SDR, as an 8-bit "
+                        f"code value 0-255, scaled to the source's bit depth "
+                        f"(default: {LIMIT_SDR})")
+    p.add_argument("--limit-hdr", type=int, default=LIMIT_HDR,
+                   help="cropdetect darkness threshold for HDR, as a 10-bit "
+                        f"code value 0-1023 (default: {LIMIT_HDR})")
+    p.add_argument("--round", type=int, default=ROUND,
+                   help=f"output dim divisibility (2=accurate, 16=codec-friendly; "
+                        f"default: {ROUND})")
+    p.add_argument("--min-keep-ratio", type=float, default=MIN_KEEP_RATIO,
                    help="absolute floor — refuse high confidence if cropped area "
-                        "below this (default 0.10, catches catastrophic misdetect only)")
-    p.add_argument("--agree-ratio", type=float, default=0.75,
-                   help="fraction of windows that must agree (default 0.75)")
+                        f"below this (default {MIN_KEEP_RATIO}, catches "
+                        "catastrophic misdetect only)")
+    p.add_argument("--agree-ratio", type=float, default=AGREE_RATIO,
+                   help=f"fraction of windows that must agree (default {AGREE_RATIO})")
 
     args = p.parse_args()
 
-    cfg = {
-        "cache_dir": script_dir / "_cache",
-        "force": args.force,
-        "dry_run": args.dry_run,
-        "sample_count": max(1, args.sample_count),
-        "window_duration": max(0.5, args.window_duration),
-        "limit_sdr": args.limit_sdr,
-        "limit_hdr": args.limit_hdr,
-        "round": max(2, args.round),
-        "min_keep_ratio": args.min_keep_ratio,
-        "agree_ratio": args.agree_ratio,
-        "scene_threshold": SCENE_THRESHOLD,
-        "short_threshold": SHORT_THRESHOLD,
-    }
+    cfg = crop_scan_cfg(
+        {
+            "cache_dir": script_dir / "_cache",
+            "scene_threshold": SCENE_THRESHOLD,
+            "short_threshold": SHORT_THRESHOLD,
+        },
+        force=args.force,
+        dry_run=args.dry_run,
+        sample_count=max(1, args.sample_count),
+        window_duration=max(0.5, args.window_duration),
+        limit_sdr=args.limit_sdr,
+        limit_hdr=args.limit_hdr,
+        round=max(2, args.round),
+        min_keep_ratio=args.min_keep_ratio,
+        agree_ratio=args.agree_ratio,
+    )
     cfg["cache_dir"].mkdir(parents=True, exist_ok=True)
 
     print(f"{PURPLE}{BOLD}av1q-crop{RESET}\n{SEP}")
@@ -112,9 +128,14 @@ def main():
     if args.input.is_file():
         files = [args.input]
     else:
-        if not args.input.exists():
+        # A missing folder is created, as the encode launchers do, so a
+        # first double-click leaves the place to drop files into; a
+        # missing FILE (a typo'd video name) is an error, not a folder.
+        if (not args.input.exists()
+                and args.input.suffix.lower() in VIDEO_EXTENSIONS):
             print(f"{CROSS} input not found: {args.input}")
             return 1
+        args.input.mkdir(parents=True, exist_ok=True)
         pattern = "**/*" if not args.no_recurse else "*"
         files = sorted(
             f for f in args.input.glob(pattern)
@@ -136,7 +157,7 @@ def main():
         except KeyboardInterrupt:
             raise
         except Exception as e:
-            print(f"  {CROSS} {e}")
+            print(f" {CROSS} {e}")
         finally:
             cleanup_temp()
 

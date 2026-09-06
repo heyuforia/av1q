@@ -4,9 +4,13 @@ and keyframe listing (demux only — no decode)."""
 import json
 import subprocess
 
+from .constants import INTRA_ONLY_CODECS
 from .probe import detect_hwaccel
 from .tools import ffmpeg_exe, ffprobe_exe
-from .util import _temp_files, clamp, escape_filter_path, make_temp_log
+from .ui import label
+from .util import (
+    _temp_files, atomic_write_json, clamp, escape_filter_path, make_temp_log,
+)
 
 
 def detect_scenes(source, cfg, duration=None):
@@ -178,3 +182,35 @@ def get_keyframes(source):
         return sorted(keyframes)
     except Exception:
         return []
+
+
+def scene_analysis(source, meta, cfg, cache=None, cache_path=None):
+    """A source's scene boundaries, per-window complexity, and keyframes,
+    as (scenes, complexity, keyframes).
+
+    Intra-only sources get three empty lists without a scan: every packet
+    is a keyframe there and packet size follows the picture, not the
+    cut structure, so there is nothing to rank and the consumers pick
+    evenly spaced clips instead. Everything else is scanned once per
+    file: given the per-file cache, a scan made under the same scene
+    threshold is read back from it and a fresh one is stored there, so
+    the crop scan and the sample stage share one scdet decode however
+    many of them ask. Without a cache (av1q-crop) it simply scans.
+    """
+    if meta["codec"] in INTRA_ONLY_CODECS:
+        return [], [], []
+    scene_cfg = {"scene_threshold": cfg["scene_threshold"]}
+    if (cache is not None
+            and all(k in cache for k in ("scenes", "complexity", "keyframes"))
+            and cache.get("scene_cfg") == scene_cfg):
+        print(f"{label('cache')}Using cached scene data")
+        return cache["scenes"], cache["complexity"], cache["keyframes"]
+    print(f"{label('analyze')}Detecting scenes...")
+    scenes = detect_scenes(source, cfg, meta["duration"])
+    complexity = analyze_complexity(source)
+    keyframes = get_keyframes(source)
+    if cache is not None:
+        cache.update(scenes=scenes, complexity=complexity,
+                     keyframes=keyframes, scene_cfg=scene_cfg)
+        atomic_write_json(cache_path, cache)
+    return scenes, complexity, keyframes

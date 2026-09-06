@@ -17,7 +17,7 @@ sys.dont_write_bytecode = True  # don't litter core/ with __pycache__
 # av1q-essential.py import the shared helper names from here.
 from core.ui import (
     GREEN, ORANGE, PURPLE, RED, RESET, BOLD, DIM, CHECK, CROSS, SEP, MIDDOT,
-    fmt_time, fmt_size, vmaf_pass_color, fmt_s2,
+    fmt_time, fmt_size, vmaf_pass_color, fmt_s2, label,
 )
 from core.constants import (
     VIDEO_EXTENSIONS, INTRA_ONLY_CODECS, TARGET_VMAF_BY_RES,
@@ -44,8 +44,10 @@ from core.calibrate import (
     update_global_calibration,
 )
 from core.crop import (
-    crop_token, load_crop_sidecar, detect_crop_window, aggregate_crops,
-    detect_crop_for_file,
+    SCAN_WINDOWS, WINDOW_DURATION, LIMIT_SDR, LIMIT_HDR, ROUND,
+    MIN_KEEP_RATIO, AGREE_RATIO,
+    crop_scan_cfg, crop_token, load_crop_sidecar, read_crop_sidecar,
+    sidecar_crop, detect_crop_window, aggregate_crops, detect_crop_for_file,
 )
 from core import search as core_search
 from core import pipeline as core_pipeline
