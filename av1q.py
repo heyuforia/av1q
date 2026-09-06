@@ -22,10 +22,12 @@ from core.ui import (
 from core.constants import (
     VIDEO_EXTENSIONS, INTRA_ONLY_CODECS, TARGET_VMAF_BY_RES,
     FALLBACK_MAXRATE, MIN_BITRATE_KBPS, VMAF_OVERSHOOT,
+    OUTPUT_CONTAINER, VMAF_TOLERANCE, BITRATE_MARGIN, SAMPLE_DURATION,
+    MIN_SCENE_DURATION, SHORT_THRESHOLD, SCENE_THRESHOLD,
 )
 from core.util import (
     _temp_files, run_cmd, cleanup_temp, atomic_write_json, make_temp_log,
-    escape_filter_path, partial_hash, clamp,
+    escape_filter_path, partial_hash, clamp, run_launcher,
 )
 from core.probe import detect_hwaccel, probe_video, get_fps, res_tier
 from core.bitrate import (
@@ -215,11 +217,15 @@ def main():
     if not 1 <= args.min_cq <= 63 or not 1 <= args.max_cq <= 63:
         parser.error("CQ bounds must be within 1-63")
     if not 0 <= args.preset <= 10:
-        parser.error("--preset must be 0-10 (SVT-AV1 v3 removed presets above 10)")
+        parser.error("--preset must be 0-10 (SVT-AV1 4.0 capped presets at 10)")
     if not 0 <= args.film_grain <= 50:
         parser.error("--film-grain must be 0-50")
     if args.samples < 1:
         parser.error("--samples must be >= 1")
+    # `0 <` also rejects nan; without this a --vmaf 0 would silently fall
+    # through to the automatic per-resolution target.
+    if args.vmaf is not None and not 0 < args.vmaf <= 100:
+        parser.error("--vmaf must be above 0 and at most 100")
     if args.seed_cq is not None and not args.min_cq <= args.seed_cq <= args.max_cq:
         parser.error("--seed-cq must be within --min-cq..--max-cq")
     if args.force_cq is not None:
@@ -239,7 +245,7 @@ def main():
         "input_dir": args.input,
         "output_dir": args.output,
         "cache_dir": script_dir / "_cache",
-        "container": ".mkv",
+        "container": OUTPUT_CONTAINER,
         "recurse": not args.no_recurse,
         "skip_existing": not args.overwrite,
         "preset": args.preset,
@@ -249,8 +255,8 @@ def main():
         "force_10bit": not args.no_10bit,
         "maxrate_factor": 1.6,
         "target_vmaf": args.vmaf,
-        "vmaf_tolerance": 0.1,
-        "bitrate_margin": 1.20,
+        "vmaf_tolerance": VMAF_TOLERANCE,
+        "bitrate_margin": BITRATE_MARGIN,
         "dry_run": args.dry_run,
         "use_crops": not args.no_crops,
         "auto_crop": args.auto_crop,
@@ -258,23 +264,14 @@ def main():
         "force_q": args.force_cq,
         "resume_encodes": not args.no_resume,
         "sample_count": args.samples,
-        "sample_duration": 6.0,
-        "min_scene_duration": 2.0,
-        "short_threshold": 48,
-        "scene_threshold": 3,
+        "sample_duration": SAMPLE_DURATION,
+        "min_scene_duration": MIN_SCENE_DURATION,
+        "short_threshold": SHORT_THRESHOLD,
+        "scene_threshold": SCENE_THRESHOLD,
     }
 
     return process_videos(cfg)
 
 
 if __name__ == "__main__":
-    try:
-        code = main() or 0
-    except KeyboardInterrupt:
-        cleanup_temp()
-        code = 0
-    try:
-        input("\nPress Enter to exit...")
-    except (EOFError, KeyboardInterrupt):
-        pass
-    sys.exit(code)
+    run_launcher(main)

@@ -1,10 +1,12 @@
 """Terminal presentation: ANSI colors, shared glyphs, and small formatters.
 
 Importing this module initializes colorama (or enables VT processing on
-Windows) exactly once, for every launcher.
+Windows) and makes the output streams redirect-safe, exactly once, for
+every launcher.
 """
 
 import os
+import sys
 
 try:
     from colorama import init as colorama_init
@@ -12,6 +14,30 @@ try:
 except ImportError:
     if os.name == "nt":
         os.system("")
+
+
+def _redirect_safe_streams():
+    """Let every print survive a redirect. A Windows console stream is
+    Unicode-capable, but stdout sent to a file or a pipe falls back to
+    the locale codec (cp1252), which cannot encode the glyphs on every
+    result line — the first ✓ would raise UnicodeEncodeError and end the
+    run. Redirected streams are reopened as UTF-8 (what a log should be
+    anyway); every stream prints through an unencodable character
+    instead of dying on it.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            if stream.isatty():
+                stream.reconfigure(errors="replace")
+            else:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError, AttributeError):
+            pass
+
+
+_redirect_safe_streams()
 
 
 GREEN = "\033[38;5;46m"
@@ -24,7 +50,7 @@ DIM = "\033[2m"
 CHECK = f"{GREEN}✓{RESET}"
 CROSS = f"{RED}✗{RESET}"
 SEP = f"{DIM}{'─' * 48}{RESET}"
-MIDDOT = "·"  # named constant for readability where it's used as a separator
+MIDDOT = "·"
 
 
 def fmt_time(seconds):

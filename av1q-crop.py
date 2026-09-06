@@ -20,13 +20,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.dont_write_bytecode = True  # don't litter the script dir with __pycache__
 from av1q import (
-    VIDEO_EXTENSIONS,
+    VIDEO_EXTENSIONS, SCENE_THRESHOLD, SHORT_THRESHOLD,
     PURPLE, RESET, BOLD, DIM, CHECK, CROSS, SEP,
     atomic_write_json,
     cleanup_temp,
     partial_hash,
     probe_video,
     detect_crop_for_file,
+    run_launcher,
 )
 
 
@@ -101,8 +102,8 @@ def main():
         "round": max(2, args.round),
         "min_keep_ratio": args.min_keep_ratio,
         "agree_ratio": args.agree_ratio,
-        "scene_threshold": 3,
-        "short_threshold": 48,
+        "scene_threshold": SCENE_THRESHOLD,
+        "short_threshold": SHORT_THRESHOLD,
     }
     cfg["cache_dir"].mkdir(parents=True, exist_ok=True)
 
@@ -147,13 +148,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        code = main() or 0
-    except KeyboardInterrupt:
-        cleanup_temp()
-        code = 0
-    try:
-        input("\nPress Enter to exit...")
-    except (EOFError, KeyboardInterrupt):
-        pass
-    sys.exit(code)
+    run_launcher(main)

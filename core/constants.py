@@ -1,10 +1,54 @@
-"""Shared domain constants: container whitelist, per-resolution VMAF
-targets and bitrate floors, and the search acceptance-band overshoot."""
+"""Shared domain constants and encode policy: container whitelist, the
+run-wide numbers both launchers seed into cfg, per-resolution VMAF
+targets and bitrate floors, and the search/refine economics."""
 
 import math
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".mov", ".m4v", ".ts", ".avi", ".webm"}
 INTRA_ONLY_CODECS = {"prores", "dnxhd", "mjpeg", "rawvideo", "ffv1", "jpeg2000", "cfhd"}
+
+# Run-wide policy the launchers seed into cfg. One source for both
+# pipelines: everything that shapes a search must stay in sync between
+# the two scripts, and a literal repeated in each is how they drift.
+
+# Output container. Matroska carries whatever audio and subtitle streams
+# the source has (the mux ladder steps the few it rejects down to SRT).
+OUTPUT_CONTAINER = ".mkv"
+
+# VMAF noise epsilon: two scores closer than this are the same score. It
+# is the acceptance band's lower edge (target - tol), the refine loop's
+# hysteresis above the band top, and the pass/fail color's threshold —
+# nothing anywhere acts on a difference smaller than this.
+VMAF_TOLERANCE = 0.1
+
+# Cold-start sample→full bitrate margin for complexity-selected samples:
+# the hardest scenes are modeled as encoding ~20% hotter than the whole
+# file, so a sample must clear margin × floor for the video to clear the
+# floor. Superseded per file by the measured complexity spread (bounded
+# to only ever tighten it) and by the cohort ratio once one exists;
+# evenly-spaced samples use EVEN_SAMPLE_MARGIN instead (below).
+BITRATE_MARGIN = 1.20
+
+# Sample clip length. 6s spans several GOPs at any common keyint, enough
+# for one probe's VMAF to average over real coding decisions; variety
+# comes from sampling more scenes (SAMPLE_SCALE_*), never longer ones.
+SAMPLE_DURATION = 6.0
+
+# Scenes shorter than this are never sampled: a clip is cut to
+# min(scene, SAMPLE_DURATION), and under 2s it is too few frames for a
+# VMAF mean to say anything about the scene.
+MIN_SCENE_DURATION = 2.0
+
+# Sources under this are too short to sample by scenes: the sampling
+# plan drops to the mini plan or full-file search (its own amortization
+# gate, 1.25× the extracted total, is higher at the default --samples),
+# and the crop scan uses evenly spaced windows instead of scene picks.
+SHORT_THRESHOLD = 48
+
+# scdet cut threshold, well under the filter's stock 10: soft cuts and
+# dissolves register too. A missed cut means a complex scene never
+# reaches the candidate list; a false cut only splits one scene in two.
+SCENE_THRESHOLD = 3
 
 TARGET_VMAF_BY_RES = {0: 93.0, 720: 94.0, 2160: 90.0}
 
@@ -25,14 +69,15 @@ MIN_BITRATE_KBPS = {0: 0, 720: 1000, 1080: 1800, 1440: 2500, 2160: 4500, 4320: 8
 BITRATE_BAND = 1.1
 
 # Sample→full bitrate margin for evenly-spaced sampling. The normal margin
-# (cfg["bitrate_margin"], ~1.20) models complexity-selection bias: samples
-# cut from the hardest scenes encode hotter than the full video, so the
-# sample must clear margin × floor for the video to clear the floor. Evenly
-# spaced samples (intra-only sources, or any file with no detected scenes)
-# carry no such bias — the sample is representative, so the ratio is ~1.0
-# and the big margin would over-cap the search and force a wasted refine
-# re-encode. A small margin keeps the video centered in the band above the
-# floor while leaving room for ratio noise.
+# (BITRATE_MARGIN, carried as cfg["bitrate_margin"]) models complexity-
+# selection bias: samples cut from the hardest scenes encode hotter than
+# the full video, so the sample must clear margin × floor for the video
+# to clear the floor. Evenly spaced samples (intra-only sources, or any
+# file with no detected scenes) carry no such bias — the sample is
+# representative, so the ratio is ~1.0 and the big margin would over-cap
+# the search and force a wasted refine re-encode. A small margin keeps
+# the video centered in the band above the floor while leaving room for
+# ratio noise.
 #
 # This is a COLD-START cushion, not a belief about the ratio: evenly-spaced
 # files roll their measured ratios into their own cohort (see cohort_keys

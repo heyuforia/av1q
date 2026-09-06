@@ -470,7 +470,9 @@ class SvtAv1FfmpegEngine(Engine):
     grid = IntGrid()
     vmaf_key_base = "full"
     sample_ext = ".mkv"
-    tmp_patterns = ("*.tmp.mkv",)
+    tmp_patterns = ("*_CQ*.tmp.mkv", "sample_enc_*.tmp.mkv")
+    ffmpeg_encoders = ("libsvtav1",)
+    ffmpeg_filters = ("libvmaf",)
     rec_q_key = "cq"
     rec_bound_keys = ("min_cq", "max_cq")
     rec_extra_keys = ()

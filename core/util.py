@@ -6,7 +6,9 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import time
+import traceback
 from pathlib import Path
 
 _temp_files = set()
@@ -70,12 +72,42 @@ def cleanup_temp():
         _temp_files.discard(path)
 
 
+def run_launcher(main):
+    """Process wrapper behind every launcher's __main__ block.
+
+    Ctrl-C is a clean stop (temps swept, exit 0); any other escape is a
+    bug or a broken environment, so the traceback is printed and the
+    exit code says failure. Either way the "Press Enter" pause still
+    runs: the scripts are double-clicked as often as typed, and a window
+    that closes on the traceback loses the one thing worth reading.
+    """
+    try:
+        code = main() or 0
+    except KeyboardInterrupt:
+        cleanup_temp()
+        code = 0
+    except Exception:
+        cleanup_temp()
+        traceback.print_exc()
+        code = 1
+    try:
+        input("\nPress Enter to exit...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+    sys.exit(code)
+
+
 def atomic_write_json(path, obj, indent=None):
     """Write JSON to `path` atomically: serialize to a sibling .tmp file,
-    then replace. A crash mid-write can't leave a torn cache or sidecar.
+    flush it to disk, then replace. Neither a crash mid-write nor a power
+    cut right after the rename can leave a torn or empty cache/sidecar —
+    without the fsync the rename can land before the data does.
     """
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj, indent=indent), encoding="utf-8")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(obj, indent=indent))
+        f.flush()
+        os.fsync(f.fileno())
     tmp.replace(path)
 
 

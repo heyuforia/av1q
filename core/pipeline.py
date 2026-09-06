@@ -43,7 +43,7 @@ from .sampling import (
     complexity_bias, complexity_bias_margin, extract_samples, sampling_plan,
     select_samples,
 )
-from .tools import have_ffmpeg, local_ffmpeg_dir
+from .tools import have_ffmpeg, local_ffmpeg_dir, missing_ffmpeg_components
 from .ui import (
     BOLD, CHECK, CROSS, DIM, GREEN, MIDDOT, ORANGE, PURPLE, RED, RESET, SEP,
     fmt_s2, fmt_size, fmt_time, vmaf_pass_color,
@@ -76,6 +76,24 @@ def process_videos(cfg, engine):
 
     if not have_ffmpeg():
         print(f"{CROSS} ffmpeg/ffprobe not found in PATH or the av1q folder")
+        return 1
+    # The build must carry what this engine encodes and measures with.
+    # Found out here, once, rather than per file after its scene scan
+    # and sample extraction have run — and named, because a dropped-in
+    # build missing libvmaf otherwise reads as a broken install.
+    try:
+        missing = missing_ffmpeg_components(
+            engine.ffmpeg_encoders, engine.ffmpeg_filters
+        )
+    except (OSError, RuntimeError) as e:
+        print(f"{CROSS} ffmpeg failed to run: {e}")
+        return 1
+    if missing:
+        where = local_ffmpeg_dir() or "PATH"
+        print(
+            f"{CROSS} ffmpeg ({where}) was built without"
+            f" {', '.join(missing)}"
+        )
         return 1
     try:
         engine.setup(cfg)
@@ -113,7 +131,8 @@ def process_videos(cfg, engine):
     # (which falls back to 30 for intra-only sources like ProRes). Enter
     # keeps auto behavior. Only when stdin is a terminal — piped/scripted
     # runs must not block.
-    if force_q is None and cfg[engine.seed_key] is None and sys.stdin.isatty():
+    if (force_q is None and engine.seed_override(cfg) is None
+            and sys.stdin.isatty()):
         while True:
             try:
                 raw = input(
@@ -145,11 +164,13 @@ def process_videos(cfg, engine):
     engine.make_dirs(cfg)
 
     # Leftover encode temps live next to the output (dest-derived names)
-    # and, when a dest is non-ASCII, in the cache root (an engine may
-    # redirect the encoder's scratch file there — see essential's Y4M
-    # path). Both are swept so a hard kill can't strand either.
+    # and under the shared cache root: an engine may redirect the
+    # encoder's scratch file there (essential's Y4M path), and the
+    # clean-sample pass writes beside the shared concats. Both are swept
+    # so a hard kill can't strand either; each engine's patterns name
+    # only its own temps (see Engine.tmp_patterns).
     for pat in engine.tmp_patterns:
-        for base in (output_dir, root_cache):
+        for base in (output_dir, cache_dir):
             for p in base.rglob(pat):
                 try:
                     p.unlink()
@@ -167,6 +188,9 @@ def process_videos(cfg, engine):
         if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS
     )
     total = len(files)
+    if not files:
+        print(f"{CROSS} No videos found in {input_dir}")
+        return 1
 
     # A user seed only seeds NEW searches: files with a completed search
     # resume past it (and verified outputs skip entirely), which reads as
@@ -174,7 +198,7 @@ def process_videos(cfg, engine):
     # for the whole batch — a per-file prompt would stall unattended
     # runs partway through. Yes clears those files' caches so they get a
     # fresh search from the seed; the default keeps today's behavior.
-    user_seed = cfg[engine.seed_key]
+    user_seed = engine.seed_override(cfg)
     seeded_redo = set()
     if force_q is None and user_seed is not None and files and sys.stdin.isatty():
         prior = []
@@ -247,14 +271,19 @@ def process_videos(cfg, engine):
 
             if file_hash in seeded_redo:
                 # User chose a fresh seeded search over the previous
-                # result: drop this file's whole cache (entries,
-                # calibration, scene data, recommended) so nothing
-                # resumes or skips below.
-                try:
-                    cp.unlink()
-                except OSError:
-                    pass
-                cache, cp = load_cache(root_cache, file_hash, engine.sig)
+                # result: drop every search product (entries,
+                # calibration, recommended) so nothing resumes or skips
+                # below. Scene analysis is a fact about the source, not
+                # the search, and the forced block belongs to forced
+                # mode — both survive, so the redo costs no re-scan.
+                keep = {
+                    k: cache[k]
+                    for k in ("scenes", "complexity", "keyframes",
+                              "scene_cfg", "forced")
+                    if k in cache
+                }
+                cache = {"sig": engine.sig, "entries": {}, **keep}
+                atomic_write_json(cp, cache)
 
             # Output names carry the crop token so cropped and uncropped
             # encodes of the same source never collide (flipping
@@ -1394,8 +1423,7 @@ def process_videos(cfg, engine):
                         except OSError:
                             pass
 
-    if total > 0:
-        print(SEP)
+    print(SEP)
     if stats["proc"] > 0:
         pct = stats["saved"] / stats["orig"] * 100 if stats["orig"] else 0
         print(f"{CHECK} Processed: {BOLD}{stats['proc']}{RESET}")

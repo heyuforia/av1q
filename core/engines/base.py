@@ -64,7 +64,18 @@ class Engine:
     grid = None
     vmaf_key_base = None    # full-encode VMAF cache key: "full" / "vmaf"
     sample_ext = None       # container for sample probe encodes
-    tmp_patterns = ()       # leftover temp outputs swept at startup
+    # Leftover temp names swept at startup (output dir + shared cache
+    # root). Only names THIS engine writes — dest-derived or hash-named —
+    # never a bare "*.tmp.mkv": both pipelines may share an output
+    # folder, and a loose glob would delete the other pipeline's
+    # in-flight temp mid-encode.
+    tmp_patterns = ()
+    # ffmpeg components the run cannot do without, checked once at
+    # launch against the resolved build. Without the check a build
+    # lacking one fails every file only after its scene scan and sample
+    # extraction were already paid for.
+    ffmpeg_encoders = ()
+    ffmpeg_filters = ()
     rec_q_key = None        # quantizer field in the `recommended` block
     rec_bound_keys = ()     # (min, max) field names in `recommended`
     rec_extra_keys = ()     # extra cfg keys the `recommended` block covers

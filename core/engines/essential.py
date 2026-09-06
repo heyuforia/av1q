@@ -447,7 +447,14 @@ class EssentialEngine(Engine):
     grid = QuarterGrid()
     vmaf_key_base = "vmaf"
     sample_ext = ".webm"
-    tmp_patterns = ("*.tmp.mkv", "*.tmp.webm")
+    # The clean-sample temp is written by prep_sample's lossless x264
+    # pass beside the shared concats, hence its pattern here.
+    tmp_patterns = (
+        "*_CRF*.tmp.mkv", "_enc_*.tmp.webm", "sample_enc_*.tmp.webm",
+        "samples_*_clean.tmp.mkv",
+    )
+    ffmpeg_encoders = ("libx264",)  # clean_sample_source's lossless pass
+    ffmpeg_filters = ("libvmaf",)
     rec_q_key = "crf"
     rec_bound_keys = ("min_crf", "max_crf")
     # enc_args_sig is None for a plain run, so a recommended block written
@@ -471,7 +478,10 @@ class EssentialEngine(Engine):
         return cfg.get("seed_crf")
 
     def parse_user_q(self, raw):
-        return qcrf(float(raw))
+        v = float(raw)
+        if not math.isfinite(v):  # "inf" parses; qcrf can't round it
+            raise ValueError(raw)
+        return qcrf(v)
 
     def signature(self, cfg, crop=None):
         return enc_signature_e(cfg, crop)

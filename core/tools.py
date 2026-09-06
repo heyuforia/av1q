@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from .ui import DIM, ORANGE, RESET
+from .util import run_cmd
 
 # core/ sits one level below the repo root, where the launchers and the
 # tools/ directory live.
@@ -95,6 +96,25 @@ def local_ffmpeg_dir():
 def have_ffmpeg():
     """True when both ffmpeg and ffprobe resolve to something runnable."""
     return all(os.path.isabs(c) or shutil.which(c) for c in _resolve_ff())
+
+
+def missing_ffmpeg_components(encoders=(), filters=()):
+    """Names among `encoders` / `filters` that the resolved ffmpeg build
+    lacks, asked of the binary itself (-encoders and -filters list what
+    was compiled in; each row is flags, name, description). Raises like
+    run_cmd when ffmpeg cannot be executed at all."""
+    missing = []
+    for flag, wanted in (("-encoders", encoders), ("-filters", filters)):
+        if not wanted:
+            continue
+        out = run_cmd([ffmpeg_exe(), "-hide_banner", flag]).stdout
+        present = set()
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) > 1:
+                present.add(parts[1])
+        missing += [name for name in wanted if name not in present]
+    return missing
 
 
 def _gpu_vendor():

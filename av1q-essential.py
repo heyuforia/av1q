@@ -26,6 +26,7 @@ Tools expected under ./tools (any subfolder):
 
 import argparse
 import hashlib
+import math
 import os
 import shlex
 import sys
@@ -38,8 +39,10 @@ import av1q
 from av1q import (
     VIDEO_EXTENSIONS, INTRA_ONLY_CODECS, MIN_BITRATE_KBPS,
     TARGET_VMAF_BY_RES, VMAF_OVERSHOOT,
+    OUTPUT_CONTAINER, VMAF_TOLERANCE, BITRATE_MARGIN, SAMPLE_DURATION,
+    MIN_SCENE_DURATION, SHORT_THRESHOLD, SCENE_THRESHOLD,
     GREEN, ORANGE, PURPLE, RED, RESET, BOLD, DIM, CHECK, CROSS, SEP, MIDDOT,
-    run_cmd, cleanup_temp, atomic_write_json, make_temp_log,
+    run_cmd, cleanup_temp, atomic_write_json, make_temp_log, run_launcher,
     partial_hash, res_tier, calc_kbps, video_kbps, measured_kbps,
     effective_sample_floor, crop_token, initial_cq_seed, clamp,
     fmt_time, fmt_size, vmaf_pass_color, fmt_s2,
@@ -68,7 +71,7 @@ _ENGINE = EssentialEngine()
 
 # ── Constants ────────────────────────────────────────────────
 
-SIG = "avqe-c1"
+SIG = _ENGINE.sig
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -186,8 +189,8 @@ def main():
     )
     parser.add_argument(
         "--tune", type=int, default=1,
-        help="Encoder tune (default: 1, the fork default; 0=VQ, 2=SSIM, "
-             "3=IQ, 4=SSIMU2-optimized — 4 inflates the measured target)",
+        help="Encoder tune (default: 1, the fork default; 0=VQ, 1=PSNR, "
+             "2=SSIM, 3=IQ, 4=MS-SSIM)",
     )
     parser.add_argument(
         "--metric-every", type=int, default=1,
@@ -244,10 +247,23 @@ def main():
 
     args = parser.parse_args()
 
-    if args.min_crf > args.max_crf:
+    # Every CRF is checked as typed (finite, in the encoder's 1-70) and
+    # then snapped to the quarter-step grid, so the relational checks
+    # below compare on-grid values — the ones the run will actually use.
+    def crf_arg(flag, raw):
+        if raw is None:
+            return None
+        if not (math.isfinite(raw) and 1 <= raw <= 70):
+            parser.error(f"{flag} must be within 1-70")
+        return qcrf(raw)
+
+    min_crf = crf_arg("--min-crf", args.min_crf)
+    max_crf = crf_arg("--max-crf", args.max_crf)
+    seed_crf = crf_arg("--seed-crf", args.seed_crf)
+    force_crf = crf_arg("--force-crf", args.force_crf)
+
+    if min_crf > max_crf:
         parser.error("--min-crf must be <= --max-crf")
-    if not 1 <= args.min_crf <= 70 or not 1 <= args.max_crf <= 70:
-        parser.error("CRF bounds must be within 1-70")
     if not 0 <= args.preset <= 10:
         parser.error("--preset must be 0-10")
     if not 0 <= args.tune <= 4:
@@ -258,14 +274,16 @@ def main():
         parser.error("--metric-every must be >= 1")
     if args.samples < 1:
         parser.error("--samples must be >= 1")
-    if args.seed_crf is not None and not args.min_crf <= args.seed_crf <= args.max_crf:
+    # `0 <` also rejects nan; without this a --vmaf 0 would silently fall
+    # through to the automatic per-resolution target.
+    if args.vmaf is not None and not 0 < args.vmaf <= 100:
+        parser.error("--vmaf must be above 0 and at most 100")
+    if seed_crf is not None and not min_crf <= seed_crf <= max_crf:
         parser.error("--seed-crf must be within --min-crf..--max-crf")
-    if args.force_crf is not None:
-        # Checked against the encoder's real 1-70 range, not
+    if force_crf is not None:
+        # Range-checked above against the encoder's real 1-70, not
         # --min/--max-crf — those bound the search, and --force-crf
         # replaces it.
-        if not 1 <= args.force_crf <= 70:
-            parser.error("--force-crf must be within 1-70")
         if args.vmaf is not None:
             parser.error("--force-crf has no VMAF target; drop --vmaf")
         if args.seed_crf is not None:
@@ -304,43 +322,34 @@ def main():
         # the two pipelines never clobber each other's per-file caches.
         "cache_dir": cache_dir,
         "e_cache_dir": cache_dir / "_essential",
-        "container": ".mkv",
+        "container": OUTPUT_CONTAINER,
         "recurse": not args.no_recurse,
         "skip_existing": not args.overwrite,
         "preset": args.preset,
-        "min_crf": qcrf(args.min_crf),
-        "max_crf": qcrf(args.max_crf),
+        "min_crf": min_crf,
+        "max_crf": max_crf,
         "film_grain": args.film_grain,
         "tune": args.tune,
         "target_vmaf": args.vmaf,
-        "vmaf_tolerance": 0.1,
-        "bitrate_margin": 1.20,
+        "vmaf_tolerance": VMAF_TOLERANCE,
+        "bitrate_margin": BITRATE_MARGIN,
         "metric_every": args.metric_every,
         "dry_run": args.dry_run,
         "use_crops": not args.no_crops,
         "auto_crop": args.auto_crop,
-        "seed_crf": qcrf(args.seed_crf) if args.seed_crf is not None else None,
-        "force_q": qcrf(args.force_crf) if args.force_crf is not None else None,
+        "seed_crf": seed_crf,
+        "force_q": force_crf,
         "enc_args": enc_args,
         "enc_args_sig": enc_args_sig,
         "sample_count": args.samples,
-        "sample_duration": 6.0,
-        "min_scene_duration": 2.0,
-        "short_threshold": 48,
-        "scene_threshold": 3,
+        "sample_duration": SAMPLE_DURATION,
+        "min_scene_duration": MIN_SCENE_DURATION,
+        "short_threshold": SHORT_THRESHOLD,
+        "scene_threshold": SCENE_THRESHOLD,
     }
 
     return process_videos(cfg)
 
 
 if __name__ == "__main__":
-    try:
-        code = main() or 0
-    except KeyboardInterrupt:
-        cleanup_temp()
-        code = 0
-    try:
-        input("\nPress Enter to exit...")
-    except (EOFError, KeyboardInterrupt):
-        pass
-    sys.exit(code)
+    run_launcher(main)

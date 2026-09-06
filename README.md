@@ -41,7 +41,7 @@ For every file:
 
 Most ffmpeg builds from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) (Windows) or [BtbN](https://github.com/BtbN/FFmpeg-Builds/releases) (Linux/Windows) include both. On macOS: `brew install ffmpeg`.
 
-av1q uses the ffmpeg on your PATH by default. To run a specific build instead, put `ffmpeg` and `ffprobe` together in a folder named `ffmpeg` next to `av1q.py`. Both files have to be in that folder, otherwise av1q falls back to PATH. When a local build is used, its folder is printed at the top of the run.
+av1q uses the ffmpeg on your PATH by default. To run a specific build instead, put `ffmpeg` and `ffprobe` together in a folder named `ffmpeg` next to `av1q.py`. Both files have to be in that folder, otherwise av1q falls back to PATH. When a local build is used, its folder is printed at the top of the run. At startup av1q asks the build it found for its encoder and filter lists, and stops with a message naming what is missing if `libsvtav1` or `libvmaf` is not there.
 
 ### Optional
 
@@ -76,7 +76,7 @@ Seed CQ 18–38 (Enter = auto):
 
 Press Enter for the automatic seed, or type a CQ to start every file's search there. This helps when a batch of similar clips all land around the same value, since a good seed can collapse the search to a single encode. The seed is only a starting point: VMAF is still measured and the search still corrects a wrong guess. `--seed-cq 24` does the same without the prompt, and piped or scripted runs skip the prompt entirely.
 
-A seed alone won't redo files that a previous run already encoded, since their finished search result is reused. When a seed is given interactively, av1q lists those files and asks once whether to re-encode them with a fresh search from the seed or keep the previous results.
+A seed alone won't redo files that a previous run already encoded, since their finished search result is reused. When a seed is given in a terminal, typed at the prompt or passed with `--seed-cq`, av1q lists those files and asks once whether to re-encode them with a fresh search from the seed or keep the previous results. Saying yes clears their search results but keeps their scene analysis, so the redo skips the scan.
 
 **Encode at a fixed CQ.** When you already know the CQ you want, `--force-cq` skips the search entirely and encodes each file at exactly that value, with no sampling, no VMAF measurement, and no refinement:
 
