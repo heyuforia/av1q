@@ -113,32 +113,28 @@ def select_samples(scenes, complexity, duration, count, keyframes, cfg):
     return selected or None
 
 
-def complexity_bias_margin(complexity, sample_scenes, base_margin, floor_margin):
-    """Estimate the sample→full bitrate margin from this file's complexity spread.
+def complexity_bias(complexity, sample_scenes):
+    """How much hotter the selected scenes are than the whole file.
 
-    The floor search needs to know how much hotter the sampled scenes
-    encode than the whole file — samples are cut from the highest-complexity
-    scenes, so they run above the full-file average, and the search must
-    clear margin × floor for the video to clear the floor. That bias is
-    normally a fixed cold-start guess (base_margin, ~1.20). Here it is
-    estimated a priori — before any encode — from the packet-stat
-    complexity (analyze_complexity) that already ranked the scenes: the
-    ratio of the selected scenes' mean complexity to the whole-file mean.
-    Low-variance content (its hottest scenes barely above average) yields a
-    margin near 1.0; high-variance content keeps the full margin.
+    The a-priori measure of complexity-selection bias — available before
+    any encode, from the packet-stat complexity (analyze_complexity) that
+    already ranked the scenes: the ratio of the selected scenes' mean
+    complexity to the whole-file mean. 1.0 means the sample turned out
+    representative after all (the file's hottest scenes are barely above
+    its average); above 1.0 means the sample really is the hard part.
 
-    Bounded to [floor_margin, base_margin]: the estimate can only TIGHTEN
-    the conservative default, never widen it past it, so a noisy proxy can't
-    push the search below the floor any harder than the fixed margin already
-    might — and the two-sided refine loop backstops whatever it misses.
-    Returns base_margin when the complexity data is missing or degenerate.
+    Both halves of the sample→full prediction read it — the bitrate
+    margin (complexity_bias_margin) and the VMAF offset center
+    (calibrate.scene_offset_center) — because both errors have the same
+    single cause. Returns None when the complexity data is missing or
+    degenerate, and callers fall back to their fixed cold-start guess.
 
     complexity is analyze_complexity's per-5s-window list; sample_scenes is
     select_samples' output (only `time`/`duration`), so the selected scenes
     are mapped back to their windows the same way select_samples does.
     """
     if not complexity or not sample_scenes:
-        return base_margin
+        return None
     comp_map = {int(c["time"] / 5) * 5: c["complexity"] for c in complexity}
     all_vals = [
         c["complexity"] for c in complexity
@@ -150,12 +146,33 @@ def complexity_bias_margin(complexity, sample_scenes, base_margin, floor_margin)
         if isinstance(v, (int, float)) and v > 0:
             sel_vals.append(v)
     if not all_vals or not sel_vals:
-        return base_margin
+        return None
     mean_all = sum(all_vals) / len(all_vals)
-    mean_sel = sum(sel_vals) / len(sel_vals)
     if mean_all <= 0:
+        return None
+    return (sum(sel_vals) / len(sel_vals)) / mean_all
+
+
+def complexity_bias_margin(complexity, sample_scenes, base_margin, floor_margin):
+    """Estimate the sample→full bitrate margin from this file's complexity spread.
+
+    The floor search needs to know how much hotter the sampled scenes
+    encode than the whole file — samples are cut from the highest-complexity
+    scenes, so they run above the whole-file average, and the search must
+    clear margin × floor for the video to clear the floor. That bias is
+    normally a fixed cold-start guess (base_margin, ~1.20); here it is the
+    file's own measured complexity_bias instead.
+
+    Bounded to [floor_margin, base_margin]: the estimate can only TIGHTEN
+    the conservative default, never widen it past it, so a noisy proxy can't
+    push the search below the floor any harder than the fixed margin already
+    might — and the two-sided refine loop backstops whatever it misses.
+    Returns base_margin when the complexity data is missing or degenerate.
+    """
+    bias = complexity_bias(complexity, sample_scenes)
+    if bias is None:
         return base_margin
-    return clamp(mean_sel / mean_all, floor_margin, base_margin)
+    return clamp(bias, floor_margin, base_margin)
 
 
 def extract_samples(source, scenes, keyframes, cfg, file_hash=None):

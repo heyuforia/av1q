@@ -18,24 +18,59 @@ import json
 import math
 import subprocess
 
+from .probe import frame_geometry
 from .tools import ffprobe_exe, find_ffvship_optional
-from .ui import DIM, RED, RESET
+from .ui import DIM, ORANGE, RED, RESET
 from .util import (
     _temp_files, ascii_path, make_temp_log, suppress_win_error_dialog,
 )
 
-# Demuxed video packet counts, memoized so the source of a long file is
-# only counted once across its verify/refine/final measurements.
+# Per-file probe results, memoized so the source of a long file is only
+# inspected once across its verify/refine/final measurements. Keyed on
+# identity, not just path, so a rewritten file is never read stale.
 _frame_counts = {}
+_geometries = {}
+
+# Skip reasons already announced. A source that can't be measured says so
+# ONCE per file: the reason is a property of the source, while _run_ffvship
+# is called per probe, so announcing it every time buries the search rows
+# it sits between under four copies of the same sentence.
+_announced = set()
+
+
+def _skip(ref, reason):
+    """Announce a deliberate skip once, in the label column every other
+    line uses, and return None for the caller to hand back."""
+    key = (_file_key(ref), reason)
+    if key not in _announced:
+        _announced.add(key)
+        print(f" {ORANGE}{'ssimu2':<10}{RESET}{DIM}skipped: {reason}{RESET}")
+    return None
+
+
+def _file_key(path):
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (str(path), st.st_size, int(st.st_mtime))
+
+
+def _geometry(path):
+    """frame_geometry(), memoized per file identity."""
+    key = _file_key(path)
+    if key is None:
+        return None
+    if key not in _geometries:
+        _geometries[key] = frame_geometry(path)
+    return _geometries[key]
 
 
 def _video_frame_count(path):
     """Video packet count via demux only (packets stand in for frames,
     same as the keyframe/complexity scans). None when uncountable."""
-    try:
-        st = path.stat()
-        key = (str(path), st.st_size, int(st.st_mtime))
-    except OSError:
+    key = _file_key(path)
+    if key is None:
         return None
     if key in _frame_counts:
         return _frame_counts[key]
@@ -95,34 +130,89 @@ def parse_ssimu2_json(path):
     return {"mean": mean, "p5": p5}
 
 
+def _comparability_gap(ref, dist, meta):
+    """Why FFVship cannot meaningfully compare these two files, or None.
+
+    FFVship reads both sides through FFMS2 and pairs frame i with frame
+    i. It never errors on a mismatch: unequal frame counts just compare
+    the overlap, and unequal geometry makes it RESCALE the encode to the
+    source's dimensions. Either way the numbers come back at exit code 0,
+    so the only defense is refusing to ask the question — for an info
+    column, no number beats a wrong one.
+
+    The four ways the two sides can disagree, cheapest check first:
+
+      orientation  ffmpeg auto-rotates on decode, so a source carrying a
+                   display matrix was encoded upright; FFMS2 reads that
+                   matrix as a property and hands back the picture
+                   untouched. The comparison is then upright-vs-rotated
+                   (or mirrored) — every frame wrong.
+      stream       every other stage here is pinned to v:0, but FFMS2
+                   picks its own video track, so a source with a second
+                   one may be read off a different picture entirely.
+      geometry     the catch-all the first two can't see: whatever the
+                   cause, if the reference (after the crop applied to
+                   its side) isn't the encode's size, FFVship rescales
+                   and the scores are meaningless.
+      frames       the source's timing slipped past the VFR gate and the
+                   CFR feed duplicated or dropped frames, so pairing
+                   drifts after the first divergence.
+
+    Frame count is checked last: it demuxes the whole file, the others
+    read headers.
+    """
+    ref_geo = _geometry(ref)
+    if ref_geo:
+        if ref_geo["transformed"]:
+            return "source is rotated — FFVship's reader reads it unrotated"
+        if ref_geo["n_video"] > 1:
+            return (f"source has {ref_geo['n_video']} video streams —"
+                    f" FFVship may read the wrong one")
+
+    dist_geo = _geometry(dist)
+    if ref_geo and dist_geo:
+        want_w, want_h = ref_geo["w"], ref_geo["h"]
+        if meta.get("crop"):
+            # The crop is applied to the REFERENCE side only (the encode
+            # is already cropped), so that is the size FFVship compares.
+            try:
+                want_w, want_h = (int(v) for v in meta["crop"].split(":")[:2])
+            except (ValueError, TypeError):
+                pass
+        if (want_w, want_h) != (dist_geo["w"], dist_geo["h"]):
+            return (f"{want_w}x{want_h} source vs {dist_geo['w']}x"
+                    f"{dist_geo['h']} encode — FFVship would rescale")
+
+    n_ref = _video_frame_count(ref)
+    n_dist = _video_frame_count(dist)
+    if n_ref is not None and n_dist is not None and n_ref != n_dist:
+        return (f"{n_ref} vs {n_dist} frames — pairing would drift")
+    return None
+
+
 def _run_ffvship(ref, dist, meta, cache_dir, exe,
                  ref_index=None, every=1, verbose=False):
     """Run FFVship and parse its per-frame JSON. Returns {'mean', 'p5'}
     or None on any failure (empty/non-finite scores included).
+
+    Comparability is gated first (_comparability_gap) — FFVship answers
+    with a number whether or not the question makes sense.
 
     The crop applies to the SOURCE side only, same rule as measure_vmaf's
     reference chain. `ref_index` names a persistent FFMS2 index for the
     reference so a source measured repeatedly (search probes, verify,
     refine) is only indexed once; the distorted index is per-encode.
     Index files live under <cache_dir>/_ffindex, never next to videos.
+    `verbose` covers FFVship's own failures; a deliberate skip always
+    prints its reason.
     """
-    # FFVship pairs frame i of the source with frame i of the encode —
-    # it has no timestamps. A near-VFR source that slips past the
-    # is_vfr gate gets frames duplicated/dropped by the CFR Y4M feed,
-    # so every pair after the first divergence compares the wrong
-    # frames and SSIMU2 collapses (negative scores). With unequal
-    # frame counts the comparison is meaningless: skip it — for an
-    # info column, no number beats a wrong one.
-    n_ref = _video_frame_count(ref)
-    n_dist = _video_frame_count(dist)
-    if n_ref is not None and n_dist is not None and n_ref != n_dist:
-        if verbose:
-            print(
-                f" {DIM}SSIMU2 skipped: source {n_ref} frames vs encode"
-                f" {n_dist} (irregular source timing — frame pairing"
-                f" would misalign){RESET}"
-            )
-        return None
+    # Refuse the measurement when the two sides aren't comparable. The
+    # reason is always printed, on both engines: a column that vanishes
+    # without saying why reads as a broken FFVship, and the reason is
+    # usually something about the source worth knowing.
+    gap = _comparability_gap(ref, dist, meta)
+    if gap:
+        return _skip(ref, gap)
 
     # FFVship's FFMS2 reads --source/--encoded as ANSI argv, so a non-ASCII
     # path arrives '?'-mangled and can't be opened. Hand it an ASCII
@@ -136,9 +226,7 @@ def _run_ffvship(ref, dist, meta, cache_dir, exe,
                     lk.unlink()
                 except OSError:
                     pass
-        if verbose:
-            print(f" {DIM}SSIMU2 skipped: no ASCII path for '{ref.name}'{RESET}")
-        return None
+        return _skip(ref, f"no ASCII path for '{ref.name}'")
 
     log = make_temp_log(cache_dir, "ssimu2", "json")
     idx_dir = cache_dir / "_ffindex"

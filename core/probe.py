@@ -252,3 +252,66 @@ def is_vfr(filepath, meta):
         return expected > 0 and abs(n - expected) / expected > 0.005
     except Exception:
         return False
+
+
+def frame_geometry(filepath):
+    """Picture geometry as a frame-indexing reader sees it.
+
+    FFVship reads through FFMS2, which decodes without applying the
+    display matrix and chooses its own video track, while ffmpeg — every
+    other stage here — auto-rotates and is pinned to v:0. This reports
+    what must agree before the two can be compared at all:
+
+      w, h         v:0's display dimensions. Not coded_width/height: the
+                   reader hands back the cropped picture (1080, not the
+                   macroblock-padded 1088).
+      transformed  a display matrix is attached, so ffmpeg's decode is
+                   oriented differently than a reader that ignores it.
+                   The demuxers suppress identity matrices, so a matrix
+                   being present at all means a real rotation or flip.
+      n_video      video streams, excluding attached cover art (ffmpeg
+                   skips those in stream selection; a genuine second
+                   track it does not).
+
+    Returns None when the file can't be read.
+    """
+    try:
+        r = run_cmd([
+            ffprobe_exe(), "-v", "error", "-select_streams", "v",
+            "-show_streams", "-of", "json", str(filepath),
+        ])
+        streams = json.loads(r.stdout or "{}").get("streams") or []
+    except (RuntimeError, ValueError, OSError):
+        # OSError included: a missing ffprobe must not take down the
+        # display-only caller that asks for this.
+        return None
+
+    real = [
+        s for s in streams
+        if not (s.get("disposition") or {}).get("attached_pic")
+    ]
+    if not real:
+        return None
+    first = real[0]
+
+    # Field names inside side_data_list have moved between ffprobe
+    # versions, so match on the type string ffmpeg exports for a display
+    # matrix and on the two field names that only a display matrix
+    # carries — any of the three is the same fact.
+    transformed = False
+    for sd in first.get("side_data_list") or []:
+        if not isinstance(sd, dict):
+            continue
+        if ("rotation" in sd or "displaymatrix" in sd
+                or "Display Matrix" in (
+                    str(v) for v in sd.values() if isinstance(v, str))):
+            transformed = True
+            break
+
+    try:
+        w, h = int(first.get("width") or 0), int(first.get("height") or 0)
+    except (TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return {"w": w, "h": h, "transformed": transformed, "n_video": len(real)}

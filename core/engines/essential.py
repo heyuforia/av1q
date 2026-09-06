@@ -27,6 +27,16 @@ from .base import Engine, Grid
 # (values are floored to the grid inside the encoder).
 CRF_STEP = 0.25
 
+# Cold-start d(log kbps)/d(CRF). Essential's rate curve is roughly half
+# as steep as the generic ln2/6 (2x per ~11 CRF, not per 6): four field
+# files measured 0.059, 0.063, 0.064 and 0.065, and an independent
+# earlier trace read ~0.07. Sitting just above the measured mean is the
+# safe side of the error — too steep only under-jumps and spends another
+# cheap sample probe, while too shallow can over-jump a full-file probe
+# past the floor. Only the cold start: the per-file and cohort decays
+# supersede it as soon as either exists.
+ESSENTIAL_BITRATE_DECAY = 0.065
+
 
 def qcrf(v):
     """Quantize to the encoder's quarter-step CRF grid."""
@@ -449,6 +459,7 @@ class EssentialEngine(Engine):
     seed_prompt_hint = "(0.25 steps, Enter = auto)"
     cal_q_key = "at_crf"
     needs_expected_frames = True
+    default_decay = ESSENTIAL_BITRATE_DECAY
 
     def cache_root(self, cfg):
         return cfg["e_cache_dir"]

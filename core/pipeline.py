@@ -29,19 +29,19 @@ from .cache import load_cache
 from .calibrate import (
     DECAY_MAX, DECAY_MIN, RATIO_MAX, RATIO_MIN, calibration_offset,
     decay_prior, ratio_prior, load_global_calibration,
-    update_global_calibration,
+    scene_offset_center, update_global_calibration,
 )
 from .constants import (
-    BITRATE_BAND, COMPLEXITY_MARGIN_FLOOR, DEFAULT_BITRATE_DECAY,
-    ENDGAME_SNAP_GAIN, EVEN_SAMPLE_MARGIN, INTRA_ONLY_CODECS,
-    MIN_BITRATE_KBPS, MINI_SAMPLE_COUNT, MINI_SAMPLE_DURATION,
-    MINI_SAMPLE_MIN_RATIO, SCENE_OFFSET_PRIOR, TARGET_VMAF_BY_RES,
-    VIDEO_EXTENSIONS, VMAF_OVERSHOOT,
+    BITRATE_BAND, COMPLEXITY_MARGIN_FLOOR, ENDGAME_SNAP_GAIN,
+    EVEN_SAMPLE_MARGIN, INTRA_ONLY_CODECS, MIN_BITRATE_KBPS,
+    MINI_SAMPLE_COUNT, MINI_SAMPLE_DURATION, MINI_SAMPLE_MIN_RATIO,
+    TARGET_VMAF_BY_RES, VIDEO_EXTENSIONS, VMAF_OVERSHOOT,
 )
 from .crop import crop_token, detect_crop_for_file, load_crop_sidecar
 from .probe import get_fps, probe_video, res_tier
 from .sampling import (
-    complexity_bias_margin, extract_samples, sampling_plan, select_samples,
+    complexity_bias, complexity_bias_margin, extract_samples, sampling_plan,
+    select_samples,
 )
 from .tools import have_ffmpeg, local_ffmpeg_dir
 from .ui import (
@@ -49,6 +49,21 @@ from .ui import (
     fmt_s2, fmt_size, fmt_time, vmaf_pass_color,
 )
 from .util import atomic_write_json, clamp, cleanup_temp, partial_hash
+
+
+def result_kbps(path, size_bytes, duration):
+    """Bitrate for a finished encode's result line: video only.
+
+    Every bitrate this tool decides on is video-only — the floor, the
+    sample threshold, the refine gates — because samples are cut -an
+    while full outputs carry audio and subs. Printing the muxed rate here
+    instead put a different, larger number under the same word on the one
+    line the eye lands on, so a file accepted at 1954kbps against an 1800
+    floor read as 2419. The size line below already reports the whole
+    file. Falls back to the muxed rate only when the video stream can't
+    be measured (unreadable, or too short to divide by).
+    """
+    return video_kbps(path, duration) or calc_kbps(size_bytes, duration)
 
 
 def process_videos(cfg, engine):
@@ -70,6 +85,9 @@ def process_videos(cfg, engine):
 
     root_cache = engine.cache_root(cfg)
     min_q, max_q = engine.q_bounds(cfg)
+    # How this encoder's quantizer maps to bitrate before anything is
+    # measured. Per engine, never a shared constant (Engine.default_decay).
+    engine_decay = engine.default_decay
     # Forced-quantizer mode: the user picked the value, so the whole
     # estimation apparatus (sampling, search, VMAF, refine) has nothing
     # to decide. Grid-native, set by the launchers (--force-cq /
@@ -489,7 +507,7 @@ def process_videos(cfg, engine):
                 atomic_write_json(cp, cache)
 
                 saved = (1.0 - out_sz / in_sz) * 100
-                out_kbps = calc_kbps(out_sz, meta["duration"])
+                out_kbps = result_kbps(final, out_sz, meta["duration"])
                 kbps_final = (
                     f"  {DIM}{MIDDOT}{RESET}  {BOLD}{out_kbps}kbps{RESET}"
                     if out_kbps else ""
@@ -713,11 +731,11 @@ def process_videos(cfg, engine):
             # the engine instead of the generic ±6 ≈ 2× cold-start, which
             # cost essential 1-2 extra probes per file.
             dec_prior, dec_src = decay_prior(
-                cache.get("calibration"), global_cal
+                cache.get("calibration"), global_cal, default=engine_decay
             )
             if (min_kbps and dec_prior is not None
-                    and abs(dec_prior - DEFAULT_BITRATE_DECAY)
-                    >= 0.15 * DEFAULT_BITRATE_DECAY):
+                    and abs(dec_prior - engine_decay)
+                    >= 0.15 * engine_decay):
                 print(
                     f"{lbl('calibr')}bitrate decay {BOLD}{dec_prior:.3f}{RESET}"
                     f"/{engine.qname} {DIM}({dec_src}){RESET}"
@@ -726,22 +744,30 @@ def process_videos(cfg, engine):
             if existing_q is not None:
                 best_q = existing_q
             elif sample_src:
+                # How complexity-biased this file's selection actually
+                # came out — the same measurement the bitrate margin below
+                # is built from (complexity_bias_margin), so the two halves
+                # of the sample→full prediction can't disagree about how
+                # biased the sample is.
+                bias = complexity_bias(complexity, sample_scenes)
                 # Apply learned VMAF offset (sample over/under-predicts
                 # full VMAF) so the sample search aims at the quantizer
                 # that will hit `target` on the full video. Per-file
-                # calibration takes precedence; on first encounter we
-                # fall back to the cohort average, shrunk toward the
-                # sampling mode's structural center — complexity-selected
-                # samples are the hardest scenes and read systematically
-                # LOW (SCENE_OFFSET_PRIOR, returned directly while the
-                # cohort is empty), evenly-spaced ones are representative
-                # (center 0). Each mode reads its OWN cohort: the scene
+                # calibration takes precedence; on first encounter we fall
+                # back to the cohort average, blended toward this file's
+                # structural center — for complexity-selected samples that
+                # is SCENE_OFFSET_PRIOR scaled by the bias actually
+                # measured above (scene_offset_center), for evenly-spaced
+                # ones it is 0. Each mode reads its OWN cohort: the scene
                 # cohort's whole content is scene-selection bias, which
                 # doesn't apply to an evenly-spaced sample.
                 sample_target = target
                 off, off_src = calibration_offset(
                     cache.get("calibration"), global_cal,
-                    prior_center=0.0 if even_sampling else SCENE_OFFSET_PRIOR,
+                    prior_center=(
+                        0.0 if even_sampling
+                        else scene_offset_center(bias, cfg["bitrate_margin"])
+                    ),
                     even=even_sampling,
                 )
                 if off is not None and abs(off) >= 0.1:
@@ -1037,7 +1063,7 @@ def process_videos(cfg, engine):
             )
             decay_b = clamp(
                 (search_state.get("bitrate_decay") if search_state else None)
-                or DEFAULT_BITRATE_DECAY,
+                or engine_decay,
                 0.05, 0.4,
             )
             # VMAF jumps aim at the CENTER of the acceptance band
@@ -1311,7 +1337,11 @@ def process_videos(cfg, engine):
                 t_vmaf += time.time() - t0
 
             saved = (1.0 - out_sz / in_sz) * 100
-            out_kbps = calc_kbps(out_sz, meta["duration"])
+            # The refine loop already measured this encode's video bitrate
+            # when a floor applies; reuse it rather than re-summing packets.
+            out_kbps = full_points.get(best_q, {}).get("kbps")
+            if out_kbps is None:
+                out_kbps = result_kbps(final, out_sz, meta["duration"])
             # Output bitrate rides the result line next to VMAF (where the
             # eye looks for "how did this encode turn out"); the size line
             # below stays size + saved%.

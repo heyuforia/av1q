@@ -8,6 +8,8 @@ the brain. Each engine's cache `sig` and key formats are frozen: caches
 written before and after the package split must stay interchangeable.
 """
 
+from ..constants import DEFAULT_BITRATE_DECAY
+
 
 class Grid:
     """Quantizer-grid arithmetic.
@@ -70,6 +72,13 @@ class Engine:
     seed_prompt_hint = None  # dim hint in the interactive seed prompt
     cal_q_key = None        # quantizer field in the calibration block
     needs_expected_frames = False  # engine's progress bar needs a frame count
+
+    # Cold-start d(log kbps)/d(quantizer) for the floor model, before this
+    # file's probes or the engine cohort have measured it. Encoder physics,
+    # not policy: an engine whose quantizer scale is flatter than the
+    # generic ln2/6 must say so, or every file of a young cohort is aimed
+    # with a curve twice as steep as its encoder's and pays extra probes.
+    default_decay = DEFAULT_BITRATE_DECAY
 
     def cache_root(self, cfg):
         """Per-pipeline cache directory (never shared between engines)."""

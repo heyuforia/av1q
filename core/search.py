@@ -17,8 +17,7 @@ import time
 
 from .bitrate import effective_sample_floor, measured_kbps
 from .constants import (
-    DEFAULT_BITRATE_DECAY, ENDGAME_SNAP_GAIN, INTRA_ONLY_CODECS,
-    MIN_BITRATE_KBPS, VMAF_OVERSHOOT,
+    ENDGAME_SNAP_GAIN, INTRA_ONLY_CODECS, MIN_BITRATE_KBPS, VMAF_OVERSHOOT,
 )
 from .probe import res_tier
 from .ui import BOLD, DIM, ORANGE, RESET, fmt_s2
@@ -82,8 +81,8 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
     measure VMAF, fit the local quality slope, jump. Also tracks the
     per-resolution bitrate floor — when bitrate is the binding constraint
     instead of VMAF, switches to bitrate-targeting mode on a log-linear
-    bitrate model (±6 quantizer steps ≈ 2× bitrate, refined with
-    measured points).
+    bitrate model, seeded from the engine's own cold-start decay (or the
+    caller's cohort prior) and refined with measured points.
 
     Injected seams (supplied by the launchers' compat wrappers so their
     module globals stay monkeypatchable):
@@ -132,8 +131,10 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
 
     # Fallback d(log kbps)/dQ before two probes have measured the local
     # slope: the engine cohort's learned decay when the caller supplies
-    # one (calibrate.decay_prior), else the generic ±6 ≈ 2× default.
-    default_decay = DEFAULT_BITRATE_DECAY
+    # one (calibrate.decay_prior), else this engine's own cold start (how
+    # its quantizer scale maps to bitrate is encoder physics, not a
+    # shared constant).
+    default_decay = engine.default_decay
     if decay_prior and 0 < decay_prior < 1:
         default_decay = decay_prior
 
@@ -435,7 +436,8 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
             if tag is not None and abs(vm["mean"] - aim) <= tol:
                 break
             delta = (vm["mean"] - aim) / slope
-            effective_max = min(max_q, floor_cap, estimate_max_q_for_floor())
+            bitrate_bound = min(floor_cap, estimate_max_q_for_floor())
+            effective_max = min(max_q, bitrate_bound)
 
             # At the quantizer ceiling (can't go higher without violating
             # the floor), accept any overshoot as long as VMAF meets target
@@ -447,10 +449,22 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
             )
             if (vm["mean"] >= target - tol
                     and q >= effective_max and not q_violates_floor):
+                # Say which of the two ceilings held it: the floor model,
+                # or the user's own grid bound. Naming bitrate for a file
+                # that simply ran out of grid reads as "nothing more to
+                # gain here" when the actual answer is "raise the max".
+                # Strict <: with no floor, or no bitrate measured yet,
+                # the estimator returns max_q itself, and that tie is not
+                # evidence of a bitrate limit.
+                held_by = (
+                    "is at bitrate ceiling"
+                    if min_kbps and bitrate_bound < max_q
+                    else f"is the highest {engine.qname} allowed"
+                )
                 print(
                     f" {ORANGE}{'accept':<10}{RESET}VMAF passes and"
                     f" {engine.qname} {BOLD}{grid.fmt(q)}{RESET}"
-                    f" is at bitrate ceiling"
+                    f" {held_by}"
                 )
                 break
 

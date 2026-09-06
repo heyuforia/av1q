@@ -63,25 +63,37 @@ COMPLEXITY_MARGIN_FLOOR = 1.10
 # overshooting file for ~5-10% smaller output (1 CQ step ≈ 11% bitrate).
 VMAF_OVERSHOOT = 0.5
 
-# Structural cold-start sample→full VMAF offset for complexity-selected
-# samples. The sample is deliberately cut from the file's hardest scenes,
-# so at equal quantizer it scores systematically LOW against the full
-# encode; aiming the sample search with a zero offset therefore lands the
+# Structural cold-start sample→full VMAF offset for a FULLY
+# complexity-biased sample. The sample is cut from the file's hardest
+# scenes, so at equal quantizer it scores systematically LOW against the
+# full encode; aiming the sample search with a zero offset lands the
 # first full encode high and the refine loop pays a whole re-encode to
 # walk it back down. The cohort average supersedes this as evidence
-# accumulates (calibration_offset shrinks the cohort toward this center,
+# accumulates (calibration_offset blends the cohort toward this center,
 # not toward 0). Field-measured true offsets so far: -0.58, -0.79, -1.10
 # (mean -0.82) — a -0.5 prior left two of those three cold files landing
 # above the acceptance band and re-encoding. -0.75 centers the observed
-# range while staying a notch shallow of the mean, so a genuinely
-# low-bias file errs toward overshoot (bitrate waste, refine-capped by
-# the noise hysteresis) rather than under target. Evenly-spaced samples
-# are representative and keep a center of 0.
+# range while staying a notch shallow of the mean.
+#
+# How biased a file's selection actually came out varies, so this is the
+# value at REFERENCE bias, scaled down per file by
+# calibrate.scene_offset_center: a source whose hottest scenes barely
+# clear its own average is evenly sampled in all but name and gets an
+# offset near 0. Charging one such file the full -0.75 aimed its search
+# a step low and cost a 41-minute re-encode (its measured bias was 1.03
+# against a true offset of +0.04). Evenly-spaced samples are
+# representative by construction and keep a center of 0.
 SCENE_OFFSET_PRIOR = -0.75
 
-# Cold-start bitrate-decay slope d(log kbps)/d(quantizer) for the floor
-# model: ±6 quantizer steps ≈ 2× bitrate. Used until measured probes (or
-# an engine cohort's learned decay — see core/calibrate.py) refine it.
+# Generic cold-start bitrate-decay slope d(log kbps)/d(quantizer) for the
+# floor model: ±6 quantizer steps ≈ 2× bitrate. Used until measured
+# probes (or an engine cohort's learned decay — see core/calibrate.py)
+# refine it.
+#
+# How a nominal quantizer maps to bitrate is encoder physics, so each
+# engine states its own (Engine.default_decay); this is the fallback and
+# the value av1q's integer CQ grid uses. Nothing shared may assume it —
+# blending Essential's cohort toward it taxed that engine's early files.
 DEFAULT_BITRATE_DECAY = math.log(2) / 6
 
 # A re-encode predicted to trim less than this fraction of bitrate costs

@@ -4,8 +4,8 @@ cohort prior (rolling averages with shrinkage)."""
 import json
 import time
 
-from .constants import DEFAULT_BITRATE_DECAY
-from .util import atomic_write_json
+from .constants import DEFAULT_BITRATE_DECAY, SCENE_OFFSET_PRIOR
+from .util import atomic_write_json, clamp
 
 
 def load_global_calibration(cache_dir):
@@ -98,11 +98,41 @@ def calibration_offset(per_file_cal, global_cal, prior_center=0.0, even=False):
             shrunk = g_off * w + prior_center * (1 - w)
             label = f"cohort n={n}"
             if abs(g_off - shrunk) >= 0.05:
-                label += f", shrunk from {g_off:+.2f}"
+                label += f", blended from {g_off:+.2f}"
             return shrunk, label
     if prior_center:
         return prior_center, "cold-start prior"
     return None, None
+
+
+def scene_offset_center(bias, reference_bias):
+    """Structural sample→full VMAF offset expected for THIS file.
+
+    SCENE_OFFSET_PRIOR is the offset a fully complexity-biased sample
+    reads — but how biased a given file's selection actually came out
+    varies, and it is measurable up front (sampling.complexity_bias).
+    A file whose hottest scenes barely clear its own average is
+    effectively evenly sampled, and its offset is near 0; charging it the
+    full structural prior aims the whole search low and buys a full
+    re-encode. Scale linearly between the two: no bias, no offset;
+    reference bias, the full prior.
+
+    `reference_bias` is the cold-start belief about scene-selection bias
+    (cfg["bitrate_margin"]) — the same number complexity_bias_margin uses
+    as its upper bound, so both halves of the sample→full prediction are
+    anchored to one scale rather than two that can drift apart.
+
+    The law is linear because one field point anchors it (bias 1.03 read
+    a true offset of +0.04) and the -0.75 end is assumed to sit at the
+    reference bias; the clamp is what makes that assumption safe, since
+    the result can only ever shrink the correction, never exceed it.
+    Returns SCENE_OFFSET_PRIOR unchanged when the bias is unmeasurable.
+    """
+    if bias is None or not reference_bias or reference_bias <= 1.0:
+        return SCENE_OFFSET_PRIOR
+    return SCENE_OFFSET_PRIOR * clamp(
+        (bias - 1.0) / (reference_bias - 1.0), 0.0, 1.0
+    )
 
 
 # Sanity range for a bitrate-decay slope d(log kbps)/d(quantizer). Real
@@ -111,20 +141,22 @@ def calibration_offset(per_file_cal, global_cal, prior_center=0.0, even=False):
 DECAY_MIN, DECAY_MAX = 0.02, 0.5
 
 
-def decay_prior(per_file_cal, global_cal):
+def decay_prior(per_file_cal, global_cal, default=DEFAULT_BITRATE_DECAY):
     """Pick the starting bitrate-decay slope for the search's floor model.
 
     Mirrors calibration_offset: a per-file measured decay is a direct
     measurement of this file and trusted as-is; the cohort average is
-    shrunk toward DEFAULT_BITRATE_DECAY (what the search would otherwise
-    assume) by n/(n+COHORT_SHRINK_K). This is how each engine learns how
-    its nominal quantizer maps to bitrate — Essential's CRF encodes
-    noticeably richer than mainline's CQ at equal numbers, which a shared
-    cold-start constant can't know, so its first jump toward the floor
-    fell short and cost 1-2 extra probes per file.
+    blended toward `default` — the engine's own cold-start decay, what
+    the search would otherwise assume — by n/(n+COHORT_SHRINK_K).
+
+    `default` is per engine (Engine.default_decay) because the quantity
+    is encoder physics: Essential's CRF curve is roughly half as steep as
+    the generic ln2/6, so blending its cohort toward that generic value
+    held every early file's estimate high and cost 1-2 extra probes each,
+    for as long as the cohort stayed small.
 
     Returns (decay, source_label); (None, None) when neither source has a
-    usable value (the search then uses DEFAULT_BITRATE_DECAY itself).
+    usable value (the search then uses `default` itself).
     """
     if isinstance(per_file_cal, dict):
         d = per_file_cal.get("decay")
@@ -137,10 +169,10 @@ def decay_prior(per_file_cal, global_cal):
             if not isinstance(n, int) or n < 1:
                 n = 1
             w = n / (n + COHORT_SHRINK_K)
-            shrunk = g * w + DEFAULT_BITRATE_DECAY * (1 - w)
+            shrunk = g * w + default * (1 - w)
             label = f"cohort n={n}"
             if abs(g - shrunk) >= 0.005:
-                label += f", shrunk from {g:.3f}"
+                label += f", blended from {g:.3f}"
             return shrunk, label
     return None, None
 
@@ -206,7 +238,7 @@ def ratio_prior(per_file_cal, global_cal, margin, even=False):
             shrunk = g * w + implied * (1 - w)
             label = f"cohort n={n}"
             if abs(g - shrunk) >= 0.005:
-                label += f", shrunk from {g:.2f}"
+                label += f", blended from {g:.2f}"
             return shrunk, label
     return None, None
 
