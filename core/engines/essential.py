@@ -517,6 +517,12 @@ class EssentialEngine(Engine):
         # prompt, not mid-search; the result is memoized.
         find_ffvship_optional()
 
+    def launch_notes(self, cfg):
+        # The file name carries the build's version. Without this line
+        # the build that runs is invisible, and two builds under tools/
+        # resolve by path order.
+        return (f"encoder: {os.path.basename(cfg['encoder_exe'])}",)
+
     def make_dirs(self, cfg):
         cfg["e_cache_dir"].mkdir(parents=True, exist_ok=True)
 

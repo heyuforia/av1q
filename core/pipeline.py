@@ -126,10 +126,15 @@ def process_videos(cfg, engine):
 
     # A build dropped into the av1q folder silently outranks whatever
     # is on PATH, so name the folder that won: a local build missing
-    # libsvtav1 or libvmaf otherwise reads as a broken install.
+    # libsvtav1 or libvmaf otherwise reads as a broken install. The
+    # engine names its own binaries the same way.
     local_ff = local_ffmpeg_dir()
-    if local_ff:
-        print(f"{DIM}ffmpeg: {local_ff}{RESET}\n{SEP}")
+    notes = [f"ffmpeg: {local_ff}"] if local_ff else []
+    notes += engine.launch_notes(cfg)
+    if notes:
+        for note in notes:
+            print(f"{DIM}{note}{RESET}")
+        print(SEP)
 
     # Interactive seed prompt: lets a batch of similar files start the
     # search at a known-good quantizer instead of the automatic seed

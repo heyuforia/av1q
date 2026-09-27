@@ -117,6 +117,12 @@ class Engine:
         when the engine cannot run here; the message is printed as is."""
         raise NotImplementedError
 
+    def launch_notes(self, cfg):
+        """Dim lines printed under the banner, after setup: what this run
+        found that the banner cannot name, such as the binary it runs.
+        Default: none."""
+        return ()
+
     def make_dirs(self, cfg):
         """Create engine-specific cache directories (input/output dirs
         are the pipeline's job). Default: nothing extra."""

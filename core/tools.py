@@ -1,17 +1,17 @@
-"""Discovery and first-run download of the external tool binaries that
-live under <repo>/tools (FFVship today; the Essential encoder's lookup
-joins it with the engine split), plus resolution of ffmpeg/ffprobe —
-a build dropped into the av1q folder is used in preference to PATH."""
+"""Where the external binaries come from: ffmpeg and ffprobe, where a
+build dropped into the av1q folder outranks PATH, and the tool binaries
+under <repo>/tools (FFVship, SvtAv1EncApp), each downloaded at a pinned
+version on the first run that finds none."""
 
-import json
+import hashlib
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-from .ui import DIM, ORANGE, RESET
-from .util import run_cmd
+from .ui import DIM, RESET, label as stage_label
+from .util import run_cmd, suppress_win_error_dialog
 
 # core/ sits one level below the repo root, where the launchers and the
 # tools/ directory live.
@@ -19,6 +19,53 @@ _ROOT = Path(__file__).resolve().parent.parent
 
 _ffvship_exe = False  # False = not probed yet; None = probed, absent
 _ff_pair = None  # memo: (ffmpeg, ffprobe) commands, resolved once
+
+# First-run downloads are pinned to the builds this code was tested
+# with, and a file is refused unless its SHA-256 matches: a binary that
+# will run here must be byte for byte the tested one. Every lookup takes
+# a copy already under tools/ or on PATH first, so raising a pin changes
+# fresh installs only; delete the old copy to fetch the new one.
+_FFVSHIP_VERSION = "v5.1.1"
+_FFVSHIP_URL = ("https://codeberg.org/Line-fr/Vship/releases/download/"
+                "{version}/FFVship_{vendor}.zip")
+_FFVSHIP_SHA256 = {  # per GPU build, keyed the way _gpu_vendor names it
+    "nvidia":
+        "19bee2924482b4ae7a1939008b5b7fc71c0d827d437522b3a5d982d13e11bc85",
+    "amd":
+        "cd49e059f428d156ed8a61b213941644dab905edb37ade125a6fbfcb377f4b05",
+    "Vulkan":
+        "412ebf2be21ad3a3afec191d4156f9d45d00845e01044506703c26d10da3a659",
+}
+_ENCODER_VERSION = "4.0.1"
+_ENCODER_RELEASE = ("https://github.com/nekotrix/SVT-AV1-Essential/"
+                    f"releases/tag/v{_ENCODER_VERSION}-Essential")
+_ENCODER_URL = ("https://github.com/nekotrix/SVT-AV1-Essential/releases/"
+                "download/v{version}-Essential/{name}")
+# Per platform, in the order tried. The Optimized builds use newer CPU
+# instructions and die on older chips, so the Generic build follows.
+_ENCODER_BUILDS = {
+    "win32": (
+        ("Windows_Optimized.exe",
+         "7ab3a726b5644562ca944f8dcb5df4c3b68f7ac20d308fa8269932ce24cfa16a"),
+        ("Windows_Generic.exe",
+         "ae27af4a7aaaf4e97183c0be0336da1b9742ed18d9ba02c1b90094a159f1935c"),
+    ),
+    "linux": (
+        ("Linux_Optimized",
+         "b4c26f03e37981324b681c4bf87ee89575fb490f60b13c54219dccf0c357818e"),
+        ("Linux_Generic",
+         "57dc7352148effeaa7bc45d20f55b50ea09215f49ddde29e7301a7e35944405b"),
+    ),
+    "darwin": (
+        ("MacOS_Arm",
+         "ea56e7314dcce6c25372c24f8a5d4b9a2521cc1af7c91d2598fbd71283654ffb"),
+    ),
+}
+
+
+def _exe_name(stem):
+    """`stem` spelled the way this platform names an executable."""
+    return f"{stem}.exe" if os.name == "nt" else stem
 
 
 def _exe_in(directory, name):
@@ -29,7 +76,7 @@ def _exe_in(directory, name):
     mistake: the preflight would pass and the failure would surface as a
     RuntimeError cascade deep in a run instead of "ffmpeg not found".
     """
-    exe = directory / (f"{name}.exe" if os.name == "nt" else name)
+    exe = directory / _exe_name(name)
     return exe if exe.is_file() else None
 
 
@@ -58,7 +105,7 @@ def _resolve_ff():
     """(ffmpeg, ffprobe) commands: a local pair when one exists, else the
     bare names for PATH lookup.
 
-    Both come from the same folder or neither does — pairing a local
+    Both come from the same folder or neither does. Pairing a local
     ffmpeg with a PATH ffprobe mixes two builds, and the version skew
     surfaces as parse failures deep in a run instead of as one clear
     error. The bare names are the fallback (never None) so every command
@@ -117,15 +164,34 @@ def missing_ffmpeg_components(encoders=(), filters=()):
     return missing
 
 
+def _find_in_tools(stem):
+    """First binary under <repo>/tools, at any depth in path order, whose
+    name matches the glob `stem` spelled as this platform names an
+    executable; None when there is none.
+
+    The same rule as _exe_in: on Windows only a .exe counts, so a Linux
+    build or a release archive sharing the name is passed over instead
+    of found and then failed on at every file.
+    """
+    tools = _ROOT / "tools"
+    if not tools.is_dir():
+        return None
+    for hit in sorted(tools.rglob(_exe_name(stem))):
+        if hit.is_file():
+            return hit
+    return None
+
+
 def _gpu_vendor():
     """Pick the FFVship build for this machine's GPU.
 
     Returns 'nvidia', 'amd', or 'Vulkan' (the universal fallback build),
     matching the Vship release asset names FFVship_<vendor>.zip.
 
-    Reads the display-adapter class key from the registry — instant.
-    Only falls back to a PowerShell CIM query if that yields nothing,
-    because PowerShell cold start makes that path take 10+ seconds.
+    Reads the display-adapter class key from the registry, which is
+    instant. Only falls back to a PowerShell CIM query if that yields
+    nothing, because PowerShell cold start makes that path take 10+
+    seconds.
     """
     out = ""
     try:
@@ -169,204 +235,199 @@ def _http_download(url, label, total=0):
 
     Same visual language as the encode bar. `total` is the expected size
     in bytes (falls back to the Content-Length header, then to a plain
-    MB counter when neither is known).
+    MB counter when neither is known). Off a terminal the bar is never
+    redrawn, as with the encode bars: only the finished line is written.
+    On failure a drawn bar is cleared, so the caller's reason starts on
+    a clean line.
     """
     import urllib.request
 
     chunks, done, bar_w = [], 0, 20
+    tty = sys.stdout.isatty()
+    redraw = "\r" if tty else ""
     # Keep the whole line under ~80 cols: a console-wrapped line defeats
     # the \r overwrite and the bar prints as a wall of repeated lines.
     if len(label) > 24:
         label = label[:23] + "…"
 
-    def render():
+    def render(final=False):
+        if not (tty or final):
+            return
         if total:
             filled = int(bar_w * done / total)
-            sys.stdout.write(
-                f"\r {ORANGE}{'download':<10}{RESET}{label} "
+            body = (
                 f"[{'█' * filled}{'░' * (bar_w - filled)}] "
                 f"{done / total * 100:5.1f}%  "
                 f"{done / (1 << 20):.1f}/{total / (1 << 20):.1f}MB"
             )
         else:
-            sys.stdout.write(
-                f"\r {ORANGE}{'download':<10}{RESET}{label} "
-                f"{done / (1 << 20):.1f}MB"
-            )
+            body = f"{done / (1 << 20):.1f}MB"
+        sys.stdout.write(
+            f"{redraw}{stage_label('download')}{label} {body}"
+        )
         sys.stdout.flush()
 
-    # Render the 0% bar before opening the connection — the release hosts
+    # Render the 0% bar before opening the connection: the release hosts
     # can take 20s+ to answer, and a blank console reads as a hang.
     render()
-    with urllib.request.urlopen(url, timeout=120) as r:
-        total = total or int(r.headers.get("Content-Length") or 0)
-        while True:
-            chunk = r.read(1 << 16)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            done += len(chunk)
-            render()
+    try:
+        with urllib.request.urlopen(url, timeout=120) as r:
+            total = total or int(r.headers.get("Content-Length") or 0)
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                done += len(chunk)
+                render()
+    except BaseException:
+        if tty:
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+        raise
+    render(final=True)
     sys.stdout.write("\n")
     sys.stdout.flush()
     return b"".join(chunks)
 
 
-def _download_ffvship(dest):
-    """First-run fetch of FFVship from the Vship releases into dest/.
+def _fetch_pinned(url, label, sha256):
+    """The body of a pinned release file; raises ValueError unless its
+    SHA-256 is the pinned one."""
+    data = _http_download(url, label)
+    if hashlib.sha256(data).hexdigest() != sha256:
+        raise ValueError("checksum mismatch, the file was refused")
+    return data
 
-    Picks the build matching the detected GPU and extracts the zip flat
-    (FFVship.exe + DLLs directly in dest, no nested folder). Returns the
-    exe path, or None on any failure — FFVship stays strictly optional,
-    so a dead network or an odd GPU must never break the pipeline.
+
+def _download_ffvship(dest):
+    """First-run fetch of the pinned FFVship build for this machine's GPU
+    into dest/ (FFVship.exe plus its DLLs, flat).
+
+    Returns the exe path, or None on any failure with its reason printed:
+    FFVship stays strictly optional, so a dead network or an odd GPU must
+    never break the pipeline.
     """
     import io
-    import urllib.request
     import zipfile
 
     if sys.platform != "win32":
         return None  # published zips are Windows binaries
     vendor = _gpu_vendor()
-    api = "https://codeberg.org/api/v1/repos/Line-fr/Vship/releases/latest"
-    sys.stdout.write(
-        f" {ORANGE}{'download':<10}{RESET}FFVship "
-        f"{DIM}contacting codeberg.org…{RESET}"
-    )
-    sys.stdout.flush()
+    name = f"FFVship {_FFVSHIP_VERSION} {vendor}"
+    exe = dest / "FFVship.exe"
+    staged = dest / f"partial-{exe.name}"
     try:
-        with urllib.request.urlopen(api, timeout=60) as r:
-            rel = json.load(r)
-        want = f"ffvship_{vendor}.zip".lower()
-        asset = next(
-            a for a in rel.get("assets", []) if a["name"].lower() == want
+        data = _fetch_pinned(
+            _FFVSHIP_URL.format(version=_FFVSHIP_VERSION, vendor=vendor),
+            name, _FFVSHIP_SHA256[vendor],
         )
-        data = _http_download(
-            asset["browser_download_url"], asset["name"], asset["size"]
-        )
-        dest.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(io.BytesIO(data)) as z:
-            for m in z.infolist():
-                if not m.is_dir():
-                    (dest / Path(m.filename).name).write_bytes(z.read(m))
-        exe = dest / "FFVship.exe"
-        return exe if exe.is_file() else None
+            # Flattened to base names: the release nests its files in one
+            # folder, and a base name joined to dest cannot leave it.
+            files = {
+                Path(m.filename).name: m
+                for m in z.infolist() if not m.is_dir()
+            }
+            if exe.name not in files:
+                raise ValueError(f"no {exe.name} in the archive")
+            dest.mkdir(parents=True, exist_ok=True)
+            for n, m in files.items():
+                if n != exe.name:
+                    (dest / n).write_bytes(z.read(m))
+            # The exe lands last and whole: an install cut short leaves
+            # no FFVship.exe, so the next run downloads again instead of
+            # finding a copy with DLLs missing.
+            staged.write_bytes(z.read(files[exe.name]))
+        staged.replace(exe)
+        return exe
     except Exception as e:
-        print(f"\r{DIM}FFVship download failed ({e}){' ' * 24}{RESET}")
+        print(f"{DIM}{name} download failed ({e}){RESET}")
         return None
+    finally:
+        try:
+            staged.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def find_ffvship_optional():
     """Locate FFVship under ./tools (any depth) or PATH; None if absent.
 
-    On Windows, a miss triggers a one-time auto-download of the build
-    matching the detected GPU into tools/FFVship/.
+    On Windows, a miss triggers a one-time auto-download of the pinned
+    build matching the detected GPU into tools/FFVship/.
     """
     global _ffvship_exe
     if _ffvship_exe is False:
-        _ffvship_exe = None
-        tools = _ROOT / "tools"
-        if tools.is_dir():
-            hits = [
-                h for pat in ("FFVship.exe", "FFVship")
-                for h in sorted(tools.rglob(pat)) if h.is_file()
-            ]
-            if hits:
-                _ffvship_exe = hits[0]
-        if _ffvship_exe is None:
-            w = shutil.which("FFVship")
-            if w:
-                _ffvship_exe = Path(w)
-        if _ffvship_exe is None:
-            _ffvship_exe = _download_ffvship(tools / "FFVship")
+        on_path = shutil.which("FFVship")
+        _ffvship_exe = (
+            _find_in_tools("FFVship")
+            or (Path(on_path) if on_path else None)
+            or _download_ffvship(_ROOT / "tools" / "FFVship")
+        )
     return _ffvship_exe
 
 
-def find_tool(patterns, fallback_name, hint):
-    """Locate a tool binary under ./tools (any depth), else PATH.
-
-    Glob patterns keep the lookup version-agnostic so dropping in an
-    upgraded binary (new version in the filename) keeps working.
-    """
-    tools = _ROOT / "tools"
-    if tools.is_dir():
-        for pat in patterns:
-            hits = sorted(tools.rglob(pat))
-            for h in hits:
-                if h.is_file():
-                    return h
-    w = shutil.which(fallback_name)
-    if w:
-        return Path(w)
-    raise FileNotFoundError(
-        f"{fallback_name} not found under {tools} or PATH.\n  {hint}"
-    )
-
-
 def _download_encoder(dest):
-    """First-run fetch of SVT-AV1-Essential from its GitHub releases
-    into dest/ (tools/SVT-AV1-Essential, mirroring FFVship's subfolder).
+    """First-run fetch of the pinned SVT-AV1-Essential build into dest/,
+    trying this platform's builds in order.
 
-    Release assets are bare executables. Prefers the CPU-Optimized build
-    but smoke-tests it and falls back to Generic — Optimized uses newer
-    CPU instructions and dies with an illegal instruction on older chips.
-    Keeps the release filename (version visible, find_tool glob matches).
-    Returns the exe path, or None so find_encoder can raise its usual
-    FileNotFoundError with the manual-install hint.
+    Each build is written under a name the lookup never matches and
+    smoke-tested there, then renamed to its release name (version
+    visible, matched by the lookup's glob). So neither a download cut
+    short nor a build this CPU cannot run is ever found by a later run.
+    Returns the exe path, or None with each reason printed.
     """
-    import urllib.request
-
-    plat = {"win32": "Windows", "darwin": "MacOS",
-            "linux": "Linux"}.get(sys.platform)
-    if plat is None:
-        return None
-    wanted = (["MacOS_Arm"] if plat == "MacOS"
-              else [f"{plat}_Optimized", f"{plat}_Generic"])
-    api = ("https://api.github.com/repos/nekotrix/SVT-AV1-Essential/"
-           "releases/latest")
-    sys.stdout.write(
-        f" {ORANGE}{'download':<10}{RESET}SvtAv1EncApp "
-        f"{DIM}contacting github.com…{RESET}"
-    )
-    sys.stdout.flush()
-    try:
-        with urllib.request.urlopen(api, timeout=60) as r:
-            rel = json.load(r)
-    except Exception as e:
-        print(f"\r{DIM}encoder download failed ({e}){' ' * 24}{RESET}")
-        return None
-    for suffix in wanted:
-        asset = next(
-            (a for a in rel.get("assets", []) if suffix in a["name"]), None)
-        if asset is None:
-            continue
+    for build, sha256 in _ENCODER_BUILDS.get(sys.platform, ()):
+        name = f"SvtAv1EncApp-{_ENCODER_VERSION}-Essential-{build}"
+        exe = dest / name
+        staged = dest / f"partial-{name}"
         try:
-            data = _http_download(
-                asset["browser_download_url"], "SvtAv1EncApp", asset["size"])
+            data = _fetch_pinned(
+                _ENCODER_URL.format(version=_ENCODER_VERSION, name=name),
+                f"SvtAv1EncApp v{_ENCODER_VERSION}", sha256,
+            )
             dest.mkdir(parents=True, exist_ok=True)
-            exe = dest / asset["name"]
-            exe.write_bytes(data)
+            staged.write_bytes(data)
             if sys.platform != "win32":
-                os.chmod(exe, 0o755)
-            probe = subprocess.run([str(exe), "--version"],
-                                   capture_output=True, timeout=15)
+                os.chmod(staged, 0o755)
+            # A build this CPU cannot run dies on an illegal instruction,
+            # and the crash box would hold the run until clicked away.
+            with suppress_win_error_dialog():
+                probe = subprocess.run([str(staged), "--version"],
+                                       capture_output=True, timeout=15)
             if probe.returncode == 0:
+                staged.replace(exe)
                 return exe
-            print(f"{DIM}{asset['name']} can't run on this CPU — "
-                  f"trying Generic{RESET}")
-            exe.unlink()
+            print(f"{DIM}{name} can't run on this CPU{RESET}")
         except Exception as e:
-            print(f"\r{DIM}{asset['name']} failed ({e}){' ' * 24}{RESET}")
+            print(f"{DIM}{name} failed ({e}){RESET}")
+        finally:
+            try:
+                staged.unlink(missing_ok=True)
+            except OSError:
+                pass
     return None
 
 
 def find_encoder():
-    try:
-        return find_tool(
-            ["SvtAv1EncApp*.exe", "SvtAv1EncApp*"], "SvtAv1EncApp",
-            "Download from https://github.com/nekotrix/SVT-AV1-Essential/releases",
+    """The SvtAv1EncApp binary: under ./tools (any depth), else PATH,
+    else the pinned build downloaded into tools/SVT-AV1-Essential/.
+    Raises FileNotFoundError when all three come up empty.
+
+    The glob keeps the lookup version-agnostic, so a binary dropped in
+    by hand is found whatever version its filename carries.
+    """
+    on_path = shutil.which("SvtAv1EncApp")
+    exe = (
+        _find_in_tools("SvtAv1EncApp*")
+        or (Path(on_path) if on_path else None)
+        or _download_encoder(_ROOT / "tools" / "SVT-AV1-Essential")
+    )
+    if exe is None:
+        raise FileNotFoundError(
+            f"SvtAv1EncApp not found under {_ROOT / 'tools'} or PATH, and"
+            f" none could be downloaded.\n  Download it from"
+            f" {_ENCODER_RELEASE}"
         )
-    except FileNotFoundError:
-        exe = _download_encoder(_ROOT / "tools" / "SVT-AV1-Essential")
-        if exe:
-            return exe
-        raise
+    return exe
