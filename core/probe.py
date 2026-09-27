@@ -23,6 +23,10 @@ _hwaccel_checked = False
 # HEVC range extensions are the same trap.
 HW_UNSAFE_PROFILES = ("4:4:4", "4:2:2", "444", "422", "rext")
 
+# The spellings ffprobe gives a color tag the stream does not state
+# ("" when the field is absent).
+UNTAGGED = {"", "unknown", "unspecified", "reserved"}
+
 
 def hw_decode_unsafe(profile):
     """True when a stream's ffprobe profile string is on the hw-unsafe
@@ -151,7 +155,14 @@ def probe_video(filepath):
     codec = (s.get("codec_name") or "").lower()
     profile = str(s.get("profile") or "").lower()
     pf = s.get("pix_fmt") or ""
-    hdr = ct in {"smpte2084", "arib-std-b67"} or cp == "bt2020"
+    # HDR is a transfer fact: PQ or HLG (BT.2100). BT.2020 primaries
+    # alone are wide gamut, and with a stated SDR transfer (bt709,
+    # bt2020-10) the source is SDR; only with the transfer untagged do
+    # they stand in for it. A false HDR flag tonemaps the VMAF chain and
+    # moves the crop scan's darkness limit.
+    hdr = ct in {"smpte2084", "arib-std-b67"} or (
+        cp == "bt2020" and ct in UNTAGGED
+    )
     duration = float(fmt.get("duration") or 0)
     try:
         start_time = float(fmt.get("start_time") or 0)

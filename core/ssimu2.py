@@ -4,14 +4,14 @@ Display-only second opinion printed next to VMAF scores. It never gates
 or refines anything, and without an FFVship binary the column simply
 doesn't appear — FFVship is not a requirement of either pipeline.
 
-One shared runner serves both engines' wrappers:
-  * measure_ssimu2_display — av1q's flavor: finds the binary itself,
-    fails silently (no binary or broken measurement -> None).
-  * ssimu2_info — av1q-essential's flavor: binary comes from cfg
-    (discovered once in engine setup), failures print an error line,
-    honors --metric-every.
-When no persistent ref_index is given, a temp source index is created
-and deleted so FFVship never writes index files next to the videos.
+One shared runner serves both engines' entry points, which differ only
+in where their scratch files go and in essential's --metric-every:
+  * measure_ssimu2_display — av1q's, scratch under the shared cache root.
+  * ssimu2_info — av1q-essential's, scratch under its own cache root.
+A skip, whether deliberate or FFVship failing, prints one line per file
+and returns None. When no persistent ref_index is given, a temp source
+index is created and deleted so FFVship never writes index files next
+to the videos.
 """
 
 import json
@@ -20,9 +20,10 @@ import subprocess
 
 from .probe import frame_geometry
 from .tools import ffprobe_exe, find_ffvship_optional
-from .ui import DIM, ORANGE, RED, RESET
+from .ui import DIM, RESET, label
 from .util import (
-    _temp_files, ascii_path, make_temp_log, suppress_win_error_dialog,
+    _temp_files, ascii_path, make_temp_log, scan_budget,
+    suppress_win_error_dialog,
 )
 
 # Per-file probe results, memoized so the source of a long file is only
@@ -39,12 +40,12 @@ _announced = set()
 
 
 def _skip(ref, reason):
-    """Announce a deliberate skip once, in the label column every other
-    line uses, and return None for the caller to hand back."""
+    """Announce a skip once per file and reason, in the label column
+    every other line uses, and return None for the caller to hand back."""
     key = (_file_key(ref), reason)
     if key not in _announced:
         _announced.add(key)
-        print(f" {ORANGE}{'ssimu2':<10}{RESET}{DIM}skipped: {reason}{RESET}")
+        print(f"{label('ssimu2')}{DIM}skipped: {reason}{RESET}")
     return None
 
 
@@ -66,9 +67,10 @@ def _geometry(path):
     return _geometries[key]
 
 
-def _video_frame_count(path):
+def _video_frame_count(path, duration=None):
     """Video packet count via demux only (packets stand in for frames,
-    same as the keyframe/complexity scans). None when uncountable."""
+    same as the keyframe/complexity scans). None when uncountable.
+    `duration` sizes the whole-file pass's budget (scan_budget)."""
     key = _file_key(path)
     if key is None:
         return None
@@ -80,7 +82,8 @@ def _video_frame_count(path):
              "-count_packets", "-show_entries", "stream=nb_read_packets",
              "-of", "default=nw=1:nk=1", str(path)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace", timeout=600,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=scan_budget(duration),
         )
         if r.returncode != 0:
             return None
@@ -183,15 +186,14 @@ def _comparability_gap(ref, dist, meta):
             return (f"{want_w}x{want_h} source vs {dist_geo['w']}x"
                     f"{dist_geo['h']} encode — FFVship would rescale")
 
-    n_ref = _video_frame_count(ref)
-    n_dist = _video_frame_count(dist)
+    n_ref = _video_frame_count(ref, meta.get("duration"))
+    n_dist = _video_frame_count(dist, meta.get("duration"))
     if n_ref is not None and n_dist is not None and n_ref != n_dist:
         return (f"{n_ref} vs {n_dist} frames — pairing would drift")
     return None
 
 
-def _run_ffvship(ref, dist, meta, cache_dir, exe,
-                 ref_index=None, every=1, verbose=False):
+def _run_ffvship(ref, dist, meta, cache_dir, exe, ref_index=None, every=1):
     """Run FFVship and parse its per-frame JSON. Returns {'mean', 'p5'}
     or None on any failure (empty/non-finite scores included).
 
@@ -203,13 +205,12 @@ def _run_ffvship(ref, dist, meta, cache_dir, exe,
     reference so a source measured repeatedly (search probes, verify,
     refine) is only indexed once; the distorted index is per-encode.
     Index files live under <cache_dir>/_ffindex, never next to videos.
-    `verbose` covers FFVship's own failures; a deliberate skip always
-    prints its reason.
     """
-    # Refuse the measurement when the two sides aren't comparable. The
-    # reason is always printed, on both engines: a column that vanishes
-    # without saying why reads as a broken FFVship, and the reason is
-    # usually something about the source worth knowing.
+    if not ref.exists() or not dist.exists():
+        return None
+    # Every skip prints its reason once per file, deliberate or not: a
+    # column that vanishes without saying why reads as a broken FFVship,
+    # and the reason is usually something about the source worth knowing.
     gap = _comparability_gap(ref, dist, meta)
     if gap:
         return _skip(ref, gap)
@@ -231,7 +232,7 @@ def _run_ffvship(ref, dist, meta, cache_dir, exe,
     log = make_temp_log(cache_dir, "ssimu2", "json")
     idx_dir = cache_dir / "_ffindex"
     if ref_index:
-        idx_dir.mkdir(parents=True, exist_ok=True)
+        ref_index.parent.mkdir(parents=True, exist_ok=True)
         src_idx = ref_index
     else:
         src_idx = make_temp_log(idx_dir, "src", "ffindex")
@@ -257,20 +258,19 @@ def _run_ffvship(ref, dist, meta, cache_dir, exe,
                 text=True, encoding="utf-8", errors="replace",
             )
         if r.returncode != 0:
-            if verbose:
-                tail = "\n".join(
-                    ((r.stderr or "") + (r.stdout or "")).splitlines()[-40:]
-                )
-                print(f" {RED}SSIMU2 error: FFVship exit {r.returncode}\n{tail}{RESET}")
-            return None
+            # The exit code only: the output tail names the per-probe
+            # encode, which would defeat the once-per-file announcement.
+            return _skip(ref, f"FFVship failed (exit {r.returncode})")
         result = parse_ssimu2_json(log)
         if not math.isfinite(result["mean"]):
-            return None
+            return _skip(ref, "FFVship returned no finite scores")
         return result
-    except (OSError, json.JSONDecodeError, ValueError) as e:
-        if verbose:
-            print(f" {RED}SSIMU2 error: {e}{RESET}")
-        return None
+    except OSError as e:
+        # Either FFVship could not start, or it exited 0 without writing
+        # its score log. The error type only, for the same reason.
+        return _skip(ref, f"FFVship failed ({type(e).__name__})")
+    except ValueError:
+        return _skip(ref, "FFVship wrote an unreadable score log")
     finally:
         cleanup = [log, dst_idx] if ref_index else [log, src_idx, dst_idx]
         cleanup += [lk for lk in (ref_link, dist_link) if lk]
@@ -286,8 +286,9 @@ def _run_ffvship(ref, dist, meta, cache_dir, exe,
 def measure_ssimu2_display(ref, dist, meta, cache_dir, ref_index=None):
     """SSIMULACRA2 of dist vs ref for av1q's info column.
 
-    Returns {'mean', 'p5'} or None on any failure — a missing binary or
-    a broken measurement must never affect the pipeline.
+    Returns {'mean', 'p5'} or None. Display only, never used in
+    decisions: no FFVship binary means no column, silently; a failed
+    measurement means no column, with its reason printed once per file.
     """
     exe = find_ffvship_optional()
     if not exe:
@@ -296,16 +297,15 @@ def measure_ssimu2_display(ref, dist, meta, cache_dir, ref_index=None):
 
 
 def ssimu2_info(ref, dist, meta, cfg, ref_index=None):
-    """SSIMULACRA2 of dist vs ref for av1q-essential's info column.
-
-    Returns {'mean', 'p5'} or None. Display only — never used in
-    decisions: no FFVship binary means no column, a failed measurement
-    means no column. Uncached on purpose (informational, and FFVship
-    is fast on the GPU).
+    """SSIMULACRA2 of dist vs ref for av1q-essential's info column: the
+    same contract as measure_ssimu2_display, with scratch under the
+    essential cache root and --metric-every honored. Uncached on purpose
+    (informational, and FFVship is fast on the GPU).
     """
-    if not cfg.get("ffvship_exe") or not dist.exists() or not ref.exists():
+    exe = find_ffvship_optional()
+    if not exe:
         return None
     return _run_ffvship(
-        ref, dist, meta, cfg["e_cache_dir"], cfg["ffvship_exe"],
-        ref_index=ref_index, every=cfg.get("metric_every", 1), verbose=True,
+        ref, dist, meta, cfg["e_cache_dir"], exe,
+        ref_index=ref_index, every=cfg.get("metric_every", 1),
     )

@@ -6,10 +6,12 @@ import math
 import subprocess
 import time
 
-from .probe import detect_hwaccel, get_fps, hw_decode_unsafe
+from .probe import UNTAGGED, detect_hwaccel, get_fps, hw_decode_unsafe
 from .tools import ffmpeg_exe, ffprobe_exe
 from .ui import RED, RESET
-from .util import _temp_files, atomic_write_json, make_temp_log, run_cmd
+from .util import (
+    _temp_files, atomic_write_json, escape_filter_path, make_temp_log, run_cmd,
+)
 
 
 def _sw_decode_only(path):
@@ -71,13 +73,12 @@ def measure_vmaf(ref, dist, meta, subsample, threads, cache_dir):
             # zscale must know the input transfer/primaries/matrix to
             # linearize, so fill in only the tags the stream is missing
             # with HDR defaults before the conversion.
-            unk = {"", "unknown", "unspecified", "reserved"}
             tags = []
-            if meta["ct"] in unk:
+            if meta["ct"] in UNTAGGED:
                 tags.append("color_trc=smpte2084")
-            if meta["cp"] in unk:
+            if meta["cp"] in UNTAGGED:
                 tags.append("color_primaries=bt2020")
-            if meta["cs"] in unk:
+            if meta["cs"] in UNTAGGED:
                 tags.append("colorspace=bt2020nc")
             if tags:
                 f.append("setparams=" + ":".join(tags))
@@ -100,10 +101,12 @@ def measure_vmaf(ref, dist, meta, subsample, threads, cache_dir):
 
     th = f":n_threads={threads}" if threads > 1 else ""
     model = "vmaf_4k_v0.6.1" if meta["h"] >= 2160 else "vmaf_v0.6.1"
-    log_esc = log.as_posix().replace("\\", "/").replace("'", "\\'").replace(":", "\\:")
 
     try:
         hw = detect_hwaccel()
+        # Probed from each file, never read from meta: on the sample path
+        # ref is the search source (essential's is the x264 clean sample),
+        # not the file meta describes.
         if hw and (_sw_decode_only(ref) or _sw_decode_only(dist)):
             hw = None
         attempts = [hw, None] if hw else [None]
@@ -121,7 +124,7 @@ def measure_vmaf(ref, dist, meta, subsample, threads, cache_dir):
                 f"[0:v]{pf_ref}[r];[1:v]{pf_dist}[d];"
                 f"[d][r]libvmaf=model=version={model}:"
                 f"n_subsample={subsample}{th}:"
-                f"log_fmt=json:log_path='{log_esc}'",
+                f"log_fmt=json:log_path={escape_filter_path(log)}",
                 "-f", "null", "-",
             ]
             r = subprocess.run(
@@ -153,7 +156,9 @@ def measure_vmaf(ref, dist, meta, subsample, threads, cache_dir):
             "p5": float(p5) if p5 is not None else float("nan"),
         }
 
-    except RuntimeError as e:
+    except (RuntimeError, OSError, ValueError) as e:
+        # OSError and ValueError: an exit-0 run whose log is missing or
+        # torn is the same failure, not a reason to fail the whole file.
         print(f" {RED}VMAF error: {e}{RESET}")
         try:
             if log.exists():

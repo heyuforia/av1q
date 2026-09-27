@@ -128,7 +128,7 @@ def make_temp_log(cache_dir, prefix, ext):
 
 def escape_filter_path(path):
     """Escape a Path for use as a log-file option inside an ffmpeg filter
-    graph (scdet/cropdetect metadata).
+    graph (scdet/cropdetect metadata, libvmaf's log).
 
     A filter graph is parsed twice, and each pass has its own special
     characters: the option value's separator ':' (which collides with a

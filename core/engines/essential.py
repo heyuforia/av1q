@@ -6,7 +6,6 @@ VFR sources gated out (the Y4M pipe is CFR-only)."""
 
 import hashlib
 import math
-import os
 import re
 import subprocess
 import sys
@@ -488,13 +487,13 @@ class EssentialEngine(Engine):
 
     def setup(self, cfg):
         cfg["encoder_exe"] = find_encoder()  # raises FileNotFoundError
-        # Optional: powers the SSIMULACRA2 info column only.
-        cfg["ffvship_exe"] = find_ffvship_optional()
-        cfg["vmaf_threads"] = os.cpu_count() or 4
+        # Optional, powers the SSIMULACRA2 info column only. Probed (and
+        # on first run downloaded) here so that happens before the seed
+        # prompt, not mid-search; the result is memoized.
+        find_ffvship_optional()
 
     def make_dirs(self, cfg):
         cfg["e_cache_dir"].mkdir(parents=True, exist_ok=True)
-        (cfg["e_cache_dir"] / "_ffindex").mkdir(parents=True, exist_ok=True)
 
     def gate(self, source, meta):
         # Y4M is CFR-only and FFVship pairs frames by index, so a
@@ -532,14 +531,6 @@ class EssentialEngine(Engine):
 
     def ssimu2_info(self, ref, dist, meta, cfg, ref_index=None):
         return ssimu2.ssimu2_info(ref, dist, meta, cfg, ref_index=ref_index)
-
-    def full_ref_index(self, cfg, source, file_hash, size):
-        return cfg["e_cache_dir"] / "_ffindex" / f"{file_hash}.ffindex"
-
-    def sample_ref_index(self, cfg, sample_src):
-        # The sample concat gets its own persistent index (it's a cached
-        # file reused across probes within this search).
-        return cfg["e_cache_dir"] / "_ffindex" / f"{sample_src.stem}.ffindex"
 
     def dst_name(self, stem, q, token, ext):
         return f"{stem}_CRF{crf_str(q)}{token}{ext}"

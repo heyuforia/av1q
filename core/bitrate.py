@@ -2,10 +2,12 @@
 the configured floor into a sample-bitrate threshold."""
 
 import subprocess
+from pathlib import Path
 
 from .calibrate import RATIO_MAX, RATIO_MIN
-from .probe import probe_video
 from .tools import ffprobe_exe
+from .ui import DIM, RESET, label
+from .util import scan_budget
 
 
 def calc_kbps(size_bytes, duration):
@@ -14,31 +16,42 @@ def calc_kbps(size_bytes, duration):
     return int((size_bytes * 8) / 1000 / duration)
 
 
-def video_kbps(filepath, duration=None):
-    """Video-only bitrate by summing video packet sizes.
+def video_kbps(filepath, duration):
+    """Video-only bitrate by summing video packet sizes, or None.
 
     File-size / duration counts muxed audio + subs, which breaks floor
     comparisons against sample bitrates (samples are -an video-only).
+    A failed read prints its reason: None here switches the floor checks
+    off for this encode, which must not happen silently.
     """
+    if not duration or duration < 1.0:
+        return None
+    timeout = scan_budget(duration)
+    why = None
     try:
-        if duration is None:
-            duration = probe_video(filepath)["duration"]
-        if not duration or duration < 1.0:
-            return None
         r = subprocess.run(
             [ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
              "-show_entries", "packet=size", "-of", "csv=p=0", str(filepath)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace", timeout=300,
+            text=True, encoding="utf-8", errors="replace", timeout=timeout,
         )
         if r.returncode != 0:
-            return None
-        total = sum(int(l) for l in r.stdout.splitlines() if l.strip())
-        if total <= 0:
-            return None
-        return int(total * 8 / 1000 / duration)
-    except Exception:
-        return None
+            tail = (r.stderr or "").strip().splitlines()
+            why = f"exit {r.returncode}" + (f": {tail[-1]}" if tail else "")
+        else:
+            total = sum(int(l) for l in r.stdout.splitlines() if l.strip())
+            if total > 0:
+                return int(total * 8 / 1000 / duration)
+            why = "no video packets"
+    except subprocess.TimeoutExpired:
+        why = f"timed out after {timeout}s"
+    except (OSError, ValueError) as e:
+        why = str(e)
+    print(
+        f"{label('bitrate')}{DIM}video bitrate of {Path(filepath).name}"
+        f" unreadable ({why}){RESET}"
+    )
+    return None
 
 
 def measured_kbps(path, duration, tag):

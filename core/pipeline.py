@@ -250,7 +250,7 @@ def process_videos(cfg, engine):
     all_qs = grid.span(min_q, max_q)
 
     for idx, filepath in enumerate(files, 1):
-        sample_src = sample_concat = None
+        sample_src = sample_concat = sample_idx = None
         _file_error = False
         search_state = None
         try:
@@ -546,7 +546,7 @@ def process_videos(cfg, engine):
 
             # Persistent FFMS2 reference index for this source (SSIMU2
             # info column only — display, never gating).
-            full_idx = engine.full_ref_index(cfg, filepath, file_hash, in_sz)
+            full_idx = engine.full_ref_index(cfg, file_hash)
 
             # Resume only from the cache's `recommended` block, written
             # when a search completes. A bare output file at some
@@ -661,6 +661,10 @@ def process_videos(cfg, engine):
                     if not sample_src:
                         print(f"{label('fallback')}Extraction failed, using full encode")
                         sample_scenes = None
+                    else:
+                        # Named while the file exists (the name carries
+                        # its size); deleted with it below.
+                        sample_idx = engine.sample_ref_index(cfg, sample_src)
                 else:
                     print(f"{label('scenes')}Using full VMAF")
             elif existing_q is None:
@@ -831,7 +835,7 @@ def process_videos(cfg, engine):
                     probe_fn=probe_video,
                     s2_fn=lambda ref, dist, m, ri: engine.ssimu2_info(
                         ref, dist, m, cfg, ref_index=ri),
-                    s2_ref_index=engine.sample_ref_index(cfg, sample_src),
+                    s2_ref_index=sample_idx,
                 )
                 t_vmaf += vt
                 for p in sample_enc_cache.values():
@@ -1319,9 +1323,12 @@ def process_videos(cfg, engine):
 
             # Final SSIMU2 info: reuse the verify/refine measurement of
             # this exact encode when there is one, otherwise (full-file
-            # search path) measure once now.
-            extra_s2 = s2_seen.get(best_q)
-            if extra_s2 is None:
+            # search path) measure once now. Membership, not the value:
+            # a None there is a skip or a failure already announced, and
+            # measuring again would only repeat it.
+            if best_q in s2_seen:
+                extra_s2 = s2_seen[best_q]
+            else:
                 t0 = time.time()
                 extra_s2 = engine.ssimu2_info(
                     filepath, final, meta, cfg, ref_index=full_idx,
@@ -1377,6 +1384,9 @@ def process_videos(cfg, engine):
             print(f" {CROSS} {e}")
         finally:
             cleanup_temp()
+            # A failed file keeps its samples for the rerun; a finished
+            # one deletes them. A partial clip set is a temp and is
+            # already gone either way.
             if not _file_error:
                 for p in (sample_src, sample_concat):
                     if p:
@@ -1385,6 +1395,14 @@ def process_videos(cfg, engine):
                                 p.unlink()
                         except OSError:
                             pass
+            # The search source's index goes with the file it indexes:
+            # left behind, it is junk no later run ever reads.
+            if sample_idx:
+                try:
+                    if not sample_src.exists():
+                        sample_idx.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     print(SEP)
     if stats["proc"] > 0:

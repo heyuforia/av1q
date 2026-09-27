@@ -515,20 +515,6 @@ class SvtAv1FfmpegEngine(Engine):
             ref, dist, meta, cfg["cache_dir"], ref_index=ref_index,
         )
 
-    def full_ref_index(self, cfg, source, file_hash, size):
-        # Stem + size keeps the index stable across runs but distinct
-        # when the underlying file changes.
-        return cfg["cache_dir"] / "_ffindex" / f"{source.stem}_{size}.ffindex"
-
-    def sample_ref_index(self, cfg, sample_src):
-        try:
-            return (
-                cfg["cache_dir"] / "_ffindex"
-                / f"{sample_src.stem}_{sample_src.stat().st_size}.ffindex"
-            )
-        except OSError:
-            return None
-
     def dst_name(self, stem, q, token, ext):
         return f"{stem}_CQ{q}{token}{ext}"
 

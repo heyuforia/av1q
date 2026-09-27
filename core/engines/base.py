@@ -120,15 +120,30 @@ class Engine:
         """Create engine-specific cache directories (input/output dirs
         are the pipeline's job). Default: nothing extra."""
 
-    def full_ref_index(self, cfg, source, file_hash, size):
-        """Persistent FFMS2 reference-index path for a source file (the
-        SSIMU2 info column re-measures it at verify/refine/final)."""
-        raise NotImplementedError
+    # FFMS2 reference indexes for the SSIMU2 info column, under this
+    # engine's cache root. FFVship reads index paths as ANSI argv, so
+    # names are hash-based and never carry a source's (possibly
+    # non-Latin) stem. It also reuses an index without checking it
+    # against the file, so each name changes when its file does.
+
+    def full_ref_index(self, cfg, file_hash):
+        """Persistent index for a source file (the SSIMU2 column
+        re-measures it at verify, refine and final)."""
+        return self.cache_root(cfg) / "_ffindex" / f"{file_hash}.ffindex"
 
     def sample_ref_index(self, cfg, sample_src):
-        """Persistent FFMS2 reference-index path for the sample concat
-        (reused across all probes within one search), or None."""
-        raise NotImplementedError
+        """Index for the search source, reused across one search's
+        probes, or None when the file can't be read. It lives exactly
+        as long as the file it indexes: the pipeline deletes the two
+        together."""
+        try:
+            size = sample_src.stat().st_size
+        except OSError:
+            return None
+        return (
+            self.cache_root(cfg) / "_ffindex"
+            / f"{sample_src.stem}_{size}.ffindex"
+        )
 
     def gate(self, source, meta):
         """Reason string when this engine cannot process the source
