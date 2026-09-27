@@ -11,14 +11,31 @@ from .util import atomic_write_json, clamp
 
 
 def load_global_calibration(cache_dir):
-    """Load cross-file rolling averages used as defaults for new files."""
+    """Load cross-file rolling averages used as defaults for new files.
+    A missing, unreadable or malformed file is an empty cohort."""
     path = cache_dir / "_global_calibration.json"
     if not path.exists():
         return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        g = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
         return {}
+    return g if isinstance(g, dict) else {}
+
+
+def file_calibration(cache, enc_tag):
+    """This file's calibration block when it was measured under these
+    encode settings (enc_tag), else None.
+
+    Preset, film grain, tune, encoder flags and crop change every
+    quantity in the block: the slope, the decay, and how the sample
+    encodes against the full file. A block from other settings describes
+    another encode, so no reader takes it as this one's, and the next
+    write replaces it whole."""
+    cal = cache.get("calibration")
+    if isinstance(cal, dict) and cal.get("enc_tag") == enc_tag:
+        return cal
+    return None
 
 
 # Pseudo-count for shrinking the cohort VMAF offset toward its structural
@@ -29,6 +46,15 @@ def load_global_calibration(cache_dir):
 # (the "cohort n=1" failure). Trust ramps with evidence: n=1 → 33%,
 # n=10 → 83%, n=50 (N_CAP) → 96%.
 COHORT_SHRINK_K = 2
+
+# Cap on a cohort's count, so the rolling average keeps weighting new
+# files at 1/N_CAP at least and stays responsive to drift (an encoder
+# upgrade, a preset change) instead of freezing on its history.
+N_CAP = 50
+
+# Sanity range for a sample→full VMAF offset: a value outside it is a
+# mis-measured probe, never a real selection bias, and is skipped.
+OFFSET_MAX = 3.0
 
 
 # Cohort key names per sampling mode. Scene-selected and evenly-spaced
@@ -103,17 +129,17 @@ def calibration_offset(per_file_cal, global_cal, prior_center=0.0, even=False,
     share an average.
 
     Returns (offset, source_label); (None, None) when neither source has
-    a usable value and the center is 0. Values outside ±3.0 are treated
-    as corrupt and skipped.
+    a usable value and the center is 0. Values outside ±OFFSET_MAX are
+    treated as corrupt and skipped.
     """
     if isinstance(per_file_cal, dict):
         o = per_file_cal.get("vmaf_offset")
-        if isinstance(o, (int, float)) and -3.0 <= o <= 3.0:
+        if isinstance(o, (int, float)) and -OFFSET_MAX <= o <= OFFSET_MAX:
             return float(o), "per-file"
     if isinstance(global_cal, dict):
         k_off, k_n = cohort_keys("offset", even, mini)
         g_off = global_cal.get(k_off)
-        if isinstance(g_off, (int, float)) and -3.0 <= g_off <= 3.0:
+        if isinstance(g_off, (int, float)) and -OFFSET_MAX <= g_off <= OFFSET_MAX:
             n = global_cal.get(k_n)
             if not isinstance(n, int) or n < 1:
                 n = 1
@@ -200,16 +226,15 @@ def decay_prior(per_file_cal, global_cal, default=DEFAULT_BITRATE_DECAY):
     return None, None
 
 
-def vmaf_slope_prior(per_file_cal, enc_tag):
-    """The VMAF slope this file's last search measured, for a refine loop
-    that runs without a search this time (a resumed file), or None.
+def vmaf_slope_prior(per_file_cal):
+    """The VMAF slope this file's last search measured under these
+    settings (per_file_cal from file_calibration), for a refine loop that
+    runs without a search this time (a resumed file), or None.
 
     Per file only, never a cohort average: how fast VMAF falls per
-    quantizer step is a property of this source's content. Trusted only
-    when the block was written under the same encode settings, because
-    preset, grain and crop change the slope too.
+    quantizer step is a property of this source's content.
     """
-    if not isinstance(per_file_cal, dict) or per_file_cal.get("enc_tag") != enc_tag:
+    if not isinstance(per_file_cal, dict):
         return None
     s = per_file_cal.get("vmaf_slope")
     if isinstance(s, (int, float)) and VMAF_SLOPE_MIN <= s <= VMAF_SLOPE_MAX:
@@ -291,17 +316,14 @@ def update_global_calibration(cache_dir, vmaf_offset=None, ratio=None,
     Per-file calibration only helps on re-runs of the same file. The
     cohort cache gives new files an informed starting point so first-
     encounter sample-vs-full mispredict is corrected up front, avoiding
-    a wasted second full encode. n is capped so the average stays
-    responsive to drift (e.g. encoder/preset changes).
+    a wasted second full encode. n is capped at N_CAP.
 
     `even` and `mini` route the offset and ratio into that sampling
     mode's and plan's own keys (see cohort_keys). Decay is skipped by the
-    split on purpose: it
-    measures how this ENGINE's quantizer maps to bitrate, which is the
-    same physics however the file was sampled, so both modes feed and
-    read one shared average.
+    split on purpose: it measures how this ENGINE's quantizer maps to
+    bitrate, which is the same physics however the file was sampled, so
+    both modes feed and read one shared average.
     """
-    N_CAP = 50
     g = load_global_calibration(cache_dir)
 
     def roll(key, n_key, val):

@@ -28,9 +28,10 @@ from .analyze import scene_analysis
 from .bitrate import calc_kbps, video_kbps
 from .cache import load_cache, recommended_matches
 from .calibrate import (
-    DECAY_MAX, DECAY_MIN, RATIO_MAX, RATIO_MIN, calibration_offset,
-    decay_prior, ratio_prior, load_global_calibration,
-    scene_offset_center, update_global_calibration, vmaf_slope_prior,
+    DECAY_MAX, DECAY_MIN, OFFSET_MAX, RATIO_MAX, RATIO_MIN,
+    calibration_offset, decay_prior, file_calibration, ratio_prior,
+    load_global_calibration, scene_offset_center, update_global_calibration,
+    vmaf_slope_prior,
 )
 from .constants import (
     BITRATE_BAND, COMPLEXITY_MARGIN_FLOOR, DEFAULT_VMAF_SLOPE,
@@ -374,15 +375,17 @@ def process_videos(cfg, engine):
                             d = dst_path(c)
                             if not d.exists():
                                 continue
-                            entry = cache["entries"].get(grid.fmt(c))
-                            if not (entry and engine.vmaf_key_base in entry
-                                    and entry.get("size") == d.stat().st_size):
+                            score = core_vmaf.stored_vmaf(
+                                cache["entries"].get(grid.fmt(c)),
+                                engine.vmaf_key_base, d.stat().st_size,
+                            )
+                            if score is None:
                                 continue
                             in_band = (
                                 outcome is None
                                 and isinstance(rec_target, (int, float))
                                 and rec_target - cfg["vmaf_tolerance"]
-                                <= entry[engine.vmaf_key_base]
+                                <= score["mean"]
                                 <= rec_target + VMAF_OVERSHOOT
                             )
                             if c == rec.get(engine.rec_q_key) or in_band:
@@ -647,13 +650,11 @@ def process_videos(cfg, engine):
                     f" from previous search{seed_note}"
                 )
 
-            sample_scenes = sample_src = None
+            sample_scenes = sample_src = sample_at_best = None
             even_sampling = False
             complexity = []  # per-window complexity; used for the margin estimate
             plan = sampling_plan(meta["duration"], cfg)
-            # Mini-plan runs keep their own cohort (see cohort_keys). Set
-            # outside the sampling branch: a resumed search still rolls
-            # its cached sample measurements in after the verify.
+            # Mini-plan runs keep their own cohort (see cohort_keys).
             mini_sampling = bool(plan) and plan[2] == "mini"
 
             if existing_q is None and plan:
@@ -774,6 +775,11 @@ def process_videos(cfg, engine):
             )
             print(f"{label('target')}VMAF {BOLD}{target:.1f}{RESET}{floor_str}")
 
+            # What this file measured before, under these settings only
+            # (see file_calibration). Every per-file prior reads it, and
+            # the calibration write after the verify extends it.
+            file_cal = file_calibration(cache, enc_tag)
+
             # Engine-cohort bitrate-decay prior for the search's floor
             # model: how fast THIS encoder's bitrate falls per quantizer
             # step (Essential's CRF encodes richer than mainline's CQ at
@@ -781,7 +787,7 @@ def process_videos(cfg, engine):
             # the engine instead of the generic ±6 ≈ 2× cold-start, which
             # cost essential 1-2 extra probes per file.
             dec_prior, dec_src = decay_prior(
-                cache.get("calibration"), global_cal, default=engine_decay
+                file_cal, global_cal, default=engine_decay
             )
             if (min_kbps and dec_prior is not None
                     and abs(dec_prior - engine_decay)
@@ -813,7 +819,7 @@ def process_videos(cfg, engine):
                 # doesn't apply to an evenly-spaced sample.
                 sample_target = target
                 off, off_src = calibration_offset(
-                    cache.get("calibration"), global_cal,
+                    file_cal, global_cal,
                     prior_center=(
                         0.0 if even_sampling
                         else scene_offset_center(bias, cfg["bitrate_margin"])
@@ -871,7 +877,7 @@ def process_videos(cfg, engine):
                 # cushion that on a real file sat 9% off the truth, capped
                 # the search a step early and cost a second full encode.
                 rat_prior, rat_src = ratio_prior(
-                    cache.get("calibration"), global_cal, search_margin,
+                    file_cal, global_cal, search_margin,
                     even=even_sampling, mini=mini_sampling,
                 )
                 if (min_kbps and rat_prior is not None and rat_src != "per-file"
@@ -881,7 +887,7 @@ def process_videos(cfg, engine):
                         f" {DIM}({rat_src}){RESET}"
                     )
 
-                best_q, _, _, vt, search_state = core_search.search(
+                best_q, sample_at_best, _, vt, search_state = core_search.search(
                     sample_src, meta, sample_target, cache, cp,
                     do_enc_sample, search_cfg, engine, tag="sample",
                     decay_prior=dec_prior, ratio_prior=rat_prior,
@@ -930,6 +936,25 @@ def process_videos(cfg, engine):
                     **{k: cfg[k] for k in engine.rec_extra_keys},
                     "crop": meta["crop"], "outcome": "pending",
                 }
+                # The sample half of the calibration pair, which the
+                # verify completes: what the search measured at its
+                # answer, the quantizer it measured it at, and the cohort
+                # the pair rolls into, since a resumed run skips the
+                # sampling that decides it. Kept here, not read back from
+                # the entries, where a later search can measure the same
+                # quantizer under other settings or another sample.
+                # Absent when there is no pair: a full-file search, or a
+                # sample search whose answer was chosen without a probe.
+                if (sample_at_best
+                        and math.isfinite(sample_at_best.get("mean", float("nan")))):
+                    pair = {
+                        "q": grid.fmt(best_q), "vmaf": sample_at_best["mean"],
+                        "even": even_sampling, "mini": mini_sampling,
+                    }
+                    kbps = search_state.get("kbps", {}).get(best_q)
+                    if kbps:
+                        pair["kbps"] = kbps
+                    cache["recommended"]["sample_pair"] = pair
                 atomic_write_json(cp, cache)
 
             if cfg["dry_run"]:
@@ -989,99 +1014,96 @@ def process_videos(cfg, engine):
                     f"{size_kbps_suffix(dst_path(best_q), actual_kbps_now)}"
                 )
 
-            # Persist sample↔full calibration BEFORE the refine loop so a
-            # resumed or repeated run of this file starts with both the
-            # bitrate ratio and the VMAF offset.
-            entry_at_best = cache.get("entries", {}).get(grid.fmt(best_q), {})
-            sample_kbps_at_best = entry_at_best.get(f"sample_kbps_{enc_tag}")
-            sample_vmaf_at_best = entry_at_best.get(
-                f"sample_{engine.vmaf_key_base}"
-            )
+            # Persist this pass's measurements BEFORE the refine loop, so
+            # a resumed or repeated run of this file starts from them. The
+            # block extends file_cal, the one written under these
+            # settings; a block from other settings is replaced whole. A
+            # resumed file runs no search, so refine starts from the slope
+            # the file's own search stored.
+            stored_slope = None if search_state else vmaf_slope_prior(file_cal)
+            cal_now = dict(file_cal or {})
+            # Measurements the block did not hold yet. Only these reach
+            # the cohort, so each file counts once per settings in it,
+            # however often it is resumed or searched again.
+            new = {}
 
-            cal_now = cache.get("calibration")
-            # A resumed file runs no search, so refine starts from the
-            # slope the file's own search measured. Read before the write
-            # below stamps the block with this run's settings.
-            stored_slope = (
-                None if search_state else vmaf_slope_prior(cal_now, enc_tag)
-            )
-            cal_now = dict(cal_now) if isinstance(cal_now, dict) else {}
-            cal_updated = False
-            fresh_offset = None
-            fresh_ratio = None
-            fresh_decay = None
-
-            # isinstance guards: these come straight from the JSON cache,
-            # and a corrupt value must be ignored (like every other
-            # calibration read), not crash the file on the arithmetic.
-            if (isinstance(sample_kbps_at_best, (int, float))
-                    and actual_kbps_now and sample_kbps_at_best > 0):
-                ratio = actual_kbps_now / sample_kbps_at_best
-                if RATIO_MIN <= ratio <= RATIO_MAX:
-                    cal_now["ratio"] = ratio
-                    cal_updated = True
-                    fresh_ratio = ratio
-                    print(
-                        f"{label('calibr')}sample {sample_kbps_at_best}kbps ->"
-                        f" video {actual_kbps_now}kbps (ratio {ratio:.2f})"
-                    )
-
-            if (isinstance(sample_vmaf_at_best, (int, float)) and best_vmaf
-                    and math.isfinite(sample_vmaf_at_best)
-                    and math.isfinite(best_vmaf.get("mean", float("nan")))):
-                offset = sample_vmaf_at_best - best_vmaf["mean"]
-                if -3.0 <= offset <= 3.0:
-                    cal_now["vmaf_offset"] = offset
-                    cal_updated = True
-                    fresh_offset = offset
-
-            if search_state and search_state.get("vmaf_slope"):
-                sl = search_state["vmaf_slope"]
-                if VMAF_SLOPE_MIN <= sl <= VMAF_SLOPE_MAX:
+            if search_state:
+                sl = search_state.get("vmaf_slope")
+                if sl and VMAF_SLOPE_MIN <= sl <= VMAF_SLOPE_MAX:
                     cal_now["vmaf_slope"] = sl
-                    cal_updated = True
+                # Bitrate decay actually measured by this search's probes
+                # (never the cold-start default: search reports those as
+                # None).
+                md = search_state.get("measured_decay")
+                if isinstance(md, (int, float)) and DECAY_MIN <= md <= DECAY_MAX:
+                    if "decay" not in cal_now:
+                        new["decay"] = md
+                    cal_now["decay"] = md
 
-            # Bitrate decay actually measured by this search's probes
-            # (never the cold-start default — search reports those as
-            # None) feeds the per-file calibration and the engine cohort.
-            md = search_state.get("measured_decay") if search_state else None
-            if isinstance(md, (int, float)) and DECAY_MIN <= md <= DECAY_MAX:
-                cal_now["decay"] = md
-                cal_updated = True
-                fresh_decay = md
+            # The sample→full pair, at the search's answer: the sample
+            # half the search recorded there (sample_pair), the full half
+            # this verify, at the same quantizer only. Each half is
+            # measured once per block; a later pass that verifies again
+            # (a resume, an --overwrite rerun) already holds it, and after
+            # refine moved the file its quantizer is not the pair's any
+            # more, so a half that failed to measure the first time is
+            # never taken from another quantizer. The isinstance guards:
+            # these come straight from the JSON cache, and a corrupt
+            # value must be ignored like every other calibration read,
+            # not crash the file on the arithmetic.
+            pair = cache["recommended"].get("sample_pair")
+            if not (isinstance(pair, dict) and pair.get("q") == grid.fmt(best_q)):
+                pair = None
+            if pair:
+                sample_kbps = pair.get("kbps")
+                sample_vmaf = pair.get("vmaf")
+                if ("ratio" not in cal_now and actual_kbps_now
+                        and isinstance(sample_kbps, (int, float))
+                        and sample_kbps > 0):
+                    ratio = actual_kbps_now / sample_kbps
+                    if RATIO_MIN <= ratio <= RATIO_MAX:
+                        new["ratio"] = ratio
+                        print(
+                            f"{label('calibr')}sample {sample_kbps}kbps ->"
+                            f" video {actual_kbps_now}kbps (ratio {ratio:.2f})"
+                        )
+                if ("vmaf_offset" not in cal_now and best_vmaf
+                        and isinstance(sample_vmaf, (int, float))
+                        and math.isfinite(sample_vmaf)
+                        and math.isfinite(best_vmaf.get("mean", float("nan")))):
+                    offset = sample_vmaf - best_vmaf["mean"]
+                    if -OFFSET_MAX <= offset <= OFFSET_MAX:
+                        new["vmaf_offset"] = offset
+                if "ratio" in new or "vmaf_offset" in new:
+                    cal_now[engine.cal_q_key] = best_q
+            cal_now.update(new)
 
-            if cal_updated:
-                cal_now[engine.cal_q_key] = best_q
+            if cal_now != (file_cal or {}):
                 cal_now["enc_tag"] = enc_tag
                 cal_now["t"] = time.time()
                 cache["calibration"] = cal_now
                 atomic_write_json(cp, cache)
 
-                # Roll fresh measurements into the cohort so subsequent
-                # new files start with an informed prior. Only values
-                # computed in this pass are rolled in, never ones merely
-                # carried in the calibration block; a resumed file
-                # recomputes its offset and ratio from cached scores, so
-                # each run that reaches here rolls them in once more.
-                # (Each engine has its own cohort file; different
-                # encoders must never share calibration.) The offset and
-                # ratio go into THIS file's sampling-mode cohort: mixing
-                # representative (evenly-spaced) measurements into the
-                # scene cohort would dilute the selection bias it exists
-                # to measure and mis-aim every scene-sampled file after
-                # them. Mini-plan runs keep their own cohort the same way.
-                # Decay is engine physics, not selection bias — every
-                # cohort shares one average.
-                if (fresh_offset is not None or fresh_ratio is not None
-                        or fresh_decay is not None):
-                    update_global_calibration(
-                        root_cache,
-                        vmaf_offset=fresh_offset,
-                        ratio=fresh_ratio,
-                        decay=fresh_decay,
-                        even=even_sampling, mini=mini_sampling,
-                    )
-                    global_cal = load_global_calibration(root_cache)
+            # Roll the new measurements into the cohort so later files
+            # start from an informed prior. (Each engine has its own
+            # cohort file; different encoders must never share
+            # calibration.) The offset and ratio go into the cohort of
+            # the sampling mode and plan the pair was measured under:
+            # mixing representative (evenly-spaced) measurements into the
+            # scene cohort would dilute the selection bias it exists to
+            # measure and mis-aim every scene-sampled file after them.
+            # Decay is engine physics, not selection bias: every cohort
+            # shares one average.
+            if new:
+                update_global_calibration(
+                    root_cache,
+                    vmaf_offset=new.get("vmaf_offset"),
+                    ratio=new.get("ratio"),
+                    decay=new.get("decay"),
+                    even=bool(pair and pair.get("even")),
+                    mini=bool(pair and pair.get("mini")),
+                )
+                global_cal = load_global_calibration(root_cache)
 
             # Consolidated refine for quality/bitrate misses in BOTH
             # directions. Deficits (VMAF below target, bitrate below the

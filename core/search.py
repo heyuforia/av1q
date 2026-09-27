@@ -15,6 +15,7 @@ import math
 import time
 
 from .bitrate import effective_sample_floor, measured_kbps
+from .calibrate import file_calibration
 from .constants import (
     DEFAULT_VMAF_SLOPE, ENDGAME_SNAP_GAIN, FLOOR_BOUND_KBPS_RATIO,
     FLOOR_BOUND_VMAF_MARGIN, INTRA_ONLY_CODECS, MIN_BITRATE_KBPS,
@@ -173,10 +174,11 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
         # Full path already measures video-only kbps, so compare raw. The
         # cohort ratio prior (ratio_prior) supplements the per-file ratio in
         # calibration: per-file > cohort > margin (see effective_sample_floor).
+        # The per-file ratio counts only when measured under these settings.
         if not tag:
             return min_kbps
         return effective_sample_floor(
-            min_kbps, cfg["bitrate_margin"], cache.get("calibration"),
+            min_kbps, cfg["bitrate_margin"], file_calibration(cache, enc_tag),
             ratio_prior=ratio_prior,
         )
 

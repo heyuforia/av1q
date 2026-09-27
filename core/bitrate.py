@@ -76,7 +76,8 @@ def effective_sample_floor(min_kbps, margin, calibration=None, ratio_prior=None)
     also valid; see RATIO_MIN/RATIO_MAX in core/calibrate.py). Sources of
     the sample→full ratio, in order of trust:
 
-      1. a measured per-file ratio (this exact file, after one full encode)
+      1. a measured per-file ratio (this exact file under these settings,
+         after one full encode; the caller hands over that block only)
       2. the cohort ratio prior (learned across files — see ratio_prior in
          core/calibrate.py; this is what lets a fresh file skip the
          conservative-margin tax once a few similar files have been seen)

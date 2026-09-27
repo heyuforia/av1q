@@ -169,6 +169,27 @@ def measure_vmaf(ref, dist, meta, subsample, threads, cache_dir):
         return {"mean": float("nan"), "p5": float("nan")}
 
 
+def stored_vmaf(entry, key, size):
+    """The score cached under `key` ({'mean','p5'}) when it measured an
+    encode of this size, else None.
+
+    The sample and the full encode at one quantizer share an entry, so
+    each score records its own encode's size: one shared size, rewritten
+    by whichever was measured last, would send the other through a fresh
+    measurement, a whole-file VMAF when a new search lands on a verified
+    quantizer. An entry without per-score sizes holds one shared `size`,
+    which vouches only for the score measured last.
+    """
+    if not isinstance(entry, dict) or key not in entry:
+        return None
+    if entry.get(f"{key}_size", entry.get("size")) != size:
+        return None
+    return {
+        "mean": float(entry[key]),
+        "p5": float(entry.get(f"{key}_p5", entry[key])),
+    }
+
+
 def vmaf_cached(ref, dist, meta, q, cache, cache_path, *, tag=None,
                 threads, log_dir, key_base, q_key, measure=None):
     """Compute VMAF with file-based caching — shared by both pipelines'
@@ -177,6 +198,8 @@ def vmaf_cached(ref, dist, meta, q, cache, cache_path, *, tag=None,
     The two cache layouts deliberately differ and are FROZEN:
       av1q       entries[str(cq)]     value keys 'full' / 'sample_full'
       essential  entries[crf_str(q)]  value keys 'vmaf' / 'sample_vmaf'
+    Each value key carries '<key>_p5' and '<key>_size' beside it (see
+    stored_vmaf).
     Key separation is what keeps essential's SSIMU2-era entries from ever
     being misread as VMAF — the sig never changes by policy, so these key
     names and `q_key` formats must never change either.
@@ -201,20 +224,16 @@ def vmaf_cached(ref, dist, meta, q, cache, cache_path, *, tag=None,
     if tag:
         meta = {**meta, "vmaf_pair": "index"}
     key = f"{tag}_{key_base}" if tag else key_base
-    entry = cache["entries"].get(q_key)
-
-    if entry and key in entry and entry.get("size") == dist_size:
-        return {
-            "mean": float(entry[key]),
-            "p5": float(entry.get(f"{key}_p5", entry[key])),
-        }
+    hit = stored_vmaf(cache["entries"].get(q_key), key, dist_size)
+    if hit:
+        return hit
 
     result = measure(ref, dist, meta, 1, threads, log_dir)
 
     if math.isfinite(result["mean"]) and 0 <= result["mean"] <= 100:
         cache["entries"].setdefault(q_key, {}).update({
             key: result["mean"], f"{key}_p5": result["p5"],
-            "size": dist_size,
+            f"{key}_size": dist_size,
             "t": time.time(),
         })
         atomic_write_json(cache_path, cache)
