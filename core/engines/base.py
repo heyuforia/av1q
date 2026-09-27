@@ -183,21 +183,21 @@ class Engine:
         if read is None:
             if not self.hdr10_passthrough:
                 raise RuntimeError(
-                    "HDR10 metadata could not be read, the file is"
-                    " stopped; the next run tries again"
+                    "HDR10 static metadata could not be read, and this"
+                    " encode would carry none, so the file is stopped"
                 )
             return (
                 "static metadata could not be read,"
-                " ffmpeg's own copy is used"
+                " the encode keeps only what ffmpeg passes on"
             )
         meta["mastering"], meta["cll"] = read
         if not (meta["mastering"] or meta["cll"]):
-            return None
+            return "no static metadata in the source"
         if mux_states_hdr10():
             return "static metadata carried over"
         return (
-            "static metadata carried over"
-            " (ffmpeg 9.0+ also writes it to the MKV header)"
+            "static metadata carried over to the AV1 stream"
+            " (the MKV header copy needs ffmpeg 9.0)"
         )
 
     def prep_sample(self, concat, meta, cfg):

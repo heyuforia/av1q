@@ -341,12 +341,13 @@ def probe_hdr_metadata(filepath):
     that starts on one and for an intra-only master, and a capture that
     starts between keyframes decodes nothing from it and reads on to its
     first keyframe. A keyframe without the metadata is the answer, not
-    a miss.
+    a miss. A window with no keyframe says nothing about the source and
+    is a failed read.
     """
     frames = _keyframe_side_data(filepath, 1)
     if frames == []:
         frames = _keyframe_side_data(filepath, HDR_KEYFRAME_WINDOW)
-    if frames is None:
+    if not frames:
         return None
 
     mastering = cll = None
