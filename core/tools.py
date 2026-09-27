@@ -19,6 +19,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 
 _ffvship_exe = False  # False = not probed yet; None = probed, absent
 _ff_pair = None  # memo: (ffmpeg, ffprobe) commands, resolved once
+_ff_options = None  # memo: option names the resolved ffmpeg takes
 
 # First-run downloads are pinned to the builds this code was tested
 # with, and a file is refused unless its SHA-256 matches: a binary that
@@ -162,6 +163,28 @@ def missing_ffmpeg_components(encoders=(), filters=()):
                 present.add(parts[1])
         missing += [name for name in wanted if name not in present]
     return missing
+
+
+def ffmpeg_options():
+    """Names, without the dash, of the command-line options the resolved
+    ffmpeg build takes, read once from its long help, where each option
+    opens a line as '-name[:<stream_spec>] <arg>  description'.
+
+    ffmpeg fails a whole command on an option its build does not know,
+    so an option newer than the oldest build this runs on is passed
+    only when it is listed here. Empty when ffmpeg cannot run: every
+    caller then leaves its option out."""
+    global _ff_options
+    if _ff_options is None:
+        try:
+            out = run_cmd([ffmpeg_exe(), "-hide_banner", "-h", "long"]).stdout
+        except (OSError, RuntimeError):
+            out = ""
+        _ff_options = frozenset(
+            line.split(None, 1)[0][1:].split("[", 1)[0]
+            for line in out.splitlines() if line.startswith("-")
+        )
+    return _ff_options
 
 
 def _find_in_tools(stem):

@@ -16,7 +16,9 @@ from ..constants import (
     FALLBACK_MAXRATE, MAXRATE_FACTOR, RESUMABLE_MIN_DURATION, SEGMENT_TIME,
 )
 from ..crop import crop_token
-from ..probe import high_bit_depth, res_tier
+from ..probe import (
+    content_light_str, high_bit_depth, res_tier, svt_mastering_display,
+)
 from ..tools import ffmpeg_exe, find_ffvship_optional
 from ..ui import BOLD, DIM, GREEN, RESET, fmt_time, label
 from ..util import _temp_files, fmt_cmd, partial_hash, run_cmd
@@ -237,11 +239,14 @@ def encode_av1(source, dest, meta, cq, cfg, show_progress=False,
     # the filter graph carries, and never refreshes it, so a HEVC
     # capture that emits a picture without its SEI first loses it. The
     # wrapper parses these params after that snapshot, so they win.
-    # Neither string holds a ':'.
+    # Neither string holds a ':'. The container's copy is stated at the
+    # final mux.
     if meta.get("mastering"):
-        svt_params += f":mastering-display={meta['mastering']}"
+        svt_params += (
+            f":mastering-display={svt_mastering_display(meta['mastering'])}"
+        )
     if meta.get("cll"):
-        svt_params += f":content-light={meta['cll']}"
+        svt_params += f":content-light={content_light_str(meta['cll'])}"
 
     vf_args = []
     if meta.get("crop"):
@@ -291,7 +296,10 @@ def encode_av1(source, dest, meta, cq, cfg, show_progress=False,
 
     tmp = dest.with_suffix(".tmp.mkv")
     _temp_files.add(tmp)
-    segments.mux_with_source_streams(video, source, tmp)
+    segments.mux_with_source_streams(
+        video, source, tmp,
+        mastering=meta.get("mastering"), cll=meta.get("cll"),
+    )
     tmp.replace(dest)
     _temp_files.discard(tmp)
     if work:
@@ -436,6 +444,7 @@ class SvtAv1FfmpegEngine(Engine):
     seed_prompt_hint = "(Enter = auto)"
     cal_q_key = "at_cq"
     needs_expected_frames = False
+    hdr10_passthrough = True
 
     def cache_root(self, cfg):
         return cfg["cache_dir"]

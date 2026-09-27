@@ -483,8 +483,9 @@ def process_videos(cfg, engine):
 
             # Source facts the encodes state themselves (HDR10 static
             # metadata, plus whatever the engine adds).
-            if engine.prepare_meta(filepath, meta, cfg):
-                print(f"{label('hdr')}{DIM}static metadata carried over{RESET}")
+            hdr_note = engine.prepare_meta(filepath, meta, cfg)
+            if hdr_note:
+                print(f"{label('hdr')}{DIM}{hdr_note}{RESET}")
 
             expected_frames = 0
             if engine.needs_expected_frames:

@@ -10,6 +10,7 @@ written before and after the package split must stay interchangeable.
 
 from ..constants import DEFAULT_BITRATE_DECAY
 from ..probe import probe_hdr_metadata
+from ..segments import mux_states_hdr10
 
 
 class Grid:
@@ -84,6 +85,11 @@ class Engine:
     seed_prompt_hint = None  # dim hint in the interactive seed prompt
     cal_q_key = None        # quantizer field in the calibration block
     needs_expected_frames = False  # engine's progress bar needs a frame count
+    # True when ffmpeg hands the encoder the HDR10 static metadata of
+    # the first frame it decodes, so a failed read still leaves the
+    # encode that copy. Without it a failed read would ship the encode
+    # with none.
+    hdr10_passthrough = False
 
     # Cold-start d(log kbps)/d(quantizer) for the floor model, before this
     # file's probes or the engine cohort have measured it. Encoder physics,
@@ -160,17 +166,39 @@ class Engine:
 
     def prepare_meta(self, source, meta, cfg):
         """Source facts read once per file, before any encode of it.
-        Returns True when something user-visible was carried over.
+        Returns the note the file's hdr line prints, or None for none.
 
         Default: the HDR10 static metadata (meta["mastering"] and
-        meta["cll"], None when absent), which every engine states to its
-        encoder itself. No encoder finds it alone: the Y4M pipe carries
-        none, and ffmpeg hands libsvtav1 only what its first decoded
-        frame carries. An engine that reads more calls this too."""
+        meta["cll"], None when absent, in probe_hdr_metadata's form),
+        which every engine states to its encoder itself, and the final
+        mux to the container. No encoder finds it alone: the Y4M pipe
+        carries none, and ffmpeg hands libsvtav1 only what its first
+        decoded frame carries. A failed read raises, stopping the file,
+        unless the engine has hdr10_passthrough to fall back on. An
+        engine that reads more calls this too."""
         meta["mastering"] = meta["cll"] = None
-        if meta["hdr"]:
-            meta["mastering"], meta["cll"] = probe_hdr_metadata(source)
-        return bool(meta["mastering"] or meta["cll"])
+        if not meta["hdr"]:
+            return None
+        read = probe_hdr_metadata(source)
+        if read is None:
+            if not self.hdr10_passthrough:
+                raise RuntimeError(
+                    "HDR10 metadata could not be read, the file is"
+                    " stopped; the next run tries again"
+                )
+            return (
+                "static metadata could not be read,"
+                " ffmpeg's own copy is used"
+            )
+        meta["mastering"], meta["cll"] = read
+        if not (meta["mastering"] or meta["cll"]):
+            return None
+        if mux_states_hdr10():
+            return "static metadata carried over"
+        return (
+            "static metadata carried over"
+            " (ffmpeg 9.0+ also writes it to the MKV header)"
+        )
 
     def prep_sample(self, concat, meta, cfg):
         """Turn the raw sample concat into this engine's search source

@@ -22,9 +22,14 @@ video file, or supplied by an engine whose encoder output restarts at 0).
 import json
 import shutil
 
-from .tools import ffmpeg_exe, ffprobe_exe
+from .probe import content_light_str, ffmpeg_mastering_display
+from .tools import ffmpeg_exe, ffmpeg_options, ffprobe_exe
 from .ui import DIM, RESET, label
 from .util import atomic_write_json, run_cmd
+
+# ffmpeg's input options that set a stream's HDR10 static metadata,
+# first released in ffmpeg 9.0.
+HDR10_MUX_OPTIONS = ("mastering_display", "content_light")
 
 MANIFEST_NAME = "manifest.json"
 SEGMENT_LIST_NAME = "segments.csv"
@@ -350,12 +355,27 @@ def concat_segments(seg_dir, segments, out_path,
         raise RuntimeError("Segment concat produced no output")
 
 
+def mux_states_hdr10():
+    """True when the resolved ffmpeg can state HDR10 static metadata for
+    the output container (mux_with_source_streams)."""
+    return set(HDR10_MUX_OPTIONS) <= ffmpeg_options()
+
+
 def mux_with_source_streams(video, source, dest_tmp, probe=None,
-                            start_ms=None):
+                            start_ms=None, mastering=None, cll=None):
     """Mux encoded video with audio, subs, attachments (subtitle fonts),
     chapters and metadata from `source` into `dest_tmp`. Subtitle copy can
     fail for codecs MKV won't take as-is (e.g. mov_text from MP4) — retried
     as SRT, then dropped.
+
+    mastering and cll are the source's HDR10 static metadata in
+    probe_hdr_metadata's form, stated for the container's own copy
+    (Matroska's MasteringMetadata, MaxCLL and MaxFALL) when the build
+    has the options. A stream copy takes that copy from its input
+    stream, which never has it from essential's IVF and has only
+    ffmpeg's first-frame snapshot from av1q's encode; the options
+    replace it before the copy is made. The bitstream's copy, the one a
+    player decodes, is the encoder's.
 
     ffmpeg shifts every input so its own first timestamp reads 0 (unless
     -copyts, which also switches off MPEG-TS discontinuity repair). An
@@ -374,11 +394,18 @@ def mux_with_source_streams(video, source, dest_tmp, probe=None,
     if start_ms is None:
         raise RuntimeError(f"Remux failed: {video.name} is unreadable")
     offset = ["-itsoffset", ms_ts(start_ms)] if start_ms > 0 else []
+    hdr = []
+    if (mastering or cll) and mux_states_hdr10():
+        if mastering:
+            hdr += ["-mastering_display:v:0",
+                    ffmpeg_mastering_display(mastering)]
+        if cll:
+            hdr += ["-content_light:v:0", content_light_str(cll)]
 
     def mux_cmd(maps, codecs):
         return [
             ffmpeg_exe(), "-y", "-hide_banner", "-v", "error",
-            *offset, "-i", str(video), "-i", str(source),
+            *hdr, *offset, "-i", str(video), "-i", str(source),
             *maps, "-map_chapters", "1", "-map_metadata", "1",
             *codecs, str(dest_tmp),
         ]

@@ -14,7 +14,9 @@ import time
 
 from .. import ssimu2
 from ..crop import crop_token
-from ..probe import is_vfr, picture_timing
+from ..probe import (
+    content_light_str, is_vfr, picture_timing, svt_mastering_display,
+)
 from ..sampling import clean_sample_source
 from ..segments import mux_with_source_streams
 from ..tools import ffmpeg_exe, find_encoder, find_ffvship_optional
@@ -168,9 +170,10 @@ def build_color_args(meta):
     if cr:
         args += ["--color-range", cr]
     if meta.get("mastering"):
-        args += ["--mastering-display", meta["mastering"]]
+        args += ["--mastering-display",
+                 svt_mastering_display(meta["mastering"])]
     if meta.get("cll"):
-        args += ["--content-light", meta["cll"]]
+        args += ["--content-light", content_light_str(meta["cll"])]
     return args
 
 
@@ -417,6 +420,7 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
     mux_with_source_streams(
         enc_out, source, tmp_mkv,
         start_ms=round(meta["picture_start"] * 1000),
+        mastering=meta.get("mastering"), cll=meta.get("cll"),
     )
 
     try:
@@ -543,7 +547,8 @@ class EssentialEngine(Engine):
         timing = picture_timing(source)
         meta["picture_start"] = timing["start"]
         meta["picture_rate"] = timing["rate"]
-        # The HDR10 static metadata build_color_args restates.
+        # The HDR10 static metadata build_color_args restates. A failed
+        # read raises too: the pipe carries no copy of its own.
         return super().prepare_meta(source, meta, cfg)
 
     def prep_sample(self, concat, meta, cfg):

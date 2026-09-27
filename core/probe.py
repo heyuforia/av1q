@@ -265,6 +265,19 @@ def _ratval(v):
         return None
 
 
+# The steps HDR10 mastering display metadata is stated in: HEVC's SEI
+# and MP4's mdcv box count chromaticities in 1/50000 and luminances in
+# 1/10000 cd/m², and ffmpeg's -mastering_display takes those counts.
+MDCV_CHROMA_DEN = 50000
+MDCV_LUMA_DEN = 10000
+
+# Side-data fields of a mastering display, in the order both spellings
+# state them: G, B, R, white point.
+_MDCV_XY = (
+    "green_x", "green_y", "blue_x", "blue_y",
+    "red_x", "red_y", "white_point_x", "white_point_y",
+)
+
 # How many packets the HDR10 read looks through for the first keyframe
 # when a capture starts between keyframes. 600 is ten seconds at 60 fps,
 # longer than any broadcast or streaming GOP and than x265's default of
@@ -295,12 +308,29 @@ def _keyframe_side_data(filepath, packets):
         return None
 
 
+def _steps(v, den):
+    """A side-data value as a whole count of 1/den steps, or None."""
+    f = _ratval(v)
+    return round(f * den) if f is not None and math.isfinite(f) else None
+
+
 def probe_hdr_metadata(filepath):
     """HDR10 static metadata as the first decoded keyframes state it.
 
-    Returns (mastering_display_str, content_light_str), either may be None.
-    Formats follow SvtAv1EncApp --color-help:
-      G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)  and  "max_cll,max_fall".
+    Returns (mastering, cll), each None when the source does not state
+    it, or None whole when a read failed, which says nothing about the
+    source:
+      mastering  G, B, R and white point x/y in 1/MDCV_CHROMA_DEN steps,
+                 then max and min luminance in 1/MDCV_LUMA_DEN steps
+      cll        (max_cll, max_fall) in cd/m²
+    svt_mastering_display, ffmpeg_mastering_display and
+    content_light_str spell them for each consumer.
+
+    A mastering display the standard forbids (a chromaticity past 1, a
+    minimum luminance above the maximum) or a light level past 16 bits
+    is corrupt and dropped like an incomplete one: ffmpeg fails the
+    whole command on a value past its own limits, which sit at or
+    beyond these.
 
     Container-level metadata rides every decoded frame, and HEVC's SEI
     metadata every frame from the keyframe that carries it. Only
@@ -316,33 +346,53 @@ def probe_hdr_metadata(filepath):
     frames = _keyframe_side_data(filepath, 1)
     if frames == []:
         frames = _keyframe_side_data(filepath, HDR_KEYFRAME_WINDOW)
+    if frames is None:
+        return None
 
     mastering = cll = None
-    for side in frames or []:
+    for side in frames:
         for sd in side:
             t = sd.get("side_data_type", "")
             if t == "Mastering display metadata" and mastering is None:
-                vals = {k: _ratval(sd.get(k)) for k in (
-                    "red_x", "red_y", "green_x", "green_y",
-                    "blue_x", "blue_y", "white_point_x", "white_point_y",
-                    "max_luminance", "min_luminance",
-                )}
-                if all(v is not None for v in vals.values()):
-                    mastering = (
-                        f"G({vals['green_x']:.5f},{vals['green_y']:.5f})"
-                        f"B({vals['blue_x']:.5f},{vals['blue_y']:.5f})"
-                        f"R({vals['red_x']:.5f},{vals['red_y']:.5f})"
-                        f"WP({vals['white_point_x']:.5f},"
-                        f"{vals['white_point_y']:.5f})"
-                        f"L({vals['max_luminance']:.4f},"
-                        f"{vals['min_luminance']:.4f})"
-                    )
+                xy = [_steps(sd.get(k), MDCV_CHROMA_DEN) for k in _MDCV_XY]
+                hi = _steps(sd.get("max_luminance"), MDCV_LUMA_DEN)
+                lo = _steps(sd.get("min_luminance"), MDCV_LUMA_DEN)
+                if (all(v is not None and 0 <= v <= MDCV_CHROMA_DEN
+                        for v in xy)
+                        and None not in (hi, lo)
+                        and 0 <= lo <= hi <= 0x7FFFFFFF):
+                    mastering = (*xy, hi, lo)
             elif t == "Content light level metadata" and cll is None:
                 mc = sd.get("max_content")
                 ma = sd.get("max_average")
-                if isinstance(mc, int) and isinstance(ma, int):
-                    cll = f"{mc},{ma}"
+                if all(isinstance(v, int) and 0 <= v <= 0xFFFF
+                       for v in (mc, ma)):
+                    cll = (mc, ma)
     return mastering, cll
+
+
+def svt_mastering_display(m):
+    """A probe_hdr_metadata mastering display as SVT-AV1 spells it, the
+    same string for SvtAv1EncApp's flag and -svtav1-params:
+    G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min) in decimals, five and four
+    places being exactly the two step sizes."""
+    return (
+        "G({:.5f},{:.5f})B({:.5f},{:.5f})R({:.5f},{:.5f})"
+        "WP({:.5f},{:.5f})L({:.4f},{:.4f})"
+    ).format(*(v / MDCV_CHROMA_DEN for v in m[:8]),
+             *(v / MDCV_LUMA_DEN for v in m[8:]))
+
+
+def ffmpeg_mastering_display(m):
+    """The same as ffmpeg's -mastering_display spells it: the same
+    layout in whole steps."""
+    return "G({},{})B({},{})R({},{})WP({},{})L({},{})".format(*m)
+
+
+def content_light_str(c):
+    """A probe_hdr_metadata light level as SVT-AV1 and ffmpeg both spell
+    it: 'max_cll,max_fall'."""
+    return f"{c[0]},{c[1]}"
 
 
 _SHOWINFO_CONFIG = re.compile(
