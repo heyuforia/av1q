@@ -166,8 +166,9 @@ def main():
     )
     parser.add_argument(
         "--vmaf", type=float, default=None,
-        help="Target VMAF score (default: auto by resolution — "
-             "94 HD, 93 SD, 90 4K, same tiers as av1q)",
+        help=f"Target VMAF score (default: auto by resolution, "
+             f"{TARGET_VMAF_BY_RES[720]:g} HD, {TARGET_VMAF_BY_RES[0]:g} SD, "
+             f"{TARGET_VMAF_BY_RES[2160]:g} 4K, same tiers as av1q)",
     )
     parser.add_argument(
         "--preset", type=int, default=4,

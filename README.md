@@ -18,7 +18,7 @@ For every file:
 ## Features
 
 - **VMAF-targeted encoding.** Hits a perceptual quality target instead of a fixed CRF.
-- **Resolution-aware defaults.** VMAF targets auto-select by resolution: 94 for HD, 93 for SD, 90 for 4K.
+- **Resolution-aware defaults.** VMAF targets auto-select by resolution: 94 for HD, 93 for SD, 93 for 4K.
 - **Bitrate floors.** Per-resolution minimums (1 Mbps at 720p, 1.8 at 1080p, 2.5 at 1440p, 4.5 at 2160p, 8 at 4320p) prevent VMAF-misleading low-bitrate encodes. They're starvation backstops, not targets.
 - **Scene-based sampling.** Fast quality estimation, so the search never encodes the whole file.
 - **P5 quality reporting.** The 5th-percentile worst-frame VMAF is reported next to the mean, so you can spot files whose worst moments lag.
