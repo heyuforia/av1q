@@ -1,18 +1,19 @@
 """Sample selection and extraction for the quality-search stage."""
 
+import bisect
 import hashlib
 import json
 import math
 import os
 import time
 
-from .analyze import get_keyframes, window_of
+from .analyze import window_of
 from .constants import (
     MINI_SAMPLE_COUNT, MINI_SAMPLE_DURATION, MINI_SAMPLE_MIN_RATIO,
     SAMPLE_COUNT_MAX, SAMPLE_SCALE_K, SAMPLE_SCALE_REF,
 )
 from .tools import ffmpeg_exe
-from .ui import DIM, RED, RESET
+from .ui import DIM, MIDDOT, RED, RESET
 from .util import _temp_files, clamp, run_cmd
 
 
@@ -80,11 +81,15 @@ def select_samples(scenes, complexity, duration, count, keyframes, cfg):
         ]
 
     comp_map = {window_of(c["time"]): c["complexity"] for c in complexity}
+    # A scene whose window has no entry (a gap in the stream) ranks at
+    # the whole-file mean: it neither beats a measurably hotter scene nor
+    # loses to a cooler one. Without packet data every scene ties.
+    neutral = sum(comp_map.values()) / len(comp_map) if comp_map else 0.0
     scored = [
         {
             "time": sc["time"],
             "duration": sc["duration"],
-            "complexity": comp_map.get(window_of(sc["time"]), 50),
+            "complexity": comp_map.get(window_of(sc["time"]), neutral),
         }
         for sc in scenes
         if sc["duration"] >= cfg["min_scene_duration"]
@@ -117,7 +122,7 @@ def complexity_bias(complexity, sample_scenes):
     """How much hotter the selected scenes are than the whole file.
 
     The a-priori measure of complexity-selection bias — available before
-    any encode, from the packet-stat complexity (analyze_complexity) that
+    any encode, from the packet-stat complexity (complexity_windows) that
     already ranked the scenes: the ratio of the selected scenes' mean
     complexity to the whole-file mean. 1.0 means the sample turned out
     representative after all (the file's hottest scenes are barely above
@@ -129,7 +134,7 @@ def complexity_bias(complexity, sample_scenes):
     single cause. Returns None when the complexity data is missing or
     degenerate, and callers fall back to their fixed cold-start guess.
 
-    complexity is analyze_complexity's per-window list; sample_scenes is
+    complexity is complexity_windows' per-window list; sample_scenes is
     select_samples' output (only `time`/`duration`), so the selected scenes
     are mapped back to their windows the same way select_samples does.
     """
@@ -175,8 +180,70 @@ def complexity_bias_margin(complexity, sample_scenes, base_margin, floor_margin)
     return clamp(bias, floor_margin, base_margin)
 
 
+def _clock(t):
+    """Compact position for the samples line: '7:05', '1:02:33'."""
+    m, s = divmod(int(t), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+# How far ahead of the gate the input seek aims (seconds). Landing early
+# only demuxes a little more that the gate then drops; the value merely
+# has to keep the output -ss clearly positive.
+PRE_SEEK = 1.0
+
+
+def cut_window(t, dur, keyframes):
+    """Where ffmpeg seeks, gates and stops to stream-copy `dur` seconds of
+    picture from the keyframe nearest t: (seek, gate, length, start).
+    seek is the input -ss, gate the output -ss relative to it (None for
+    none), length the -t, and start where the clip really begins.
+
+    A stream-copied clip can only begin on a keyframe, and one input -ss
+    cannot be trusted to land on the keyframe chosen: each demuxer
+    resolves the seek its own way (Matroska takes the last cue at or
+    before it, MP4 the last keyframe by presentation time, MPEG-TS the
+    last packet by decode time with no keyframe walk-back), and ffmpeg
+    itself moves the request 130ms earlier on every container that does
+    not declare presentation-time seeking (Matroska and MPEG-TS do not,
+    MP4 does) whenever the stream has B-frames. On an MKV that is one
+    cue early, so every clip carried a whole GOP of the previous scene.
+
+    So the cut is two steps. The input seek aims halfway back to the
+    previous keyframe, which lands at or before that keyframe on every
+    container, and an output -ss at that same point drops what was read
+    before it. Stream copy discards leading non-keyframes, so the first
+    packet kept is exactly the keyframe chosen: the previous keyframe
+    sits before the gate and is dropped, the chosen one sits after it by
+    half a GOP, more than any reorder delay pulls its decode time back.
+    -t counts from the gate, so it is stretched by the same half GOP.
+    """
+    if not keyframes:
+        # No keyframe list (the packet scan failed): seek at the scene
+        # time and accept whatever pre-roll the landing brings.
+        return math.ceil(t * 1000 + 1e-3) / 1000, None, dur, t
+    kf = min(keyframes, key=lambda k: abs(k - t))
+    j = bisect.bisect_left(keyframes, kf)
+    if j == 0:
+        # The first keyframe is the first packet: reading from the start
+        # lands on it in every container, and nothing precedes it.
+        return 0.0, None, kf + dur, kf
+    mid = (keyframes[j - 1] + kf) / 2
+    seek = max(0.0, math.floor((mid - PRE_SEEK) * 1000) / 1000)
+    gate = math.floor((mid - seek) * 1000) / 1000
+    return seek, gate, kf + dur - (seek + gate), kf
+
+
 def extract_samples(source, scenes, keyframes, cfg, file_hash=None):
-    """Extract and concatenate sample clips from the source video."""
+    """Cut each selected scene from its keyframe by stream copy and join
+    the clips into one video-only concat under _cache/_samples/. Returns
+    the concat, or None when no clip could be cut.
+
+    Only a complete set is kept for the next run. When a clip fails, the
+    search still runs on the clips that were cut, but that set is a temp
+    under a per-run name, so the next run cuts every clip again instead
+    of inheriting the gap.
+    """
     if not scenes:
         return None
 
@@ -191,32 +258,35 @@ def extract_samples(source, scenes, keyframes, cfg, file_hash=None):
         [[round(sc["time"], 3), round(sc["duration"], 3)] for sc in scenes]
     ).encode("utf-8")).hexdigest()[:10]
     concat_out = sample_dir / f"samples_{tag}_{scene_sig}.mkv"
+
+    # Each scene is cut from its nearest keyframe (cut_window). Two
+    # scenes that snap to the same keyframe would cut the same clip
+    # twice and weight that stretch double in every probe, so the
+    # second is dropped.
+    cuts = []
+    for sc in scenes:
+        win = cut_window(sc["time"], sc["duration"], keyframes)
+        if all(win[3] != c[3] for c in cuts):
+            cuts.append(win)
+    where = (
+        f"{len(cuts)} clip{'s' if len(cuts) != 1 else ''} at"
+        f" {' '.join(_clock(c[3]) for c in cuts)}"
+    )
+
     if concat_out.exists() and concat_out.stat().st_size > 0:
-        print(f"{'':>11}{DIM}Samples: {concat_out.stat().st_size / 1e6:.1f}MB (cached){RESET}")
+        print(
+            f"{'':>11}{DIM}Samples: {concat_out.stat().st_size / 1e6:.1f}MB"
+            f" (cached) {MIDDOT} {where}{RESET}"
+        )
         return concat_out
 
     ts = int(time.time() * 1000)
-    clips = []
-    if keyframes is None:
-        keyframes = get_keyframes(source)
-
-    for i, sc in enumerate(scenes):
+    attempted, clips = [], []
+    for i, (seek, gate, length, _) in enumerate(cuts):
         clip = sample_dir / f"sample_{ts}_{i}.mkv"
+        attempted.append(clip)
         _temp_files.add(clip)
         try:
-            start = (
-                min(keyframes, key=lambda k: abs(k - sc["time"]))
-                if keyframes else sc["time"]
-            )
-            # Input -ss lands on the last keyframe AT OR BEFORE the
-            # request, and stream copy keeps everything from there. A
-            # request that rounds below the snapped keyframe (7.111111 →
-            # 7.111) therefore pulls in the whole previous GOP: a 48s
-            # plan once came out 90s. Round the request UP past the
-            # keyframe instead; the +1µs covers ffprobe's own 6-decimal
-            # rounding, and ~1ms of slack cannot reach the next frame
-            # (frame durations are >= 8ms).
-            seek = math.ceil(start * 1000 + 1e-3) / 1000
             # Map the video stream explicitly: default stream selection
             # would also pick a subtitle stream (mov_text from MP4 fails
             # MKV stream copy outright) and picks the "best" video stream
@@ -226,7 +296,8 @@ def extract_samples(source, scenes, keyframes, cfg, file_hash=None):
             run_cmd([
                 ffmpeg_exe(), "-y", "-hide_banner", "-v", "error",
                 "-ss", f"{seek:.3f}", "-i", str(source),
-                "-t", f"{sc['duration']:.3f}",
+                *(["-ss", f"{gate:.3f}"] if gate is not None else []),
+                "-t", f"{length:.3f}",
                 "-map", "0:v:0",
                 "-c", "copy", "-an", "-avoid_negative_ts", "make_zero",
                 str(clip),
@@ -240,33 +311,54 @@ def extract_samples(source, scenes, keyframes, cfg, file_hash=None):
         print(f" {RED}No clips extracted{RESET}")
         return None
 
+    # Bare names, resolved beside the list (as in core.segments): an
+    # absolute path would put the cache folder's own name inside the
+    # list's quoting, where one apostrophe ends the entry.
     concat_list = sample_dir / f"concat_{ts}.txt"
     _temp_files.add(concat_list)
     concat_list.write_text(
-        "\n".join(f"file '{c.as_posix()}'" for c in clips), encoding="utf-8"
+        "\n".join(f"file '{c.name}'" for c in clips), encoding="utf-8"
     )
 
+    complete = len(clips) == len(cuts)
+    out = concat_out if complete else sample_dir / (
+        f"samples_{tag}_{scene_sig}_part{ts}.mkv"
+    )
+    # Written under a temp name and renamed when whole, so an
+    # interrupted concat never sits under the name a later run reuses.
+    tmp = out.with_suffix(".tmp.mkv")
+    _temp_files.add(tmp)
     try:
         run_cmd([
             ffmpeg_exe(), "-y", "-hide_banner", "-v", "error",
-            "-f", "concat", "-safe", "0", "-i", str(concat_list),
-            "-c", "copy", str(concat_out),
+            "-f", "concat", "-i", str(concat_list),
+            "-c", "copy", str(tmp),
         ])
-        for c in clips:
-            try:
-                c.unlink()
-                _temp_files.discard(c)
-            except OSError:
-                pass
-        concat_list.unlink()
-        _temp_files.discard(concat_list)
-
-        if concat_out.exists():
-            print(f"{'':>11}{DIM}Samples: {concat_out.stat().st_size / 1e6:.1f}MB{RESET}")
-            return concat_out
-    except RuntimeError as e:
+        if not tmp.exists() or tmp.stat().st_size == 0:
+            raise RuntimeError("empty output")
+        tmp.replace(out)
+    except (RuntimeError, OSError) as e:
         print(f" {RED}Concat error: {e}{RESET}")
-    return None
+        return None
+    finally:
+        for p in (*attempted, concat_list, tmp):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                continue
+            _temp_files.discard(p)
+
+    print(
+        f"{'':>11}{DIM}Samples: {out.stat().st_size / 1e6:.1f}MB"
+        f" {MIDDOT} {where}{RESET}"
+    )
+    if not complete:
+        _temp_files.add(out)
+        print(
+            f"{'':>11}{DIM}{len(clips)} of {len(cuts)} clips cut; this"
+            f" set is not kept, the next run cuts it again{RESET}"
+        )
+    return out
 
 
 def clean_sample_source(concat, meta, cfg):
@@ -319,6 +411,10 @@ def clean_sample_source(concat, meta, cfg):
             clean.unlink()
         tmp.rename(clean)
         _temp_files.discard(tmp)
+        # A clean pass over a temp concat (a partial clip set, named per
+        # run) is itself a temp: no later run can ever reuse it.
+        if concat in _temp_files:
+            _temp_files.add(clean)
         print(f"{'':>11}{DIM}Clean samples: {clean.stat().st_size / 1e6:.1f}MB{RESET}")
         return clean
     except (RuntimeError, OSError) as e:

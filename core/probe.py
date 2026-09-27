@@ -117,6 +117,10 @@ def probe_video(filepath):
                 None. Not avg_frame_rate: ffmpeg derives that from the
                 frame count only for MP4/MOV and takes the nominal
                 DefaultDuration for Matroska (see is_vfr).
+      start_time  the container's start time in seconds, 0.0 when
+                unstated. ffmpeg subtracts it from every timestamp it
+                reads, so the scene scan and every -ss count from it;
+                ffprobe's packet times do not (see read_packets).
     """
     r = run_cmd([
         ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
@@ -124,7 +128,7 @@ def probe_video(filepath):
         "stream=width,height,bit_rate,pix_fmt,color_primaries,"
         "color_transfer,color_space,color_range,codec_name,profile,"
         "r_frame_rate,avg_frame_rate,nb_frames,duration"
-        ":stream_tags:format=duration,bit_rate",
+        ":stream_tags:format=duration,bit_rate,start_time",
         "-of", "json", str(filepath),
     ])
     data = json.loads(r.stdout or "{}")
@@ -149,6 +153,10 @@ def probe_video(filepath):
     pf = s.get("pix_fmt") or ""
     hdr = ct in {"smpte2084", "arib-std-b67"} or cp == "bt2020"
     duration = float(fmt.get("duration") or 0)
+    try:
+        start_time = float(fmt.get("start_time") or 0)
+    except ValueError:
+        start_time = 0.0  # 'N/A': ffmpeg applies no offset either
 
     fps = s.get("avg_frame_rate")
     rfps = s.get("r_frame_rate")
@@ -178,7 +186,7 @@ def probe_video(filepath):
         "w": int(s.get("width") or 0),
         "h": int(s.get("height") or 0),
         "pix_fmt": pf, "bitrate": bitrate,
-        "duration": duration,
+        "duration": duration, "start_time": start_time,
         "cp": cp, "ct": ct, "cs": cs, "cr": cr,
         "codec": codec, "profile": profile, "hdr": hdr,
         "fps": fps if parse_rate(fps) else None,
