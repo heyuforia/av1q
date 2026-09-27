@@ -171,7 +171,9 @@ def main():
     )
     parser.add_argument(
         "--preset", type=int, default=4,
-        help="Encoder preset 0-10, lower=slower+better (default: 4)",
+        help="Encoder preset 0-10, lower=slower+better (default: 4). The "
+             "encoder also takes -1 and 11-13; this tool stops at av1q's "
+             "range",
     )
     parser.add_argument(
         "--min-crf", type=float, default=18.0,

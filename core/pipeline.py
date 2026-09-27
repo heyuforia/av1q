@@ -101,7 +101,7 @@ def process_videos(cfg, engine):
         return 1
     try:
         engine.setup(cfg)
-    except FileNotFoundError as e:
+    except OSError as e:
         print(f"{CROSS} {e}")
         return 1
 

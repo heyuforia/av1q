@@ -157,10 +157,10 @@ def scan_budget(duration):
 
 
 def _short_path_win(s):
-    """Windows 8.3 short-path alias for `s` (all-ASCII), or None on
-    failure. When the volume has no 8.3 name for the path (creation
-    disabled, or the file predates it) GetShortPathNameW returns the long
-    path unchanged, which the caller rejects as non-ASCII.
+    """Windows 8.3 short-path alias for `s` (an existing file or folder),
+    or None on failure. When the volume has no 8.3 name for the path
+    (creation disabled, or the path predates it) GetShortPathNameW returns
+    the long path unchanged, which the caller rejects as non-ASCII.
     """
     import ctypes
     from ctypes import wintypes
@@ -174,6 +174,20 @@ def _short_path_win(s):
         buf = ctypes.create_unicode_buffer(n)
         n = fn(s, buf, len(buf))
     return buf.value if n else None
+
+
+def ascii_dir(path):
+    """An all-ASCII spelling of an existing folder, for output paths
+    handed to a Windows program that reads its arguments as ANSI
+    (SvtAv1EncApp, FFVship): the folder itself, or its 8.3 alias. None
+    when neither is ASCII (8.3 names are off on that volume). File names
+    written inside it are ours and already ASCII.
+    """
+    s = str(path)
+    if s.isascii() or os.name != "nt":
+        return path
+    short = _short_path_win(s)
+    return Path(short) if short and short.isascii() else None
 
 
 def ascii_path(path, scratch_dir):

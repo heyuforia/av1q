@@ -127,7 +127,7 @@ def probe_video(filepath):
     Alongside the dimension, color, bitrate, and codec facts (`profile`
     is the stream's profile string, lowercased, for the hardware-decode
     gate), it carries the timing facts the essential engine's VFR
-    verdict and CFR feed need:
+    verdict needs:
       fps       avg_frame_rate as a rational string, or None
       rfps      r_frame_rate as a rational string, or None: the nominal
                 cadence, the finest the stream's timestamps fall on
@@ -313,6 +313,49 @@ def probe_hdr_metadata(filepath):
     return mastering, cll
 
 
+_SHOWINFO_CONFIG = re.compile(
+    r"config in time_base: (\d+)/(\d+), frame_rate: (\d+)/(\d+)"
+)
+_SHOWINFO_FIRST = re.compile(r"\bn:\s*0\s+pts:\s*(-?\d+|NOPTS)")
+
+
+def picture_timing(filepath):
+    """How ffmpeg itself decodes v:0, read off its first decoded frame.
+
+    Returns {"start", "rate"}:
+      start  seconds from the container start to the first frame the
+             decoder outputs, on the timeline every ffmpeg run here uses.
+             Not the stream's stated start time: a capture whose leading
+             frames do not decode starts its picture later than that.
+      rate   ffmpeg's own frame-rate guess for the stream (the rate its
+             filter graph and every -fps_mode cfr output run at) as
+             'num/den', or None when it has none. Not r_frame_rate: an
+             interlaced H.264 stream states its field rate there, and
+             ffmpeg corrects it to the frame rate from the codec.
+
+    showinfo's config line and first frame line carry both facts, and
+    -frames:v 1 stops the decode there. Raises RuntimeError when ffmpeg
+    fails or decodes no frame.
+    """
+    r = run_cmd([
+        ffmpeg_exe(), "-hide_banner", "-nostats", "-v", "info",
+        "-i", str(filepath), "-map", "0:v:0", "-vf", "showinfo",
+        "-frames:v", "1", "-f", "null", "-",
+    ])
+    err = r.stderr or ""
+    config = _SHOWINFO_CONFIG.search(err)
+    first = _SHOWINFO_FIRST.search(err)
+    if not config or not first:
+        raise RuntimeError(f"No decodable video frame in {filepath.name}")
+    tb_num, tb_den, fr_num, fr_den = (int(g) for g in config.groups())
+    pts = first.group(1)
+    start = 0.0
+    if pts != "NOPTS" and tb_den:
+        start = max(0.0, int(pts) * tb_num / tb_den)
+    rate = f"{fr_num}/{fr_den}" if fr_num > 0 and fr_den > 0 else None
+    return {"start": start, "rate": rate}
+
+
 # A frame interval this far off the median is irregular. Container
 # timestamp rounding jitters a CFR stream's intervals by one tick — 2.4%
 # for 23.976fps in Matroska's 1ms ticks, 12% at 120fps — while a dropped
@@ -357,9 +400,9 @@ def _frame_intervals(filepath, duration):
 def is_vfr(filepath, meta):
     """True when the source's frame timing is genuinely variable.
 
-    The Y4M pipe's CFR feed resamples every source onto its nominal
-    cadence (fps=r_frame_rate): irregular frame intervals become dups
-    and drops and the frame count changes, where av1q's ffmpeg path
+    The Y4M pipe's CFR feed resamples every source onto one constant
+    rate: irregular frame intervals become dups and drops and the frame
+    count changes, where av1q's ffmpeg path
     passes VFR timing through untouched. So the essential engine refuses
     such files and points at av1q.
 

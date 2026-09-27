@@ -113,7 +113,8 @@ class Engine:
 
     def setup(self, cfg):
         """Discover required/optional tool binaries before processing.
-        May raise FileNotFoundError when a required binary is missing."""
+        Raises OSError (FileNotFoundError for a missing required binary)
+        when the engine cannot run here; the message is printed as is."""
         raise NotImplementedError
 
     def make_dirs(self, cfg):

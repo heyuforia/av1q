@@ -22,7 +22,7 @@ from .probe import frame_geometry
 from .tools import ffprobe_exe, find_ffvship_optional
 from .ui import DIM, RESET, label
 from .util import (
-    _temp_files, ascii_path, make_temp_log, scan_budget,
+    _temp_files, ascii_dir, ascii_path, make_temp_log, scan_budget,
     suppress_win_error_dialog,
 )
 
@@ -215,11 +215,22 @@ def _run_ffvship(ref, dist, meta, cache_dir, exe, ref_index=None, every=1):
     if gap:
         return _skip(ref, gap)
 
-    # FFVship's FFMS2 reads --source/--encoded as ANSI argv, so a non-ASCII
-    # path arrives '?'-mangled and can't be opened. Hand it an ASCII
-    # spelling (8.3 alias or a hardlink) of each real file instead.
-    safe_ref, ref_link = ascii_path(ref, cache_dir)
-    safe_dist, dist_link = ascii_path(dist, cache_dir)
+    # FFVship reads every path argument as ANSI argv, so a non-ASCII one
+    # arrives '?'-mangled and can't be opened. Its own files (log,
+    # indexes, hardlinks) go under the cache root's ASCII spelling, and
+    # each video gets an ASCII spelling (8.3 alias or a hardlink).
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        if ref_index:
+            ref_index.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return _skip(ref, f"cache folder unwritable ({type(e).__name__})")
+    scratch = ascii_dir(cache_dir)
+    idx_home = ascii_dir(ref_index.parent) if ref_index else scratch
+    if scratch is None or idx_home is None:
+        return _skip(ref, "the cache folder has no ASCII path")
+    safe_ref, ref_link = ascii_path(ref, scratch)
+    safe_dist, dist_link = ascii_path(dist, scratch)
     if safe_ref is None or safe_dist is None:
         for lk in (ref_link, dist_link):
             if lk:
@@ -229,11 +240,10 @@ def _run_ffvship(ref, dist, meta, cache_dir, exe, ref_index=None, every=1):
                     pass
         return _skip(ref, f"no ASCII path for '{ref.name}'")
 
-    log = make_temp_log(cache_dir, "ssimu2", "json")
-    idx_dir = cache_dir / "_ffindex"
+    log = make_temp_log(scratch, "ssimu2", "json")
+    idx_dir = scratch / "_ffindex"
     if ref_index:
-        ref_index.parent.mkdir(parents=True, exist_ok=True)
-        src_idx = ref_index
+        src_idx = idx_home / ref_index.name
     else:
         src_idx = make_temp_log(idx_dir, "src", "ffindex")
     dst_idx = make_temp_log(idx_dir, "dist", "ffindex")

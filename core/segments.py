@@ -15,7 +15,8 @@ resumed encode re-enters that same timeline via -ss/-copyts/-start_at_zero,
 and the concat list declares each segment's exact duration (next segment's
 first PTS minus this one's), which zeroes the concat demuxer's timestamp
 delta so the original PTS survive unchanged. The mux then keeps the
-video's start offset against the source's other streams.
+video's start offset against the source's other streams (read from the
+video file, or supplied by an engine whose encoder output restarts at 0).
 """
 
 import json
@@ -349,7 +350,8 @@ def concat_segments(seg_dir, segments, out_path,
         raise RuntimeError("Segment concat produced no output")
 
 
-def mux_with_source_streams(video, source, dest_tmp, probe=None):
+def mux_with_source_streams(video, source, dest_tmp, probe=None,
+                            start_ms=None):
     """Mux encoded video with audio, subs, attachments (subtitle fonts),
     chapters and metadata from `source` into `dest_tmp`. Subtitle copy can
     fail for codecs MKV won't take as-is (e.g. mov_text from MP4) — retried
@@ -362,9 +364,13 @@ def mux_with_source_streams(video, source, dest_tmp, probe=None):
     source's first timestamp; rebased to 0 alone, the picture would play
     that much early against the audio. -itsoffset by the video's own
     start cancels its shift.
+
+    start_ms is that start for a video file that does not carry it (a
+    pipe-fed encoder writes its picture from 0); None reads it from the
+    video file.
     """
-    probe = probe or _probe_start_ms
-    start_ms = probe(video)
+    if start_ms is None:
+        start_ms = (probe or _probe_start_ms)(video)
     if start_ms is None:
         raise RuntimeError(f"Remux failed: {video.name} is unreadable")
     offset = ["-itsoffset", ms_ts(start_ms)] if start_ms > 0 else []

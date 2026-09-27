@@ -6,6 +6,7 @@ VFR sources gated out (the Y4M pipe is CFR-only)."""
 
 import hashlib
 import math
+import os
 import re
 import subprocess
 import sys
@@ -13,12 +14,12 @@ import time
 
 from .. import ssimu2
 from ..crop import crop_token
-from ..probe import is_vfr, probe_hdr_metadata
+from ..probe import is_vfr, picture_timing, probe_hdr_metadata
 from ..sampling import clean_sample_source
 from ..segments import mux_with_source_streams
 from ..tools import ffmpeg_exe, find_encoder, find_ffvship_optional
 from ..ui import BOLD, DIM, GREEN, MIDDOT, RESET, fmt_time, label
-from ..util import _temp_files, make_temp_log
+from ..util import _temp_files, ascii_dir, make_temp_log
 from .base import Engine, Grid
 
 
@@ -68,7 +69,7 @@ MANAGED_ENC_FLAGS = {
     "--color-primaries", "--transfer-characteristics",
     "--matrix-coefficients", "--color-range",
     "--mastering-display", "--content-light",
-    "--progress", "--hide-banner",
+    "--progress", "--hide-banner", "--webm",
 }
 
 
@@ -178,31 +179,28 @@ def _proc_tail(text, n=40):
 
 
 def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
-                     expected_frames=0):
+                     expected_frames=0, full=False):
     """Encode `source` to AV1 at `crf` via SVT-AV1-Essential.
 
     ffmpeg decodes (applying crop) and pipes 10-bit Y4M — Essential
     rejects 8-bit input by design — into the encoder, which writes a
-    video-only WebM. A `.mkv` dest then gets audio/subs/chapters remuxed
-    back from the source; a `.webm` dest (sample probes) is used as-is.
+    video-only IVF. A sample probe (full False) is that picture, renamed
+    to dest. A full-file output (full True) runs the feed at ffmpeg's own
+    frame rate and gets audio/subs/chapters remuxed back from the source.
+    meta["picture_start"] and meta["picture_rate"] come from
+    EssentialEngine.prepare_meta.
 
     Hardware decode is deliberately not used on this path: a mid-stream
     hwaccel failure can't be retried without restarting the encoder, and
     CPU decode comfortably outpaces SVT-AV1 at these presets.
     """
-    is_full = dest.suffix.lower() != ".webm"
-    # The standalone encoder takes its output path on the command line,
-    # and on Windows a non-ASCII path is ANSI-mangled to '?' before it
-    # reaches the encoder, which then rejects the filename outright. A
-    # full-encode dest carries the source's (possibly non-Latin) stem, so
-    # its bitstream is written to an ASCII, hash-named scratch file in the
-    # cache dir; ffmpeg remuxes it to the real dest afterward and handles
-    # the Unicode path natively. Sample dests are already hash-named ASCII.
-    if is_full:
-        tag = hashlib.sha256(str(dest).encode("utf-8")).hexdigest()[:16]
-        enc_out = cfg["e_cache_dir"] / f"_enc_{tag}.tmp.webm"
-    else:
-        enc_out = dest.with_suffix(".tmp.webm")
+    # The standalone encoder reads its output path as ANSI on Windows, and
+    # a full-encode dest carries the source's (possibly non-Latin) stem,
+    # so every encode writes a hash-named scratch file in the ASCII
+    # spelling of the cache root (EssentialEngine.setup) and is renamed or
+    # remuxed to dest by Python and ffmpeg, which take Unicode paths.
+    tag = hashlib.sha256(str(dest).encode("utf-8")).hexdigest()[:16]
+    enc_out = cfg["e_scratch"] / f"_enc_{tag}.tmp.ivf"
     _temp_files.add(enc_out)
     try:
         if enc_out.exists():
@@ -212,26 +210,30 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
 
     ff_cmd = [ffmpeg_exe(), "-y", "-hide_banner", "-v", "error", "-nostats",
               "-i", str(source), "-map", "0:v:0"]
-    # Full encodes normalize the feed's timeline to the source's nominal
-    # frame cadence: setpts zeroes any start offset / edit-list delay and
-    # fps re-times onto a clean CFR grid at r_frame_rate. This is a no-op
-    # for well-formed CFR sources, but for irregular ones (e.g. stream-
-    # copy concatenations with a per-join timing gap) it is what keeps the
-    # full encode frame-aligned with the VMAF reference, which applies the
-    # identical setpts+fps normalization on its side. Without it the
-    # encoder's own CFR conversion fills the gaps differently than the
-    # reference's fps filter and the two drift out of phase, collapsing
-    # full VMAF. Samples skip this: their search source is already a clean
-    # CFR re-encode (clean_sample_source) and they pair by index.
+    # Full encodes normalize the feed's timeline: setpts zeroes any start
+    # offset / edit-list delay and fps re-times onto a clean CFR grid at
+    # ffmpeg's own frame rate for the stream (probe.picture_timing), the
+    # rate its CFR outputs run at. This is a no-op for well-formed
+    # CFR sources, but for irregular ones (e.g. stream-copy concatenations
+    # with a per-join timing gap) it is what keeps the full encode
+    # frame-aligned with the VMAF reference, which applies the identical
+    # setpts+fps normalization on its side at the encode's own rate.
+    # Without it the encoder's own CFR conversion fills the gaps
+    # differently than the reference's fps filter and the two drift out of
+    # phase, collapsing full VMAF. r_frame_rate is not that rate: on an
+    # interlaced H.264 source it is the field rate, and the feed would
+    # double every frame. Samples skip this: their search source is
+    # already a clean CFR re-encode (clean_sample_source) and they pair by
+    # index.
     vf = []
     if meta.get("crop"):
         vf.append(f"crop={meta['crop']}")
-    rfps = meta.get("rfps") if is_full else None
-    if rfps:
-        vf += ["setpts=PTS-STARTPTS", f"fps={rfps}"]
+    rate = meta["picture_rate"] if full else None
+    if rate:
+        vf += ["setpts=PTS-STARTPTS", f"fps={rate}"]
     if vf:
         ff_cmd += ["-vf", ",".join(vf)]
-    if rfps:
+    if rate:
         # Pass the fps filter's CFR frames through untouched; without this
         # the yuv4mpegpipe muxer re-runs its own CFR conversion on top,
         # which can diverge from the reference's fps filter at the same
@@ -240,8 +242,11 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
     ff_cmd += ["-pix_fmt", "yuv420p10le", "-strict", "-1",
                "-f", "yuv4mpegpipe", "-"]
 
+    # --webm 0 pins IVF: release builds are compiled without WebM output,
+    # a build with it defaults to WebM, and the two must not differ.
     enc_cmd = [
         str(cfg["encoder_exe"]), "-i", "stdin", "-b", str(enc_out),
+        "--webm", "0",
         "--preset", str(cfg["preset"]), "--crf", crf_str(crf),
         "--tune", str(cfg["tune"]), "--film-grain", str(cfg["film_grain"]),
         "--film-grain-denoise", "0",
@@ -298,8 +303,12 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
         rendered = True
 
     show = show_progress and sys.stdout.isatty()
+    # --progress 2's line. Under 1 frame per second the encoder states
+    # frames per MINUTE ("fpm"), which a 4K encode at a slow preset
+    # reaches. NO_COLOR below keeps ANSI colors out of the line (Windows
+    # builds never color it).
     prog_re = re.compile(
-        rb"Encoding:\s+(\d+)(?:/(\d+))?\s+Frames\s+@\s+([\d.]+)\s+fps"
+        rb"Encoding:\s+(\d+)(?:/(\d+))?\s+Frames\s+@\s+([\d.]+)\s+fp([sm])"
         rb"\s+\|\s+([\d.]+)\s+kb/s"
     )
 
@@ -310,6 +319,7 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
             enc = subprocess.Popen(
                 enc_cmd, stdin=ffp.stdout,
                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                env={**os.environ, "NO_COLOR": "1"},
             )
             ffp.stdout.close()  # let EPIPE reach ffmpeg if the encoder dies
 
@@ -338,10 +348,11 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
                     pm = prog_re.search(line)
                     if pm:
                         if show and time.time() - last_render >= 0.2:
+                            per = 60 if pm.group(4) == b"m" else 1
                             render(
                                 int(pm.group(1)),
                                 int(pm.group(2)) if pm.group(2) else 0,
-                                float(pm.group(3)), float(pm.group(4)),
+                                float(pm.group(3)) / per, float(pm.group(5)),
                             )
                     else:
                         tail.append(line.decode("utf-8", "replace"))
@@ -391,28 +402,29 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
     if not enc_out.exists() or enc_out.stat().st_size == 0:
         raise RuntimeError("Encoder produced no output")
 
-    if not is_full:
-        if dest.exists():
-            dest.unlink()
-        enc_out.rename(dest)
+    if not full:
+        enc_out.replace(dest)
         _temp_files.discard(enc_out)
         return
 
     # Remux: AV1 video from the encoder + audio/subs/chapters/attachments
     # from the source (shared with av1q's full encodes — the SRT/drop
-    # subtitle fallback ladder lives in core.segments).
+    # subtitle fallback ladder lives in core.segments). The encoder writes
+    # the picture from 0, so its start on the source's timeline comes from
+    # the source itself.
     tmp_mkv = dest.with_suffix(".tmp.mkv")
     _temp_files.add(tmp_mkv)
-    mux_with_source_streams(enc_out, source, tmp_mkv)
+    mux_with_source_streams(
+        enc_out, source, tmp_mkv,
+        start_ms=round(meta["picture_start"] * 1000),
+    )
 
     try:
         enc_out.unlink()
     except OSError:
         pass
     _temp_files.discard(enc_out)
-    if dest.exists():
-        dest.unlink()
-    tmp_mkv.rename(dest)
+    tmp_mkv.replace(dest)
     _temp_files.discard(tmp_mkv)
 
 
@@ -447,12 +459,11 @@ class EssentialEngine(Engine):
     banner_extra = f" {DIM}SVT-AV1-Essential {MIDDOT} VMAF{RESET}"
     grid = QuarterGrid()
     vmaf_key_base = "vmaf"
-    sample_ext = ".webm"
+    sample_ext = ".ivf"  # the encoder's own output, pinned by --webm 0
     # The clean-sample temp is written by prep_sample's lossless x264
     # pass beside the shared concats, hence its pattern here.
     tmp_patterns = (
-        "*_CRF*.tmp.mkv", "_enc_*.tmp.webm", "sample_enc_*.tmp.webm",
-        "samples_*_clean.tmp.mkv",
+        "*_CRF*.tmp.mkv", "_enc_*.tmp.ivf", "samples_*_clean.tmp.mkv",
     )
     ffmpeg_encoders = ("libx264",)  # clean_sample_source's lossless pass
     ffmpeg_filters = ("libvmaf",)
@@ -489,6 +500,18 @@ class EssentialEngine(Engine):
 
     def setup(self, cfg):
         cfg["encoder_exe"] = find_encoder()  # raises FileNotFoundError
+        # The encoder writes every encode into the cache root, and reads
+        # that path as ANSI on Windows: a folder with no ASCII spelling
+        # would fail every file after its scan and samples were paid for.
+        self.make_dirs(cfg)
+        cfg["e_scratch"] = ascii_dir(cfg["e_cache_dir"])
+        if cfg["e_scratch"] is None:
+            raise OSError(
+                f"SvtAv1EncApp cannot write under {cfg['e_cache_dir']}: it"
+                f" reads file paths in the Windows code page, and that"
+                f" folder has no short ASCII name. Move the av1q folder to"
+                f" a path with only ASCII characters."
+            )
         # Optional, powers the SSIMULACRA2 info column only. Probed (and
         # on first run downloaded) here so that happens before the seed
         # prompt, not mid-search; the result is memoized.
@@ -506,10 +529,16 @@ class EssentialEngine(Engine):
         return None
 
     def prepare_meta(self, source, meta, cfg):
+        # Read once per file, used by every full encode of it: the Y4M
+        # pipe carries no timestamps, so the feed's rate and the
+        # picture's start against the audio (restored at the mux) come
+        # from ffmpeg's own decode of the source. Raises when the source
+        # decodes no frame, which no encode of it could survive either.
+        timing = picture_timing(source)
+        meta["picture_start"] = timing["start"]
+        meta["picture_rate"] = timing["rate"]
         # HDR10 static metadata rides the encoder flags (Y4M carries
-        # none); fetched once per file, used by every encode of it. The
-        # CFR feed's nominal cadence (meta["rfps"]) already arrives with
-        # probe_video's metadata.
+        # none).
         meta["mastering"] = meta["cll"] = None
         if meta["hdr"]:
             meta["mastering"], meta["cll"] = probe_hdr_metadata(source)
@@ -522,13 +551,13 @@ class EssentialEngine(Engine):
 
     def encode(self, source, dest, meta, q, cfg,
                show_progress=False, expected_frames=0, resumable=False):
-        # resumable is ignored: the Y4M pipe has no resume path (the
-        # standalone encoder muxes its own output, so there is no
-        # segment-muxer seam to split it at). Build on av1q's segmented
-        # design first; adapt here only once it has proven out.
+        # resumable marks a full-file output. Its resume half does not
+        # apply: the standalone encoder writes its own container from a
+        # pipe, so there is no segment muxer to cut the encode at.
         encode_essential(
             source, dest, meta, q, cfg,
             show_progress=show_progress, expected_frames=expected_frames,
+            full=resumable,
         )
 
     def ssimu2_info(self, ref, dist, meta, cfg, ref_index=None):
