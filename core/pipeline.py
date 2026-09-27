@@ -580,10 +580,14 @@ def process_videos(cfg, engine):
             even_sampling = False
             complexity = []  # per-window complexity; used for the margin estimate
             plan = sampling_plan(meta["duration"], cfg)
+            # Mini-plan runs keep their own cohort (see cohort_keys). Set
+            # outside the sampling branch: a resumed search still rolls
+            # its cached sample measurements in after the verify.
+            mini_sampling = bool(plan) and plan[2] == "mini"
 
             if existing_q is None and plan:
-                n_samples, s_dur, plan_mode = plan
-                if plan_mode == "mini":
+                n_samples, s_dur, _ = plan
+                if mini_sampling:
                     print(
                         f"{label('short')}{meta['duration']:.0f}s source →"
                         f" mini-samples ({n_samples}×{s_dur:.0f}s)"
@@ -755,7 +759,7 @@ def process_videos(cfg, engine):
                         0.0 if even_sampling
                         else scene_offset_center(bias, cfg["bitrate_margin"])
                     ),
-                    even=even_sampling,
+                    even=even_sampling, mini=mini_sampling,
                 )
                 if off is not None and abs(off) >= 0.1:
                     sample_target = clamp(target + off, 0.0, 100.0)
@@ -809,7 +813,7 @@ def process_videos(cfg, engine):
                 # the search a step early and cost a second full encode.
                 rat_prior, rat_src = ratio_prior(
                     cache.get("calibration"), global_cal, search_margin,
-                    even=even_sampling,
+                    even=even_sampling, mini=mini_sampling,
                 )
                 if (min_kbps and rat_prior is not None and rat_src != "per-file"
                         and abs(rat_prior - 1.0 / search_margin) >= 0.01):
@@ -1022,8 +1026,9 @@ def process_videos(cfg, engine):
                 # representative (evenly-spaced) measurements into the
                 # scene cohort would dilute the selection bias it exists
                 # to measure and mis-aim every scene-sampled file after
-                # them. Decay is engine physics, not selection bias —
-                # both modes share one average.
+                # them. Mini-plan runs keep their own cohort the same way.
+                # Decay is engine physics, not selection bias — every
+                # cohort shares one average.
                 if (fresh_offset is not None or fresh_ratio is not None
                         or fresh_decay is not None):
                     update_global_calibration(
@@ -1031,7 +1036,7 @@ def process_videos(cfg, engine):
                         vmaf_offset=fresh_offset,
                         ratio=fresh_ratio,
                         decay=fresh_decay,
-                        even=even_sampling,
+                        even=even_sampling, mini=mini_sampling,
                     )
                     global_cal = load_global_calibration(root_cache)
 

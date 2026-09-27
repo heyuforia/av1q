@@ -178,8 +178,8 @@ def main():
         help="Minimum CRF / highest quality, 0.25 steps (default: 18)",
     )
     parser.add_argument(
-        "--max-crf", type=float, default=38.0,
-        help="Maximum CRF / lowest quality, 0.25 steps (default: 38)",
+        "--max-crf", type=float, default=50.0,
+        help="Maximum CRF / lowest quality, 0.25 steps (default: 50)",
     )
     parser.add_argument(
         "--film-grain", type=int, default=24,

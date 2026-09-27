@@ -208,6 +208,15 @@ def extract_samples(source, scenes, keyframes, cfg, file_hash=None):
                 min(keyframes, key=lambda k: abs(k - sc["time"]))
                 if keyframes else sc["time"]
             )
+            # Input -ss lands on the last keyframe AT OR BEFORE the
+            # request, and stream copy keeps everything from there. A
+            # request that rounds below the snapped keyframe (7.111111 →
+            # 7.111) therefore pulls in the whole previous GOP: a 48s
+            # plan once came out 90s. Round the request UP past the
+            # keyframe instead; the +1µs covers ffprobe's own 6-decimal
+            # rounding, and ~1ms of slack cannot reach the next frame
+            # (frame durations are >= 8ms).
+            seek = math.ceil(start * 1000 + 1e-3) / 1000
             # Map the video stream explicitly: default stream selection
             # would also pick a subtitle stream (mov_text from MP4 fails
             # MKV stream copy outright) and picks the "best" video stream
@@ -216,7 +225,7 @@ def extract_samples(source, scenes, keyframes, cfg, file_hash=None):
             # kbps math reads their whole byte size as video.
             run_cmd([
                 ffmpeg_exe(), "-y", "-hide_banner", "-v", "error",
-                "-ss", f"{start:.3f}", "-i", str(source),
+                "-ss", f"{seek:.3f}", "-i", str(source),
                 "-t", f"{sc['duration']:.3f}",
                 "-map", "0:v:0",
                 "-c", "copy", "-an", "-avoid_negative_ts", "make_zero",

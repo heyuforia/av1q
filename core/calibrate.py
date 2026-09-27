@@ -54,13 +54,33 @@ _EVEN_KEYS = {
     "ratio": ("even_ratio", "n_even_ratio"),
 }
 
+# Mini-plan runs (a few 2s clips from a short source) are a third and
+# fourth population. Their clips cover a large share of a short file, so
+# their ratio sits near the file's own, while a standard plan's clips are
+# a sliver of a long one: on one real batch the mini runs averaged ~1.00
+# (even) and ~0.93 (scene), the long files ~0.96 and ~0.87. Steered by
+# the mini-heavy average, two long files (one of each mode) landed ~4%
+# under the floor and bought a second full encode of 34 and 63 minutes.
+# The standard plan keeps the original keys; these are purely additive.
+_MINI_SCENE_KEYS = {
+    "offset": ("mini_vmaf_offset", "n_mini_offset"),
+    "ratio": ("mini_ratio", "n_mini_ratio"),
+}
+_MINI_EVEN_KEYS = {
+    "offset": ("mini_even_vmaf_offset", "n_mini_even_offset"),
+    "ratio": ("mini_even_ratio", "n_mini_even_ratio"),
+}
 
-def cohort_keys(quantity, even):
+
+def cohort_keys(quantity, even, mini=False):
     """(value_key, count_key) in the cohort file for one quantity."""
+    if mini:
+        return (_MINI_EVEN_KEYS if even else _MINI_SCENE_KEYS)[quantity]
     return (_EVEN_KEYS if even else _SCENE_KEYS)[quantity]
 
 
-def calibration_offset(per_file_cal, global_cal, prior_center=0.0, even=False):
+def calibration_offset(per_file_cal, global_cal, prior_center=0.0, even=False,
+                       mini=False):
     """Pick the sample→full VMAF offset used to aim the sample search.
 
     Per-file calibration is a direct measurement of this exact file and is
@@ -76,8 +96,9 @@ def calibration_offset(per_file_cal, global_cal, prior_center=0.0, even=False):
     each; with no cohort at all the center itself is the best estimate
     and is returned directly.
 
-    `even` picks which cohort to read (see cohort_keys): the two sampling
-    modes measure different populations and never share an average.
+    `even` and `mini` pick which cohort to read (see cohort_keys): the
+    sampling modes and plans measure different populations and never
+    share an average.
 
     Returns (offset, source_label); (None, None) when neither source has
     a usable value and the center is 0. Values outside ±3.0 are treated
@@ -88,7 +109,7 @@ def calibration_offset(per_file_cal, global_cal, prior_center=0.0, even=False):
         if isinstance(o, (int, float)) and -3.0 <= o <= 3.0:
             return float(o), "per-file"
     if isinstance(global_cal, dict):
-        k_off, k_n = cohort_keys("offset", even)
+        k_off, k_n = cohort_keys("offset", even, mini)
         g_off = global_cal.get(k_off)
         if isinstance(g_off, (int, float)) and -3.0 <= g_off <= 3.0:
             n = global_cal.get(k_n)
@@ -190,7 +211,7 @@ def decay_prior(per_file_cal, global_cal, default=DEFAULT_BITRATE_DECAY):
 RATIO_MIN, RATIO_MAX = 0.5, 1.3
 
 
-def ratio_prior(per_file_cal, global_cal, margin, even=False):
+def ratio_prior(per_file_cal, global_cal, margin, even=False, mini=False):
     """Pick the sample→full bitrate ratio for the search's floor threshold.
 
     Mirrors decay_prior and calibration_offset: a per-file measured ratio
@@ -214,7 +235,8 @@ def ratio_prior(per_file_cal, global_cal, margin, even=False):
     their structural center is 1.0: EVEN_SAMPLE_MARGIN is a cold-start
     cushion against ratio noise, not a belief about the ratio, and
     shrinking toward it would hold every even-sampled file's threshold
-    ~5% above the truth no matter how much evidence accumulated.
+    ~5% above the truth no matter how much evidence accumulated. `mini`
+    picks the mini-plan cohort of the same mode; the centers are the same.
 
     Returns (ratio, source_label); (None, None) when neither source has a
     usable value (the search then falls back to the raw margin).
@@ -224,7 +246,7 @@ def ratio_prior(per_file_cal, global_cal, margin, even=False):
         if isinstance(r, (int, float)) and RATIO_MIN <= r <= RATIO_MAX:
             return float(r), "per-file"
     if isinstance(global_cal, dict):
-        k_rat, k_n = cohort_keys("ratio", even)
+        k_rat, k_n = cohort_keys("ratio", even, mini)
         g = global_cal.get(k_rat)
         if isinstance(g, (int, float)) and RATIO_MIN <= g <= RATIO_MAX:
             n = global_cal.get(k_n)
@@ -244,7 +266,7 @@ def ratio_prior(per_file_cal, global_cal, margin, even=False):
 
 
 def update_global_calibration(cache_dir, vmaf_offset=None, ratio=None,
-                              decay=None, even=False):
+                              decay=None, even=False, mini=False):
     """Roll new measurements into the cohort calibration cache.
 
     Per-file calibration only helps on re-runs of the same file. The
@@ -253,8 +275,9 @@ def update_global_calibration(cache_dir, vmaf_offset=None, ratio=None,
     a wasted second full encode. n is capped so the average stays
     responsive to drift (e.g. encoder/preset changes).
 
-    `even` routes the offset and ratio into that sampling mode's own
-    keys (see cohort_keys). Decay is skipped by the split on purpose: it
+    `even` and `mini` route the offset and ratio into that sampling
+    mode's and plan's own keys (see cohort_keys). Decay is skipped by the
+    split on purpose: it
     measures how this ENGINE's quantizer maps to bitrate, which is the
     same physics however the file was sampled, so both modes feed and
     read one shared average.
@@ -276,8 +299,8 @@ def update_global_calibration(cache_dir, vmaf_offset=None, ratio=None,
         g[key] = prev * (1 - weight) + float(val) * weight
         g[n_key] = n_new
 
-    roll(*cohort_keys("offset", even), vmaf_offset)
-    roll(*cohort_keys("ratio", even), ratio)
+    roll(*cohort_keys("offset", even, mini), vmaf_offset)
+    roll(*cohort_keys("ratio", even, mini), ratio)
     roll("decay", "n_decay", decay)
     g["t"] = time.time()
 
