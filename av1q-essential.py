@@ -106,7 +106,7 @@ def vmaf_cached_e(ref, dist, meta, crf, cache, cache_path, cfg, tag=None):
     """
     return core_vmaf.vmaf_cached(
         ref, dist, meta, crf, cache, cache_path, tag=tag,
-        threads=cfg.get("vmaf_threads") or (os.cpu_count() or 4),
+        threads=os.cpu_count() or 4,
         log_dir=cfg["e_cache_dir"],
         key_base="vmaf", q_key=crf_str(crf),
         measure=lambda *a: measure_vmaf(*a),
@@ -123,7 +123,7 @@ def search_crf(source, meta, target, cache, cache_path, enc_func, cfg, tag=None)
     Compat wrapper over the shared brain (core.search.search) with the
     Essential engine. The measurement closures resolve this module's
     globals at call time, so monkeypatching this module's vmaf_cached_e /
-    probe_video keeps working.
+    probe_video / ssimu2_info keeps working.
     """
     return core_search.search(
         source, meta, target, cache, cache_path, enc_func, cfg, _ENGINE,
@@ -133,7 +133,7 @@ def search_crf(source, meta, target, cache, cache_path, enc_func, cfg, tag=None)
         probe_fn=lambda f: probe_video(f),
         s2_fn=lambda ref, dist, m, ri: ssimu2_info(
             ref, dist, m, cfg, ref_index=ri),
-        s2_ref_index=cfg.get("_search_ref_index"),
+        s2_ref_index=core_search.search_ref_index(_ENGINE, cfg, source, tag),
     )
 
 

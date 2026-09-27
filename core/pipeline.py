@@ -33,8 +33,8 @@ from .calibrate import (
     scene_offset_center, update_global_calibration,
 )
 from .constants import (
-    BITRATE_BAND, COMPLEXITY_MARGIN_FLOOR, ENDGAME_SNAP_GAIN,
-    EVEN_SAMPLE_MARGIN, INTRA_ONLY_CODECS, MIN_BITRATE_KBPS,
+    BITRATE_BAND, COMPLEXITY_MARGIN_FLOOR, DEFAULT_VMAF_SLOPE,
+    ENDGAME_SNAP_GAIN, EVEN_SAMPLE_MARGIN, INTRA_ONLY_CODECS, MIN_BITRATE_KBPS,
     MINI_SAMPLE_COUNT, MINI_SAMPLE_DURATION, MINI_SAMPLE_MIN_RATIO,
     TARGET_VMAF_BY_RES, VIDEO_EXTENSIONS, VMAF_OVERSHOOT,
 )
@@ -296,12 +296,8 @@ def process_videos(cfg, engine):
             # verify, and refine all route through here so every score
             # lands in (and reuses) the same frozen cache layout.
             def measure(ref, dist, q, tag=None):
-                # Sample measurements pair frames by index (the pair is
-                # frame-aligned by construction; its container
-                # timestamps are not trustworthy) — see measure_vmaf.
-                m = {**meta, "vmaf_pair": "index"} if tag else meta
                 return core_vmaf.vmaf_cached(
-                    ref, dist, m, q, cache, cp, tag=tag,
+                    ref, dist, meta, q, cache, cp, tag=tag,
                     threads=vmaf_threads, log_dir=root_cache,
                     key_base=engine.vmaf_key_base, q_key=grid.fmt(q),
                 )
@@ -765,7 +761,7 @@ def process_videos(cfg, engine):
                     ),
                     even=even_sampling, mini=mini_sampling,
                 )
-                if off is not None and abs(off) >= 0.1:
+                if off is not None and abs(off) >= cfg["vmaf_tolerance"]:
                     sample_target = clamp(target + off, 0.0, 100.0)
                     print(
                         f"{label('calibr')}sample target"
@@ -855,8 +851,10 @@ def process_videos(cfg, engine):
                 )
                 t_vmaf += vt
 
+            # The search returns nothing only when its first probe could
+            # not be measured.
             if best_q is None:
-                print(f" {CROSS} No valid {engine.qname} found")
+                print(f" {CROSS} Search stopped: the first probe has no VMAF")
                 continue
 
             # Mark the search as completed for BOTH search paths. Written
@@ -890,8 +888,13 @@ def process_videos(cfg, engine):
                 print(f"   Run without --dry-run to encode")
                 continue
 
+            # The full-file search's probes ARE full encodes: what it
+            # measured of them is reused below, never measured twice.
+            full_search = not sample_src and existing_q is None
+            full_probes = search_state if full_search else {}
+
             # SSIMU2 info per full-encode quantizer (display only).
-            s2_seen = {}
+            s2_seen = dict(full_probes.get("ssimu2", {}))
 
             def size_kbps_suffix(path, kbps):
                 """Trailing 'size  video-kbps' field for a full-encode result
@@ -909,10 +912,10 @@ def process_videos(cfg, engine):
                     parts.append(f"{kbps}kbps")
                 return f"  {DIM}{' '.join(parts)}{RESET}" if parts else ""
 
-            # Bitrate of the verified best_q encode: shown on the verify
-            # line and reused by the calibration block below so video_kbps
-            # is only computed once for that encode.
-            actual_kbps_now = None
+            # Bitrate of the best_q encode: read once, by the verify below
+            # or already by the full-file search, and reused by the
+            # calibration block and the refine loop.
+            actual_kbps_now = full_probes.get("kbps", {}).get(best_q)
 
             # Final full encode at the candidate quantizer + VMAF verify
             if sample_src or existing_q is not None:
@@ -958,14 +961,6 @@ def process_videos(cfg, engine):
             sample_vmaf_at_best = entry_at_best.get(
                 f"sample_{engine.vmaf_key_base}"
             )
-            # Full-file search path skips the verify block above, so
-            # measure it here if it wasn't already.
-            if actual_kbps_now is None:
-                actual_kbps_now = (
-                    video_kbps(dst_path(best_q), meta["duration"])
-                    if meta["duration"] > 1 and dst_path(best_q).exists()
-                    else None
-                )
 
             cal_now = cache.get("calibration")
             cal_now = dict(cal_now) if isinstance(cal_now, dict) else {}
@@ -1054,7 +1049,8 @@ def process_videos(cfg, engine):
             # move is a slope-sized jump, not a step-by-1, so it
             # converges in 1-2 encodes.
             slope_v = clamp(
-                (search_state.get("vmaf_slope") if search_state else None) or 0.5,
+                (search_state.get("vmaf_slope") if search_state else None)
+                or DEFAULT_VMAF_SLOPE,
                 0.1, 2.0,
             )
             decay_b = clamp(
@@ -1220,7 +1216,8 @@ def process_videos(cfg, engine):
                     t_enc += time.time() - t0
                 t0 = time.time()
                 adj = measure(filepath, dst_path(try_q), try_q)
-                if math.isfinite(adj.get("mean", float("nan"))):
+                if (math.isfinite(adj.get("mean", float("nan")))
+                        and try_q not in s2_seen):
                     s2_seen[try_q] = engine.ssimu2_info(
                         filepath, dst_path(try_q), meta, cfg,
                         ref_index=full_idx,
@@ -1228,11 +1225,14 @@ def process_videos(cfg, engine):
                 t_vmaf += time.time() - t0
                 if not math.isfinite(adj.get("mean", float("nan"))):
                     break
-                adj_kbps = (
-                    video_kbps(dst_path(try_q), meta["duration"])
-                    if meta["duration"] > 1 and dst_path(try_q).exists()
-                    else None
-                )
+                # A step onto a full-file search probe reuses its bitrate.
+                adj_kbps = full_probes.get("kbps", {}).get(try_q)
+                if adj_kbps is None:
+                    adj_kbps = (
+                        video_kbps(dst_path(try_q), meta["duration"])
+                        if meta["duration"] > 1 and dst_path(try_q).exists()
+                        else None
+                    )
                 vc_a = vmaf_pass_color(adj["mean"], target, cfg["vmaf_tolerance"])
                 print(
                     f"{'':>{LABEL_W + 1}}VMAF {BOLD}{vc_a}{adj['mean']:.2f}{RESET}"
@@ -1321,9 +1321,10 @@ def process_videos(cfg, engine):
                 )
                 continue
 
-            # Final SSIMU2 info: reuse the verify/refine measurement of
-            # this exact encode when there is one, otherwise (full-file
-            # search path) measure once now. Membership, not the value:
+            # Final SSIMU2 info: reuse the search/verify/refine measurement
+            # of this exact encode when there is one, otherwise (a
+            # floor-bound full-file probe, whose VMAF and SSIMU2 were
+            # skipped) measure once now. Membership, not the value:
             # a None there is a skip or a failure already announced, and
             # measuring again would only repeat it.
             if best_q in s2_seen:

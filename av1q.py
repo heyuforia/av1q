@@ -87,18 +87,8 @@ def search_cq(source, meta, target, cache, cache_path,
     Compat wrapper over the shared brain (core.search.search) with av1q's
     integer-CQ engine. The measurement closures resolve this module's
     globals at call time, so monkeypatching av1q.vmaf_cached /
-    av1q.probe_video keeps working.
+    av1q.probe_video / av1q.measure_ssimu2_display keeps working.
     """
-    # Persistent FFMS2 index for the search source (SSIMU2 info column
-    # only). Stem + size keeps it stable across probes of one search but
-    # distinct when the underlying file changes (e.g. re-extracted samples).
-    try:
-        s2_ref_index = (
-            cache_path.parent / "_ffindex"
-            / f"{source.stem}_{source.stat().st_size}.ffindex"
-        )
-    except OSError:
-        s2_ref_index = None
     return core_search.search(
         source, meta, target, cache, cache_path, enc_func, cfg, _ENGINE,
         tag=tag,
@@ -106,8 +96,8 @@ def search_cq(source, meta, target, cache, cache_path,
             ref, dist, meta, q, cache, cache_path, threads, tag=tag),
         probe_fn=lambda f: probe_video(f),
         s2_fn=lambda ref, dist, m, ri: measure_ssimu2_display(
-            ref, dist, m, cache_path.parent, ref_index=ri),
-        s2_ref_index=s2_ref_index,
+            ref, dist, m, cfg["cache_dir"], ref_index=ri),
+        s2_ref_index=core_search.search_ref_index(_ENGINE, cfg, source, tag),
     )
 
 

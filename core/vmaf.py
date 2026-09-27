@@ -37,11 +37,11 @@ def measure_vmaf(ref, dist, meta, subsample, threads, cache_dir):
     meta["vmaf_pair"] == "index" pairs frames by INDEX instead of by
     timestamp: both chains get identical synthetic timestamps so
     framesync matches frame n with frame n — the same pairing FFVship
-    uses. The sample path sets this: its pair is frame-aligned by
-    construction (the clean source is CFR and feeds the encoder 1:1),
-    while its container timestamps inherit quirks from stream-copied
-    cuts of irregular sources — which the timestamp/fps chain turned
-    into one-sided dup/drops, collapsing sample VMAF (issue #4: flat
+    uses. vmaf_cached sets this for every sample measurement: the pair
+    is frame-aligned by construction (the search source feeds the
+    encoder 1:1), while its container timestamps inherit quirks from
+    stream-copied cuts of irregular sources — which the timestamp/fps
+    chain turned into one-sided dup/drops, collapsing sample VMAF (flat
     ~76 / P5 ~2 against a sane SSIMU2, even in software decode). The
     full path must keep timestamp pairing: there the encode-side CFR
     conversion changes the frame count, and mirroring that conversion
@@ -181,6 +181,10 @@ def vmaf_cached(ref, dist, meta, q, cache, cache_path, *, tag=None,
     being misread as VMAF — the sig never changes by policy, so these key
     names and `q_key` formats must never change either.
 
+    A tagged measurement is a sample probe, and sample pairs are matched
+    by frame index (see measure_vmaf); untagged full-file pairs keep
+    timestamp pairing.
+
     `measure` defaults to this module's measure_vmaf; the wrappers inject
     a late-binding closure so their module-level monkeypatch seam stays
     intact for the tests.
@@ -194,6 +198,8 @@ def vmaf_cached(ref, dist, meta, q, cache, cache_path, *, tag=None,
 
     if measure is None:
         measure = measure_vmaf
+    if tag:
+        meta = {**meta, "vmaf_pair": "index"}
     key = f"{tag}_{key_base}" if tag else key_base
     entry = cache["entries"].get(q_key)
 

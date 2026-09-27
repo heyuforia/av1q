@@ -3,10 +3,9 @@
 One implementation serves av1q (integer CQ grid) and av1q-essential
 (quarter-step CRF grid): all stepping goes through the engine's Grid and
 all measurement through injected closures, so the search never knows
-which encoder or cache layout sits behind it. av1q's integer-grid
-behavior is the contract of record; the generalization must not change
-it (quantize/clamp ordering is equivalent because bounds are on-grid —
-see Grid in core/engines/base.py).
+which encoder or cache layout sits behind it. Grid bounds are on-grid,
+so quantize-then-clamp equals clamp-then-quantize (see Grid in
+core/engines/base.py).
 
 Seeding lives here too: initial_cq_seed maps source-bitrate headroom
 over the floor to a starting quantizer.
@@ -17,11 +16,26 @@ import time
 
 from .bitrate import effective_sample_floor, measured_kbps
 from .constants import (
-    ENDGAME_SNAP_GAIN, INTRA_ONLY_CODECS, MIN_BITRATE_KBPS, VMAF_OVERSHOOT,
+    DEFAULT_VMAF_SLOPE, ENDGAME_SNAP_GAIN, FLOOR_BOUND_KBPS_RATIO,
+    FLOOR_BOUND_VMAF_MARGIN, INTRA_ONLY_CODECS, MIN_BITRATE_KBPS,
+    VMAF_OVERSHOOT,
 )
 from .probe import res_tier
-from .ui import BOLD, DIM, ORANGE, RESET, fmt_s2
-from .util import atomic_write_json, clamp
+from .ui import BOLD, DIM, RESET, fmt_s2, fmt_size, label
+from .util import atomic_write_json, clamp, partial_hash
+
+
+def search_ref_index(engine, cfg, source, tag):
+    """The search source's FFMS2 index for the SSIMU2 column, named as the
+    pipeline names it: the sample's own index when tagged, the source's
+    persistent one otherwise. For callers without the file hash at hand
+    (the launchers' search wrappers); None when the file can't be read."""
+    if tag:
+        return engine.sample_ref_index(cfg, source)
+    try:
+        return engine.full_ref_index(cfg, partial_hash(source))
+    except OSError:
+        return None
 
 
 def initial_cq_seed(source_kbps, floor_kbps, min_cq, max_cq, default_cq=30):
@@ -90,40 +104,56 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
       probe_fn(path)           -> probe_video() dict   (duration lookup)
       s2_fn(ref, dist, meta, ref_index) -> dict|None   SSIMU2 info column
 
-    Returns (best, vmaf_result, enc_time, vmaf_time, state) where state
-    carries the fitted slopes for the caller's refine loop.
+    Returns (best, vmaf_result, enc_time, vmaf_time, state). state
+    carries the fitted models for the caller's refine loop (the VMAF
+    slope and the measured decay are None unless probes measured them)
+    and each probe's bitrate and SSIMU2 result, keyed by quantizer. On
+    the full path those probes are the full encodes themselves.
     """
     grid = engine.grid
     min_q, max_q = engine.q_bounds(cfg)
     tol = cfg["vmaf_tolerance"]
-    slope = 0.5
+    slope = DEFAULT_VMAF_SLOPE
     # True once `slope` has been fitted from two real probe pairs. The
-    # cold-start 0.5 is only a guess; jumps sized by it can clamp onto a
-    # grid bound purely as a slope artifact, so decisions that treat a
-    # bound landing as *proof* (the min_q short-circuit below) must wait
-    # for a measured slope. An explicit flag rather than len(tested) >= 2:
-    # a NaN-VMAF entry must never count as a measurement.
+    # cold-start guess can size a jump that clamps onto a grid bound
+    # purely as a slope artifact, so decisions that treat a bound landing
+    # as *proof* (the min_q short-circuit below) must wait for a measured
+    # slope. An explicit flag rather than len(tested) >= 2: a NaN-VMAF
+    # entry must never count as a measurement.
     slope_measured = False
     enc_time = vmaf_time = 0.0
     tested = {}
     tested_paths = {}
+    # Probes whose VMAF measurement was asked for and failed. A skipped
+    # measurement (floor-bound probes, the min_q short-circuit) is assumed
+    # passing by monotonicity; a failed one proves nothing, so selection
+    # never picks it over a probe that measured.
+    failed = set()
+    # SSIMU2 result per probe that ran it (None: a skip already announced).
+    s2_seen = {}
 
     min_kbps = MIN_BITRATE_KBPS.get(res_tier(meta["w"], meta["h"]), 0)
-    # Duration drives the per-probe bitrate readout, which is shown for
-    # every probe now — not just files with a non-zero floor (SD is tier 0
-    # with min_kbps == 0 but its encodes still have a bitrate worth seeing).
-    # The full path's source IS the file, so its meta duration applies and
-    # no extra probe is needed; the sample path must probe the concat for
-    # its own (short) duration. The floor machinery below stays gated on
-    # min_kbps regardless.
+    # Duration turns each probe's size into its bitrate: the readout on
+    # every probe line, and the floor checks when a floor applies. The
+    # full path's source IS the file, so its probed duration applies; the
+    # sample path probes the search source for its own (short) one.
+    # Without a duration neither can run, which must not happen silently.
+    why = None
     if tag:
         src_duration = 0.0
         try:
             src_duration = probe_fn(source)["duration"]
-        except Exception:
-            pass
+        except (RuntimeError, OSError, ValueError) as e:
+            why = (str(e).strip().splitlines() or [type(e).__name__])[0]
     else:
         src_duration = meta.get("duration") or 0.0
+    if src_duration <= 0:
+        print(
+            f"{label('bitrate')}{DIM}{'sample' if tag else 'source'}"
+            f" duration unknown{f' ({why})' if why else ''}: no bitrate"
+            f" readout{' or floor check' if min_kbps else ''} in this"
+            f" search{RESET}"
+        )
 
     floor_cap = max_q
     bitrate_points = {}
@@ -149,6 +179,16 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
             min_kbps, cfg["bitrate_margin"], cache.get("calibration"),
             ratio_prior=ratio_prior,
         )
+
+    # The full path accepts a probe within ENDGAME_SNAP_GAIN under the
+    # floor, the same sliver refine and final selection waive: every
+    # probe there is a full encode, and one spent lifting the bitrate by
+    # less than that buys nothing. Sample probes are cheap predictions
+    # and get no waiver. The floor MODEL still aims at the floor itself.
+    waiver = 1.0 if tag else 1.0 - ENDGAME_SNAP_GAIN
+
+    def meets_floor(kbps):
+        return kbps >= eff_floor() * waiver
 
     def local_decay(target_kbps):
         """Bitrate decay d(log kbps)/dQ from the two tested points nearest
@@ -176,8 +216,8 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
         The R-Q curve is hyperbolic in quantizer (libaom and SVT-AV1 both
         model rate as R ∝ 1/Q), so it flattens at low q: a chord anchored
         on a distant high-bitrate point overestimates the decay near the
-        floor, landing probes 1-2 steps too high — the old first/last-point
-        fit then corrected one full encode at a time via floor_cap.
+        floor and lands probes 1-2 steps too high, each corrected one
+        encode at a time via floor_cap.
 
         With points on both sides of the floor, inverse quadratic
         interpolation through the three nearest (trusted only inside the
@@ -234,18 +274,19 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
             est = max(est, max(above))
         return est
 
+    def fit_slope(q0, vm0, q1, vm1):
+        """Refit the VMAF slope from two probes when both measured."""
+        nonlocal slope, slope_measured
+        if (q0 != q1 and math.isfinite(vm0["mean"])
+                and math.isfinite(vm1["mean"])):
+            slope = clamp(
+                abs(vm0["mean"] - vm1["mean"]) / abs(q0 - q1), 0.1, 1.5
+            )
+            slope_measured = True
+
     def test(q, measure=True):
         nonlocal enc_time, vmaf_time, floor_cap
         q = grid.quantize(clamp(q, min_q, max_q))
-        if q in tested:
-            # Upgrade a previously-skipped VMAF measurement if now needed
-            if measure and not math.isfinite(
-                tested[q].get("mean", float("nan"))
-            ) and q in tested_paths and tested_paths[q].exists():
-                t0 = time.time()
-                tested[q] = measure_fn(source, tested_paths[q], q)
-                vmaf_time += time.time() - t0
-            return q, tested[q]
 
         t0 = time.time()
         dst = enc_func(q)
@@ -255,6 +296,8 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
             t0 = time.time()
             vm = measure_fn(source, dst, q)
             vmaf_time += time.time() - t0
+            if not math.isfinite(vm["mean"]):
+                failed.add(q)
         else:
             vm = {"mean": float("nan"), "p5": float("nan")}
 
@@ -264,13 +307,12 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
         s2 = None
         if measure and math.isfinite(vm["mean"]):
             t0 = time.time()
-            s2 = s2_fn(source, dst, meta, s2_ref_index)
+            s2 = s2_seen[q] = s2_fn(source, dst, meta, s2_ref_index)
             vmaf_time += time.time() - t0
-        sz_mb = dst.stat().st_size / 1e6 if dst.exists() else 0
+        size = dst.stat().st_size if dst.exists() else 0
+        kbps = None
         if src_duration > 1:
             kbps = measured_kbps(dst, src_duration, tag)
-        else:
-            kbps = None
         kbps_str = f" {kbps}kbps" if kbps else ""
         vmaf_field = (
             f"  VMAF {BOLD}{vm['mean']:.2f}{RESET}  P5 {BOLD}{vm['p5']:.2f}{RESET}"
@@ -278,9 +320,9 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
             else f"  {DIM}VMAF skipped{RESET}"
         )
         print(
-            f" {ORANGE}{'search':<10}{RESET}{engine.qname} {BOLD}{grid.fmt(q)}{RESET}"
+            f"{label('search')}{engine.qname} {BOLD}{grid.fmt(q)}{RESET}"
             f"{vmaf_field}{fmt_s2(s2)}"
-            f"  {DIM}{sz_mb:.1f}MB{kbps_str}{RESET}"
+            f"  {DIM}{fmt_size(size)}{kbps_str}{RESET}"
         )
 
         if kbps:
@@ -291,27 +333,29 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
                 ] = kbps
                 atomic_write_json(cache_path, cache)
 
-        if min_kbps and src_duration > 1 and kbps:
+            # Anything above q would read lower still, so q caps the
+            # search even when the full path's waiver accepts q itself.
             ef = eff_floor()
-            if kbps <= ef:
+            if kbps < ef:
                 floor_cap = min(floor_cap, grid.quantize(q - grid.step))
-                label = "sample" if tag else "video"
-                print(
-                    f" {ORANGE}{'bitrate':<10}{RESET}{kbps}kbps {label} at"
-                    f" {engine.qname} {grid.fmt(q)} below {min_kbps}kbps floor"
-                    f" (threshold {int(ef)}kbps), capping at"
-                    f" {engine.qname} {BOLD}{grid.fmt(floor_cap)}{RESET}"
-                )
+                if not meets_floor(kbps):
+                    print(
+                        f"{label('bitrate')}{kbps}kbps"
+                        f" {'sample' if tag else 'video'} at"
+                        f" {engine.qname} {grid.fmt(q)} below {min_kbps}kbps"
+                        f" floor (threshold {int(ef)}kbps), capping at"
+                        f" {engine.qname} {BOLD}{grid.fmt(floor_cap)}{RESET}"
+                    )
 
         return q, vm
 
-    # Seed the first quantizer from source bitrate instead of a hardcoded
-    # 30. High source/floor ratio has more compression headroom, so we
-    # start closer to the answer. Falls back to 30 when source bitrate or
-    # floor is unknown — or when the source is an intra-only mezzanine
-    # codec (ProRes/DNxHD): those bitrates say nothing about AV1
+    # Seed the first quantizer from source-bitrate headroom over the
+    # floor. Falls back to 30 when the source bitrate or floor is unknown
+    # — or when the source is an intra-only mezzanine codec
+    # (ProRes/DNxHD): those bitrates say nothing about AV1
     # compressibility and would seed several steps too low, wasting a
-    # probe near-lossless.
+    # probe near-lossless. meta["bitrate"] is the container's rate, audio
+    # included, so the ratio reads high by the audio's share.
     src_kbps_hint = None
     if meta.get("bitrate") and meta.get("codec") not in INTRA_ONLY_CODECS:
         src_kbps_hint = int(meta["bitrate"] / 1000)
@@ -319,7 +363,7 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
     if user_seed is not None:
         seed_q = grid.quantize(clamp(user_seed, min_q, max_q))
         print(
-            f" {ORANGE}{'seed':<10}{RESET}{engine.qname}"
+            f"{label('seed')}{engine.qname}"
             f" {BOLD}{grid.fmt(seed_q)}{RESET} {DIM}(user){RESET}"
         )
     else:
@@ -328,7 +372,7 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
         ))
         if seed_q != 30:
             print(
-                f" {ORANGE}{'seed':<10}{RESET}{engine.qname}"
+                f"{label('seed')}{engine.qname}"
                 f" {BOLD}{grid.fmt(seed_q)}{RESET}"
                 f" {DIM}(source {src_kbps_hint or '?'}kbps vs floor {min_kbps or '-'}kbps){RESET}"
             )
@@ -337,54 +381,46 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
     if not math.isfinite(vm["mean"]):
         return None, None, enc_time, vmaf_time, None
 
-    # Where to aim inside the acceptance band [target - tol,
-    # target + VMAF_OVERSHOOT] differs by path. The full path ships
-    # whichever probe lands in the band first, so it aims at the target
-    # itself and satisfices — every probe there is a full encode. The
-    # sample path's landing is a PREDICTION INPUT: the final encode
-    # lands wherever the sample landed plus the sample→full offset
+    # Both paths aim at the center of the acceptance band [target - tol,
+    # target + VMAF_OVERSHOOT], so slope error spreads symmetrically
+    # inside it. They stop differently. The full path ships the first
+    # probe that lands in the band, because every probe there is a full
+    # encode. The sample path's landing is a PREDICTION INPUT: the final
+    # encode lands wherever the sample landed plus the sample→full offset
     # error, so any slack left here goes straight into the verify/refine
     # miss budget, where correcting it costs a full re-encode. Sample
-    # probes are cheap — aim at the band's center so slope error and
-    # offset error spread symmetrically inside it.
-    aim = target + (VMAF_OVERSHOOT - tol) / 2 if tag else target
+    # probes are cheap, so that path converges on the center itself.
+    aim = target + (VMAF_OVERSHOOT - tol) / 2
 
     # Floor-bound detection: VMAF comfortably above target AND bitrate well
     # below floor. In this regime VMAF is not binding — it's a pure bitrate
     # targeting problem. Skip VMAF on intermediate probes; verify once on
-    # the final candidate. Monotonicity (lower q → higher VMAF) keeps this
-    # safe as long as the seed test already cleared target.
+    # the final candidate.
     floor_bound = bool(
-        min_kbps and vm["mean"] > target + 2.0
+        min_kbps and vm["mean"] > target + FLOOR_BOUND_VMAF_MARGIN
         and q in bitrate_points
-        and bitrate_points[q] < eff_floor() * 0.80
+        and bitrate_points[q] < eff_floor() * FLOOR_BOUND_KBPS_RATIO
     )
     if floor_bound:
         print(
-            f" {ORANGE}{'mode':<10}{RESET}floor-bound "
+            f"{label('mode')}floor-bound "
             f"{DIM}(skipping VMAF on intermediate probes){RESET}"
         )
 
-    # Proactive bitrate jump: go straight to the extrapolated floor
-    # quantizer. Only when the model puts the crossing below the current
-    # one — when est >= q the current probe already sits at the predicted
-    # ceiling and the main loop accepts it without spending another encode.
-    if (min_kbps and (floor_bound or vm["mean"] >= target - tol)
-            and q in bitrate_points
-            and bitrate_points[q] < eff_floor() * 1.10
-            and q - grid.step >= min_q):
-        est_q = estimate_max_q_for_floor()
-        floor_q = grid.quantize(clamp(est_q, min_q, q - grid.step))
-        if est_q < q and floor_q not in tested:
+    # Proactive bitrate jump: a seed that passes VMAF but misses the floor
+    # goes straight to the extrapolated floor quantizer. Missing the floor
+    # puts the model's crossing below the seed, so the jump always moves
+    # down; at min_q there is nowhere to go.
+    seed_kbps = bitrate_points.get(q)
+    if (vm["mean"] >= target - tol and seed_kbps
+            and not meets_floor(seed_kbps)):
+        floor_q = grid.quantize(
+            clamp(estimate_max_q_for_floor(), min_q, q - grid.step)
+        )
+        if floor_q < q:
             prev_q, prev_vm = q, vm
             q, vm = test(floor_q, measure=not floor_bound)
-            if (math.isfinite(vm["mean"]) and math.isfinite(prev_vm["mean"])
-                    and prev_q != q):
-                slope = clamp(
-                    abs(prev_vm["mean"] - vm["mean"]) / abs(prev_q - q),
-                    0.1, 1.5,
-                )
-                slope_measured = True
+            fit_slope(prev_q, prev_vm, q, vm)
 
     if floor_bound:
         # Bitrate-only convergence: keep picking the estimated floor
@@ -393,26 +429,20 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
         for _ in range(4):
             effective_max = min(max_q, floor_cap, estimate_max_q_for_floor())
             current_kbps = bitrate_points.get(q, 0)
-            # Compare against the sample-converted threshold, not the raw
-            # video floor: on the sample path they differ (eff_floor is
-            # min_kbps scaled by the ratio/margin), and with a learned
-            # ratio > 1 the raw floor sits ABOVE the threshold — gating
-            # on it walked past points the model already accepted.
-            q_violates_floor = (
-                q in bitrate_points and bitrate_points[q] < eff_floor()
-            )
-            if (q >= effective_max and current_kbps >= eff_floor()
-                    and not q_violates_floor):
+            # meets_floor compares against the sample-converted threshold,
+            # not the raw video floor: with a learned ratio > 1 the raw
+            # floor sits ABOVE the threshold, and gating on it walked past
+            # points the model already accepted.
+            if (q >= effective_max and current_kbps
+                    and meets_floor(current_kbps)):
                 print(
-                    f" {ORANGE}{'accept':<10}{RESET}bitrate floor met at"
+                    f"{label('accept')}bitrate floor met at"
                     f" {engine.qname} {BOLD}{grid.fmt(q)}{RESET}"
                 )
                 break
 
-            next_q = grid.quantize(
-                clamp(estimate_max_q_for_floor(), min_q, effective_max)
-            )
-            if (next_q == q and current_kbps < eff_floor()
+            next_q = grid.quantize(max(min_q, effective_max))
+            if (next_q == q and not meets_floor(current_kbps)
                     and q - grid.step >= min_q):
                 next_q = grid.quantize(q - grid.step)
             if next_q == q or next_q in tested:
@@ -423,9 +453,13 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
                 break
     else:
         # The sample path gets one extra iteration: converging on the aim
-        # (instead of stopping anywhere in the band) occasionally takes
-        # one more cheap probe than band-satisficing did.
+        # instead of stopping anywhere in the band occasionally takes one
+        # more cheap probe.
         for _ in range(5 if tag else 4):
+            # A failed measurement ends the probing (selection below never
+            # picks it); every other probe in this loop is measured.
+            if not math.isfinite(vm["mean"]):
+                break
             in_band = target - tol <= vm["mean"] <= target + VMAF_OVERSHOOT
             if tag is None and in_band:
                 break
@@ -444,8 +478,7 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
             # and this point's bitrate isn't already below the predicted
             # floor.
             q_violates_floor = (
-                min_kbps and q in bitrate_points
-                and bitrate_points[q] < eff_floor()
+                q in bitrate_points and not meets_floor(bitrate_points[q])
             )
             if (vm["mean"] >= target - tol
                     and q >= effective_max and not q_violates_floor):
@@ -462,7 +495,7 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
                     else f"is the highest {engine.qname} allowed"
                 )
                 print(
-                    f" {ORANGE}{'accept':<10}{RESET}VMAF passes and"
+                    f"{label('accept')}VMAF passes and"
                     f" {engine.qname} {BOLD}{grid.fmt(q)}{RESET}"
                     f" {held_by}"
                 )
@@ -502,7 +535,7 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
             if (tag is not None and slope_measured and next_q == min_q
                     and next_q not in tested and vm["mean"] < target - tol):
                 print(
-                    f" {ORANGE}{'accept':<10}{RESET}{engine.qname}"
+                    f"{label('accept')}{engine.qname}"
                     f" {BOLD}{grid.fmt(min_q)}{RESET} is max quality and VMAF"
                     f" still short — selecting it without a sample probe"
                 )
@@ -521,7 +554,7 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
                 snap_decay = local_decay(eff_floor()) or default_decay
                 if (next_q - q) * snap_decay < -math.log1p(-ENDGAME_SNAP_GAIN):
                     print(
-                        f" {ORANGE}{'accept':<10}{RESET}{engine.qname}"
+                        f"{label('accept')}{engine.qname}"
                         f" {grid.fmt(next_q)} would trim under"
                         f" {ENDGAME_SNAP_GAIN:.0%} bitrate — keeping"
                         f" {engine.qname} {BOLD}{grid.fmt(q)}{RESET}"
@@ -533,24 +566,16 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
 
             prev_q, prev_vm = q, vm
             q, vm = test(next_q)
-            if not math.isfinite(vm["mean"]):
-                break
-            if prev_q != q:
-                slope = clamp(
-                    abs(prev_vm["mean"] - vm["mean"]) / abs(prev_q - q),
-                    0.1, 1.5,
-                )
-                slope_measured = True
+            fit_slope(prev_q, prev_vm, q, vm)
 
     def valid_q(c):
+        if c in failed:
+            return False
         vm_c = tested[c]
         if math.isfinite(vm_c["mean"]) and vm_c["mean"] < target - tol:
             return False
-        if min_kbps and src_duration > 1 and c in tested_paths:
-            kbps = measured_kbps(tested_paths[c], src_duration, tag)
-            if kbps and kbps < eff_floor():
-                return False
-        return True
+        kbps = bitrate_points.get(c)
+        return not kbps or meets_floor(kbps)
 
     valid = [c for c in tested if valid_q(c)]
     if tag is None or floor_bound:
@@ -560,13 +585,11 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
         best = max(valid, default=None)
     else:
         # The sample path stepped toward the aim, so several in-band
-        # candidates can exist; pick the landing closest to it. Under
-        # monotone VMAF this equals the old max(valid) whenever every
-        # candidate sits above the aim, and picks the better-centered
-        # one when the probes straddle it — a band-bottom pick would
-        # hand its slack straight to the full-encode miss budget.
-        # VMAF-less entries (the min_q short-circuit) rank last; ties
-        # prefer the higher quantizer (smaller file).
+        # candidates can exist; pick the landing closest to it — a
+        # band-bottom pick would hand its slack straight to the
+        # full-encode miss budget. VMAF-less entries (the min_q
+        # short-circuit) rank last; ties prefer the higher quantizer
+        # (smaller file).
         def aim_dist(c):
             m = tested[c].get("mean", float("nan"))
             return abs(m - aim) if math.isfinite(m) else float("inf")
@@ -583,8 +606,8 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
     # Guarantee a VMAF measurement on the returned candidate (floor-bound
     # path may have skipped it). Monotonicity makes a failure here very
     # unlikely — floor-bound only triggers when the seed already cleared
-    # target by 2, and every subsequent probe is at a lower quantizer
-    # (higher VMAF).
+    # target by FLOOR_BOUND_VMAF_MARGIN, and every subsequent probe is at
+    # a lower quantizer (higher VMAF).
     if (best is not None and not math.isfinite(tested[best]["mean"])
             and best in tested_paths and tested_paths[best].exists()):
         t0 = time.time()
@@ -593,8 +616,8 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
 
     # Slopes for caller's post-search refinement. Decay is fitted from the
     # points nearest the floor — the regime where the refine loop uses it.
-    # measured_decay is None unless probes actually measured it, so the
-    # caller never rolls the cold-start default into the calibration.
+    # Neither measured value falls back to its cold-start guess, so the
+    # caller never rolls a guess into the calibration.
     bitrate_decay = default_decay
     measured_decay = None
     if min_kbps:
@@ -602,9 +625,11 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
         if m:
             bitrate_decay = measured_decay = m
     state = {
-        "vmaf_slope": slope,
+        "vmaf_slope": slope if slope_measured else None,
         "bitrate_decay": bitrate_decay,
         "measured_decay": measured_decay,
+        "kbps": dict(bitrate_points),
+        "ssimu2": s2_seen,
     }
 
     return best, tested.get(best), enc_time, vmaf_time, state

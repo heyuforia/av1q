@@ -79,11 +79,11 @@ FALLBACK_MAXRATE = {
 MIN_BITRATE_KBPS = {0: 0, 720: 1000, 1080: 1800, 1440: 2500, 2160: 4500, 4320: 8000}
 
 # Bitrate acceptance band: a video anywhere in [floor, floor × BITRATE_BAND]
-# has hit the floor closely enough. The search and the refine loop both aim
-# at the floor but accept the whole band, so neither spends an extra full
-# encode shaving the last few percent off a video that's already there
-# (e.g. trimming 5330kbps toward 5000 when the floor is 5000). 1.1 keeps the
-# overshoot under ~one CQ grid step.
+# has hit the floor closely enough. The refine loop accepts the whole band,
+# so it never spends an extra full encode shaving the last few percent off
+# a video that's already there (e.g. trimming 5330kbps toward 5000 when the
+# floor is 5000), and its bitrate jumps aim at the band's center. 1.1 keeps
+# the overshoot under ~one CQ grid step.
 BITRATE_BAND = 1.1
 
 # Sample→full bitrate margin for evenly-spaced sampling. The normal margin
@@ -159,10 +159,31 @@ SCENE_OFFSET_PRIOR = -0.75
 # blending Essential's cohort toward it taxed that engine's early files.
 DEFAULT_BITRATE_DECAY = math.log(2) / 6
 
+# Cold-start VMAF points per quantizer step, before two probes have
+# measured the local slope. It only sizes the first jump: the search
+# refits from every probe pair, and a bound landing sized by this guess
+# is never taken as proof (the min_q short-circuit in core/search.py
+# waits for a measured slope). The refine loop starts from it too when
+# the search measured none.
+DEFAULT_VMAF_SLOPE = 0.5
+
+# Floor-bound mode: a seed that clears the target by at least
+# FLOOR_BOUND_VMAF_MARGIN while its bitrate sits under
+# FLOOR_BOUND_KBPS_RATIO × the floor threshold is a bitrate problem, not
+# a quality one, so the search stops measuring VMAF on the probes that
+# walk down to the floor. The margin is what makes the skip safe: every
+# later probe sits at a lower quantizer and scores higher still, and the
+# chosen one is measured once at the end.
+FLOOR_BOUND_VMAF_MARGIN = 2.0
+FLOOR_BOUND_KBPS_RATIO = 0.80
+
 # A re-encode predicted to trim less than this fraction of bitrate costs
 # more than it buys — the full-file search endgame and the refine loop
-# both accept the current point instead (sample probes are cheap and are
-# never snapped: there the extra probe still shrinks the final encode).
+# both accept the current point instead. The same economics waive a
+# shortfall this close under the floor, in the full-file search, the
+# refine loop and final selection alike: lifting bitrate by less buys
+# nothing either. Sample probes are cheap and are never snapped or
+# waived: there the extra probe still shrinks the final encode.
 ENDGAME_SNAP_GAIN = 0.03
 
 # Resumable segmented encodes. Full encodes of sources at least this long
