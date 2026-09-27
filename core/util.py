@@ -106,15 +106,26 @@ def run_launcher(main):
 def atomic_write_json(path, obj, indent=None):
     """Write JSON to `path` atomically: serialize to a sibling .tmp file,
     flush it to disk, then replace. Neither a crash mid-write nor a power
-    cut right after the rename can leave a torn or empty cache/sidecar —
+    cut right after the rename can leave a torn or empty cache/sidecar:
     without the fsync the rename can land before the data does.
+
+    A write stopped by an error or Ctrl-C deletes its .tmp. One left by a
+    hard kill carries the target's own name, so the next write of that
+    target replaces it.
     """
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(json.dumps(obj, indent=indent))
-        f.flush()
-        os.fsync(f.fileno())
-    tmp.replace(path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(obj, indent=indent))
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def make_temp_log(cache_dir, prefix, ext):

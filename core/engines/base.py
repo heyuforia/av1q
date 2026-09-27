@@ -179,18 +179,18 @@ class Engine:
         meta["mastering"] = meta["cll"] = None
         if not meta["hdr"]:
             return None
-        read = probe_hdr_metadata(source)
-        if read is None:
+        try:
+            meta["mastering"], meta["cll"] = probe_hdr_metadata(source)
+        except RuntimeError as e:
             if not self.hdr10_passthrough:
                 raise RuntimeError(
-                    "HDR10 static metadata could not be read, and this"
-                    " encode would carry none, so the file is stopped"
-                )
+                    f"HDR10 static metadata could not be read ({e}), and"
+                    f" this encode would carry none, so the file is stopped"
+                ) from None
             return (
-                "static metadata could not be read,"
-                " the encode keeps only what ffmpeg passes on"
+                f"static metadata could not be read ({e}),"
+                f" the encode keeps only what ffmpeg passes on"
             )
-        meta["mastering"], meta["cll"] = read
         if not (meta["mastering"] or meta["cll"]):
             return "no static metadata in the source"
         if mux_states_hdr10():

@@ -314,6 +314,14 @@ def _http_download(url, label, total=0):
     return b"".join(chunks)
 
 
+def _staging_path(dest, name):
+    """Where a download of `name` into dest is written before it is
+    trusted: a name the lookup never matches, carrying this process's id
+    so two first runs launched together never write or delete each
+    other's file."""
+    return dest / f"partial-{os.getpid()}-{name}"
+
+
 def _fetch_pinned(url, label, sha256):
     """The body of a pinned release file; raises ValueError unless its
     SHA-256 is the pinned one."""
@@ -339,7 +347,7 @@ def _download_ffvship(dest):
     vendor = _gpu_vendor()
     name = f"FFVship {_FFVSHIP_VERSION} {vendor}"
     exe = dest / "FFVship.exe"
-    staged = dest / f"partial-{exe.name}"
+    staged = _staging_path(dest, exe.name)
     try:
         data = _fetch_pinned(
             _FFVSHIP_URL.format(version=_FFVSHIP_VERSION, vendor=vendor),
@@ -365,6 +373,12 @@ def _download_ffvship(dest):
         staged.replace(exe)
         return exe
     except Exception as e:
+        # The lookup found no exe and an install lands it last, so one
+        # here now is the same pinned install finished by a run launched
+        # beside this one. Windows refuses to overwrite a file that run
+        # has open, which is the likely failure here; its copy serves.
+        if exe.is_file():
+            return exe
         print(f"{DIM}{name} download failed ({e}){RESET}")
         return None
     finally:
@@ -404,7 +418,7 @@ def _download_encoder(dest):
     for build, sha256 in _ENCODER_BUILDS.get(sys.platform, ()):
         name = f"SvtAv1EncApp-{_ENCODER_VERSION}-Essential-{build}"
         exe = dest / name
-        staged = dest / f"partial-{name}"
+        staged = _staging_path(dest, name)
         try:
             data = _fetch_pinned(
                 _ENCODER_URL.format(version=_ENCODER_VERSION, name=name),
@@ -424,6 +438,10 @@ def _download_encoder(dest):
                 return exe
             print(f"{DIM}{name} can't run on this CPU{RESET}")
         except Exception as e:
+            # As in _download_ffvship: a run launched beside this one
+            # installed the same build first and may be running it.
+            if exe.is_file():
+                return exe
             print(f"{DIM}{name} failed ({e}){RESET}")
         finally:
             try:

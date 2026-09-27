@@ -289,7 +289,9 @@ HDR_KEYFRAME_WINDOW = 600
 def _keyframe_side_data(filepath, packets):
     """The side-data list of each keyframe ffprobe decodes among the
     first `packets` packets of v:0, in output order ([] when none
-    decodes), or None when ffprobe fails."""
+    decodes). Raises RuntimeError saying why when ffprobe gives no
+    answer."""
+    timeout = 120
     try:
         r = subprocess.run(
             [ffprobe_exe(), "-v", "error", "-skip_frame", "nokey",
@@ -298,14 +300,22 @@ def _keyframe_side_data(filepath, packets):
              "-show_entries", "frame=side_data_list",
              "-of", "json", str(filepath)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace", timeout=120,
+            text=True, encoding="utf-8", errors="replace", timeout=timeout,
         )
-        if r.returncode != 0:
-            return None
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"ffprobe timed out after {timeout}s") from None
+    except OSError as e:
+        raise RuntimeError(f"ffprobe did not start: {e}") from None
+    if r.returncode != 0:
+        tail = (r.stderr or "").strip().splitlines()
+        raise RuntimeError(
+            f"ffprobe exit {r.returncode}" + (f": {tail[-1]}" if tail else "")
+        )
+    try:
         frames = json.loads(r.stdout or "{}").get("frames") or []
         return [f.get("side_data_list") or [] for f in frames]
-    except Exception:
-        return None
+    except (ValueError, AttributeError, TypeError):
+        raise RuntimeError("ffprobe output not readable") from None
 
 
 def _steps(v, den):
@@ -318,13 +328,16 @@ def probe_hdr_metadata(filepath):
     """HDR10 static metadata as the first decoded keyframes state it.
 
     Returns (mastering, cll), each None when the source does not state
-    it, or None whole when a read failed, which says nothing about the
-    source:
+    it:
       mastering  G, B, R and white point x/y in 1/MDCV_CHROMA_DEN steps,
                  then max and min luminance in 1/MDCV_LUMA_DEN steps
       cll        (max_cll, max_fall) in cd/m²
     svt_mastering_display, ffmpeg_mastering_display and
     content_light_str spell them for each consumer.
+
+    A failed read says nothing about the source and raises RuntimeError
+    with the reason, which tells a failure a rerun may fix (a timeout)
+    from one that returns on every run (no keyframe in the window).
 
     A mastering display the standard forbids (a chromaticity past 1, a
     minimum luminance above the maximum) or a light level past 16 bits
@@ -345,10 +358,12 @@ def probe_hdr_metadata(filepath):
     is a failed read.
     """
     frames = _keyframe_side_data(filepath, 1)
-    if frames == []:
+    if not frames:
         frames = _keyframe_side_data(filepath, HDR_KEYFRAME_WINDOW)
     if not frames:
-        return None
+        raise RuntimeError(
+            f"no keyframe in the first {HDR_KEYFRAME_WINDOW} packets"
+        )
 
     mastering = cll = None
     for side in frames:
