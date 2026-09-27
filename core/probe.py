@@ -265,51 +265,83 @@ def _ratval(v):
         return None
 
 
-def probe_hdr_metadata(filepath):
-    """HDR10 static metadata from the first frame's side data.
+# How many packets the HDR10 read looks through for the first keyframe
+# when a capture starts between keyframes. 600 is ten seconds at 60 fps,
+# longer than any broadcast or streaming GOP and than x265's default of
+# 250 frames. Only keyframes decode on that read, so the window costs a
+# demux plus one decode per keyframe inside it.
+HDR_KEYFRAME_WINDOW = 600
 
-    Returns (mastering_display_str, content_light_str), either may be None.
-    Formats follow SvtAv1EncApp --color-help:
-      G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)  and  "max_cll,max_fall".
-    """
+
+def _keyframe_side_data(filepath, packets):
+    """The side-data list of each keyframe ffprobe decodes among the
+    first `packets` packets of v:0, in output order ([] when none
+    decodes), or None when ffprobe fails."""
     try:
         r = subprocess.run(
-            [ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
-             "-show_frames", "-read_intervals", "%+#1",
+            [ffprobe_exe(), "-v", "error", "-skip_frame", "nokey",
+             "-read_intervals", f"%+#{packets}",
+             "-select_streams", "v:0", "-show_frames",
              "-show_entries", "frame=side_data_list",
              "-of", "json", str(filepath)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace", timeout=120,
         )
         if r.returncode != 0:
-            return None, None
-        frames = json.loads(r.stdout or "{}").get("frames", [])
-        side = frames[0].get("side_data_list", []) if frames else []
+            return None
+        frames = json.loads(r.stdout or "{}").get("frames") or []
+        return [f.get("side_data_list") or [] for f in frames]
     except Exception:
-        return None, None
+        return None
+
+
+def probe_hdr_metadata(filepath):
+    """HDR10 static metadata as the first decoded keyframes state it.
+
+    Returns (mastering_display_str, content_light_str), either may be None.
+    Formats follow SvtAv1EncApp --color-help:
+      G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)  and  "max_cll,max_fall".
+
+    Container-level metadata rides every decoded frame, and HEVC's SEI
+    metadata every frame from the keyframe that carries it. Only
+    keyframes are decoded, because a picture between keyframes carries
+    no SEI, and whether the decoder emits one for it when the capture
+    starts there depends on the codec and the ffmpeg version. So the
+    first packet answers when it is a keyframe, one decode for a stream
+    that starts on one and for an intra-only master, and a capture that
+    starts between keyframes decodes nothing from it and reads on to its
+    first keyframe. A keyframe without the metadata is the answer, not
+    a miss.
+    """
+    frames = _keyframe_side_data(filepath, 1)
+    if frames == []:
+        frames = _keyframe_side_data(filepath, HDR_KEYFRAME_WINDOW)
 
     mastering = cll = None
-    for sd in side:
-        t = sd.get("side_data_type", "")
-        if t == "Mastering display metadata":
-            vals = {k: _ratval(sd.get(k)) for k in (
-                "red_x", "red_y", "green_x", "green_y", "blue_x", "blue_y",
-                "white_point_x", "white_point_y",
-                "max_luminance", "min_luminance",
-            )}
-            if all(v is not None for v in vals.values()):
-                mastering = (
-                    f"G({vals['green_x']:.5f},{vals['green_y']:.5f})"
-                    f"B({vals['blue_x']:.5f},{vals['blue_y']:.5f})"
-                    f"R({vals['red_x']:.5f},{vals['red_y']:.5f})"
-                    f"WP({vals['white_point_x']:.5f},{vals['white_point_y']:.5f})"
-                    f"L({vals['max_luminance']:.4f},{vals['min_luminance']:.4f})"
-                )
-        elif t == "Content light level metadata":
-            mc = sd.get("max_content")
-            ma = sd.get("max_average")
-            if isinstance(mc, int) and isinstance(ma, int):
-                cll = f"{mc},{ma}"
+    for side in frames or []:
+        for sd in side:
+            t = sd.get("side_data_type", "")
+            if t == "Mastering display metadata" and mastering is None:
+                vals = {k: _ratval(sd.get(k)) for k in (
+                    "red_x", "red_y", "green_x", "green_y",
+                    "blue_x", "blue_y", "white_point_x", "white_point_y",
+                    "max_luminance", "min_luminance",
+                )}
+                if all(v is not None for v in vals.values()):
+                    mastering = (
+                        f"G({vals['green_x']:.5f},{vals['green_y']:.5f})"
+                        f"B({vals['blue_x']:.5f},{vals['blue_y']:.5f})"
+                        f"R({vals['red_x']:.5f},{vals['red_y']:.5f})"
+                        f"WP({vals['white_point_x']:.5f},"
+                        f"{vals['white_point_y']:.5f})"
+                        f"L({vals['max_luminance']:.4f},"
+                        f"{vals['min_luminance']:.4f})"
+                    )
+            elif t == "Content light level metadata" and cll is None:
+                mc = sd.get("max_content")
+                ma = sd.get("max_average")
+                if isinstance(mc, int) and isinstance(ma, int):
+                    cll = f"{mc},{ma}"
     return mastering, cll
 
 
