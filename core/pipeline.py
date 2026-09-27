@@ -30,13 +30,14 @@ from .cache import load_cache, recommended_matches
 from .calibrate import (
     DECAY_MAX, DECAY_MIN, RATIO_MAX, RATIO_MIN, calibration_offset,
     decay_prior, ratio_prior, load_global_calibration,
-    scene_offset_center, update_global_calibration,
+    scene_offset_center, update_global_calibration, vmaf_slope_prior,
 )
 from .constants import (
     BITRATE_BAND, COMPLEXITY_MARGIN_FLOOR, DEFAULT_VMAF_SLOPE,
     ENDGAME_SNAP_GAIN, EVEN_SAMPLE_MARGIN, INTRA_ONLY_CODECS, MIN_BITRATE_KBPS,
     MINI_SAMPLE_COUNT, MINI_SAMPLE_DURATION, MINI_SAMPLE_MIN_RATIO,
-    TARGET_VMAF_BY_RES, VIDEO_EXTENSIONS, VMAF_OVERSHOOT,
+    TARGET_VMAF_BY_RES, VIDEO_EXTENSIONS, VMAF_OVERSHOOT, VMAF_SLOPE_MAX,
+    VMAF_SLOPE_MIN,
 )
 from .crop import (
     crop_scan_cfg, crop_token, detect_crop_for_file, load_crop_sidecar,
@@ -50,13 +51,14 @@ from .sampling import (
 from .tools import have_ffmpeg, local_ffmpeg_dir, missing_ffmpeg_components
 from .ui import (
     BOLD, CHECK, CROSS, DIM, GREEN, LABEL_W, MIDDOT, ORANGE, PURPLE, RED,
-    RESET, SEP, fmt_s2, fmt_size, fmt_time, label, vmaf_pass_color,
+    RESET, SEP, fmt_s2, fmt_size, fmt_time, fmt_vmaf, label,
 )
 from .util import atomic_write_json, clamp, cleanup_temp, partial_hash
 
 
-def result_kbps(path, size_bytes, duration):
-    """Bitrate for a finished encode's result line: video only.
+def result_kbps(video, size_bytes, duration):
+    """Bitrate for a finished encode's result line: `video`, the encode's
+    video-only rate, or None when it could not be read.
 
     Every bitrate this tool decides on is video-only — the floor, the
     sample threshold, the refine gates — because samples are cut -an
@@ -65,9 +67,11 @@ def result_kbps(path, size_bytes, duration):
     line the eye lands on, so a file accepted at 1954kbps against an 1800
     floor read as 2419. The size line below already reports the whole
     file. Falls back to the muxed rate only when the video stream can't
-    be measured (unreadable, or too short to divide by).
+    be measured (unreadable, or too short to divide by). It takes the rate
+    the caller already read: reading again after a failure only prints
+    the same failure twice.
     """
-    return video_kbps(path, duration) or calc_kbps(size_bytes, duration)
+    return video or calc_kbps(size_bytes, duration)
 
 
 def process_videos(cfg, engine):
@@ -235,9 +239,11 @@ def process_videos(cfg, engine):
                 seeded_redo = {fh for _, fh in prior}
             print(SEP)
 
+    # `failed` counts files that stopped on an error, not the ones skipped
+    # or deleted by design; any makes the run's exit code 1.
     stats = {
         "proc": 0, "vmaf_sum": 0.0, "vmaf_n": 0,
-        "saved": 0, "orig": 0, "deleted": 0,
+        "saved": 0, "orig": 0, "deleted": 0, "failed": 0,
     }
     t_start = time.time()
     global_cal = load_global_calibration(root_cache)
@@ -265,13 +271,13 @@ def process_videos(cfg, engine):
                 # User chose a fresh seeded search over the previous
                 # result: drop every search product (entries,
                 # calibration, recommended) so nothing resumes or skips
-                # below. The forced block belongs to forced mode and
-                # survives; scene analysis lives in the shared store
-                # and is untouched.
-                forced = cache.get("forced")
-                cache = {"sig": engine.sig, "entries": {}}
-                if forced is not None:
-                    cache["forced"] = forced
+                # below. The forced block and the outputs record are
+                # facts about files on disk, not search products, and
+                # survive; scene analysis lives in the shared store and
+                # is untouched.
+                cache = {"sig": engine.sig, "entries": {}, **{
+                    k: cache[k] for k in ("forced", "outputs") if k in cache
+                }}
                 atomic_write_json(cp, cache)
 
             # Output names carry the crop token so cropped and uncropped
@@ -303,7 +309,7 @@ def process_videos(cfg, engine):
                 )
 
             if cfg["skip_existing"]:
-                verified = False
+                skip_note = None
                 if force_q is not None:
                     # Forced mode has its own done contract: the `forced`
                     # cache block records, per quantizer, the settings a
@@ -329,27 +335,42 @@ def process_videos(cfg, engine):
                             and fe.get("crop") == expected_crop
                             and d.exists()
                             and fe.get("size") == d.stat().st_size):
-                        verified = True
+                        skip_note = f"{CHECK} exists"
                 else:
-                    # An output file with a cached full VMAF is necessary
-                    # but not sufficient: an interrupted search can leave
-                    # a probe encode that later gets verified, and a
-                    # verified-but-unconverged file (e.g. seed quantizer
-                    # at 4x the intended bitrate) must not be skipped
-                    # forever. Require the cache's `recommended` block —
-                    # written only when a search completes — to match the
-                    # current settings, and accept either the recommended
-                    # quantizer itself or (for outputs predating the
-                    # post-refine `recommended` update) a verified VMAF
-                    # inside the acceptance band.
+                    # A bare output file proves nothing (an interrupted
+                    # search leaves probe encodes behind), and neither
+                    # does a completed search: the refine loop can still
+                    # move the quantizer or reject the whole encode. The
+                    # cache's `recommended` block, written when a search
+                    # completes and matched here against the current
+                    # settings, therefore records how the file ended:
+                    #   pending  search done, file not (a run stopped in
+                    #            verify or refine): never skipped, the
+                    #            run resumes where it stopped
+                    #   kept     skipped on the recommended quantizer's
+                    #            output, its full VMAF cached for that
+                    #            exact file
+                    #   larger   the encode came out larger than the
+                    #            source and was deleted: skipped with no
+                    #            output, since the same settings would
+                    #            only encode it again to delete it again
+                    # A block from before outcomes were recorded keeps its
+                    # own rule: the recommended quantizer's output, or any
+                    # output whose verified VMAF sits inside the band.
                     rec = cache.get("recommended")
                     # Auto targets vary by resolution and the file hasn't
                     # been probed yet, so only an explicit --vmaf can be
                     # checked here.
                     if recommended_matches(rec, engine, cfg, expected_crop,
                                            cfg["target_vmaf"]):
+                        outcome = rec.get("outcome")
                         rec_target = rec.get("target")
-                        for c in all_qs:
+                        if outcome == "larger":
+                            skip_note = (
+                                f"{CHECK} source kept"
+                                f" {DIM}(its AV1 encode came out larger){RESET}"
+                            )
+                        for c in all_qs if outcome in ("kept", None) else ():
                             d = dst_path(c)
                             if not d.exists():
                                 continue
@@ -358,21 +379,22 @@ def process_videos(cfg, engine):
                                     and entry.get("size") == d.stat().st_size):
                                 continue
                             in_band = (
-                                isinstance(rec_target, (int, float))
+                                outcome is None
+                                and isinstance(rec_target, (int, float))
                                 and rec_target - cfg["vmaf_tolerance"]
                                 <= entry[engine.vmaf_key_base]
                                 <= rec_target + VMAF_OVERSHOOT
                             )
                             if c == rec.get(engine.rec_q_key) or in_band:
-                                verified = True
+                                skip_note = f"{CHECK} exists"
                                 break
-                if verified:
-                    # A verified file never reaches the post-encode
+                if skip_note:
+                    # A skipped file never reaches the post-encode
                     # cleanup below, so reclaim any segment dirs an
-                    # interrupted refine encode left behind here — they
-                    # can hold most of a movie's video stream.
+                    # interrupted encode left behind here — they can
+                    # hold most of a movie's video stream.
                     core_segments.cleanup_file_segments(root_cache, file_hash)
-                    print(f" {PURPLE}{filepath.name:<30}{RESET} {CHECK} exists")
+                    print(f" {PURPLE}{filepath.name:<30}{RESET} {skip_note}")
                     continue
 
             if idx > 1:
@@ -462,6 +484,53 @@ def process_videos(cfg, engine):
                 if fps_f and meta["duration"] > 0:
                     expected_frames = int(meta["duration"] * fps_f)
 
+            # Which settings made the file at each output name. A name
+            # carries only the quantizer and the crop, so a file another
+            # run left under other settings (film grain, preset, tune)
+            # sits at the exact name this run would write. It is reused
+            # only when this record says these settings made it at its
+            # current size; anything else is encoded again.
+            enc_tag = engine.signature(cfg, meta.get("crop"))
+            outputs = cache.get("outputs")
+            if not isinstance(outputs, dict):
+                outputs = cache["outputs"] = {}
+
+            def record_output(q):
+                outputs[grid.fmt(q)] = {
+                    "enc_tag": enc_tag, "size": dst_path(q).stat().st_size,
+                }
+
+            t_enc = t_vmaf = 0.0
+
+            def full_encode(q):
+                """The full encode at q (on-grid; the search, refine and
+                the launchers' CLI all hand one over) for forced mode,
+                the full-file search, the verify and the refine loop
+                alike: the file already at its output name when these
+                settings made it (see record_output), otherwise a fresh
+                encode, recorded as soon as it lands."""
+                nonlocal t_enc
+                d = dst_path(q)
+                made = outputs.get(grid.fmt(q))
+                if (d.exists() and isinstance(made, dict)
+                        and made.get("enc_tag") == enc_tag
+                        and made.get("size") == d.stat().st_size):
+                    print(
+                        f"{label('reuse')}{engine.qname}"
+                        f" {BOLD}{grid.fmt(q)}{RESET} encode exists"
+                    )
+                    return d
+                t0 = time.time()
+                engine.encode(
+                    filepath, d, meta, q, cfg,
+                    show_progress=True, expected_frames=expected_frames,
+                    resumable=True,
+                )
+                t_enc += time.time() - t0
+                record_output(q)
+                atomic_write_json(cp, cache)
+                return d
+
             # Forced mode: one full encode at the user's quantizer and
             # done. Probe/crop/gate/meta prep above still apply (they are
             # source facts, not search machinery); segments still resume;
@@ -480,16 +549,12 @@ def process_videos(cfg, engine):
                     f" {BOLD}{grid.fmt(force_q)}{RESET}"
                     f" {DIM}(skipping search){RESET}"
                 )
-                t0 = time.time()
-                engine.encode(
-                    filepath, dst_path(force_q), meta, force_q, cfg,
-                    show_progress=True, expected_frames=expected_frames,
-                    resumable=True,
-                )
-                t_enc = time.time() - t0
-                final = dst_path(force_q)
+                # A file these settings already made at this quantizer,
+                # by any earlier run, is that encode and is reused.
+                final = full_encode(force_q)
                 if not final.exists():
                     print(f" {CROSS} Final encode missing")
+                    _file_error = True
                     continue
                 core_segments.cleanup_file_segments(root_cache, file_hash)
                 out_sz = final.stat().st_size
@@ -509,7 +574,10 @@ def process_videos(cfg, engine):
                 atomic_write_json(cp, cache)
 
                 saved = (1.0 - out_sz / in_sz) * 100
-                out_kbps = result_kbps(final, out_sz, meta["duration"])
+                out_kbps = result_kbps(
+                    video_kbps(final, meta["duration"]), out_sz,
+                    meta["duration"],
+                )
                 kbps_final = (
                     f"  {DIM}{MIDDOT}{RESET}  {BOLD}{out_kbps}kbps{RESET}"
                     if out_kbps else ""
@@ -551,13 +619,20 @@ def process_videos(cfg, engine):
             # the output dir, so an interrupted run leaves the seed
             # encode behind — trusting it shipped seed-quality files at
             # several times the intended bitrate. Leftover probes are
-            # still reused (do_enc_full skips existing files, VMAF is
-            # cached by size), so re-running the search after an
-            # interruption stays cheap.
+            # still reused (full_encode keeps a file these settings
+            # made, VMAF is cached by size), so re-running the search
+            # after an interruption stays cheap.
             existing_q = None
             rec = cache.get("recommended")
             if recommended_matches(rec, engine, cfg, meta["crop"], target):
                 existing_q = grid.quantize(rec[engine.rec_q_key])
+                # The file is being worked on again, so it is pending
+                # until it finishes, whatever an earlier run recorded: a
+                # stop from here on must resume, never skip. A dry run
+                # touches no encode and leaves the outcome alone.
+                if not cfg["dry_run"] and rec.get("outcome") != "pending":
+                    rec["outcome"] = "pending"
+                    atomic_write_json(cp, cache)
                 seed_note = ""
                 if user_seed is not None:
                     # The seed only starts a NEW search; saying so here
@@ -666,11 +741,9 @@ def process_videos(cfg, engine):
             elif existing_q is None:
                 print(f"{label('short')}≤{mini_min:.0f}s, full VMAF")
 
-            t_enc = t_vmaf = 0.0
             sample_enc_dir = root_cache / "_sample_enc"
             sample_enc_dir.mkdir(parents=True, exist_ok=True)
             sample_enc_cache = {}
-            enc_tag = engine.signature(cfg, meta.get("crop"))
 
             def do_enc_sample(q):
                 nonlocal t_enc
@@ -692,20 +765,6 @@ def process_videos(cfg, engine):
                 if not d.exists():
                     raise RuntimeError("Encoding failed")
                 sample_enc_cache[q] = d
-                return d
-
-            def do_enc_full(q):
-                nonlocal t_enc
-                q = grid.quantize(clamp(q, min_q, max_q))
-                d = dst_path(q)
-                if not d.exists():
-                    t0 = time.time()
-                    engine.encode(
-                        filepath, d, meta, q, cfg,
-                        show_progress=True, expected_frames=expected_frames,
-                        resumable=True,
-                    )
-                    t_enc += time.time() - t0
                 return d
 
             min_kbps = MIN_BITRATE_KBPS.get(res_tier(meta["w"], meta["h"]), 0)
@@ -842,7 +901,7 @@ def process_videos(cfg, engine):
             else:
                 best_q, best_vmaf, _, vt, search_state = core_search.search(
                     filepath, meta, target, cache, cp,
-                    do_enc_full, cfg, engine, decay_prior=dec_prior,
+                    full_encode, cfg, engine, decay_prior=dec_prior,
                     measure_fn=lambda ref, dist, q: measure(ref, dist, q),
                     probe_fn=probe_video,
                     s2_fn=lambda ref, dist, m, ri: engine.ssimu2_info(
@@ -855,12 +914,13 @@ def process_videos(cfg, engine):
             # not be measured.
             if best_q is None:
                 print(f" {CROSS} Search stopped: the first probe has no VMAF")
+                _file_error = True
                 continue
 
-            # Mark the search as completed for BOTH search paths. Written
-            # before the final encode so an interruption resumes here;
-            # the quantizer is synced again after the refine loop if
-            # refinement moves it.
+            # Mark the search as completed for BOTH search paths, with the
+            # file still pending (see the skip-existing check). Written
+            # before the final encode so an interruption resumes here; the
+            # finished file's quantizer and outcome replace it at the end.
             if existing_q is None:
                 cache["recommended"] = {
                     engine.rec_q_key: best_q, "target": target,
@@ -868,24 +928,23 @@ def process_videos(cfg, engine):
                     engine.rec_bound_keys[1]: cfg[engine.rec_bound_keys[1]],
                     "preset": cfg["preset"], "film_grain": cfg["film_grain"],
                     **{k: cfg[k] for k in engine.rec_extra_keys},
-                    "crop": meta["crop"],
+                    "crop": meta["crop"], "outcome": "pending",
                 }
                 atomic_write_json(cp, cache)
 
             if cfg["dry_run"]:
                 entry = cache["entries"].get(grid.fmt(best_q), {})
-                vmaf_str = ""
                 sv = (entry.get(f"sample_{engine.vmaf_key_base}")
                       or entry.get(engine.vmaf_key_base))
-                if isinstance(sv, dict):
-                    vmaf_str = f" VMAF {BOLD}{sv['mean']:.2f}{RESET}  P5 {BOLD}{sv['p5']:.2f}{RESET}"
-                elif isinstance(sv, (int, float)):
-                    vmaf_str = f" VMAF {BOLD}{sv:.2f}{RESET}"
+                vmaf_str = (
+                    f" VMAF {BOLD}{sv:.2f}{RESET}"
+                    if isinstance(sv, (int, float)) else ""
+                )
                 print(
                     f" {CHECK} Recommended {engine.qname}"
                     f" {BOLD}{grid.fmt(best_q)}{RESET}{vmaf_str}"
                 )
-                print(f"   Run without --dry-run to encode")
+                print("   Run without --dry-run to encode")
                 continue
 
             # The full-file search's probes ARE full encodes: what it
@@ -902,37 +961,19 @@ def process_videos(cfg, engine):
                 video-only bitrate). The size is the muxed output on disk
                 (audio/subs included); the kbps stays video-only for floor
                 parity, so the two can legitimately differ."""
-                parts = []
-                try:
-                    if path is not None and path.exists():
-                        parts.append(fmt_size(path.stat().st_size))
-                except OSError:
-                    pass
+                parts = [fmt_size(path.stat().st_size)]
                 if kbps:
                     parts.append(f"{kbps}kbps")
-                return f"  {DIM}{' '.join(parts)}{RESET}" if parts else ""
+                return f"  {DIM}{' '.join(parts)}{RESET}"
 
             # Bitrate of the best_q encode: read once, by the verify below
             # or already by the full-file search, and reused by the
-            # calibration block and the refine loop.
+            # calibration block, the refine loop and the result line.
             actual_kbps_now = full_probes.get("kbps", {}).get(best_q)
 
             # Final full encode at the candidate quantizer + VMAF verify
             if sample_src or existing_q is not None:
-                if not dst_path(best_q).exists():
-                    t0 = time.time()
-                    engine.encode(
-                        filepath, dst_path(best_q), meta, best_q, cfg,
-                        show_progress=True, expected_frames=expected_frames,
-                        resumable=True,
-                    )
-                    t_enc += time.time() - t0
-                else:
-                    print(
-                        f"{label('reuse')}{engine.qname}"
-                        f" {BOLD}{grid.fmt(best_q)}{RESET} encode exists"
-                    )
-
+                full_encode(best_q)
                 print(f"{label('verify')}Full VMAF...")
                 t0 = time.time()
                 best_vmaf = measure(filepath, dst_path(best_q), best_q)
@@ -940,15 +981,10 @@ def process_videos(cfg, engine):
                     filepath, dst_path(best_q), meta, cfg, ref_index=full_idx,
                 )
                 t_vmaf += time.time() - t0
-                actual_kbps_now = (
-                    video_kbps(dst_path(best_q), meta["duration"])
-                    if meta["duration"] > 1 and dst_path(best_q).exists()
-                    else None
-                )
-                vc = vmaf_pass_color(best_vmaf["mean"], target, cfg["vmaf_tolerance"])
+                actual_kbps_now = video_kbps(dst_path(best_q), meta["duration"])
                 print(
-                    f"{'':>{LABEL_W + 1}}VMAF {BOLD}{vc}{best_vmaf['mean']:.2f}{RESET}"
-                    f"  {DIM}P5 {best_vmaf['p5']:.2f}{RESET}"
+                    f"{'':>{LABEL_W + 1}}"
+                    f"{fmt_vmaf(best_vmaf, target, cfg['vmaf_tolerance'])}"
                     f"{fmt_s2(s2_seen[best_q])}"
                     f"{size_kbps_suffix(dst_path(best_q), actual_kbps_now)}"
                 )
@@ -963,6 +999,12 @@ def process_videos(cfg, engine):
             )
 
             cal_now = cache.get("calibration")
+            # A resumed file runs no search, so refine starts from the
+            # slope the file's own search measured. Read before the write
+            # below stamps the block with this run's settings.
+            stored_slope = (
+                None if search_state else vmaf_slope_prior(cal_now, enc_tag)
+            )
             cal_now = dict(cal_now) if isinstance(cal_now, dict) else {}
             cal_updated = False
             fresh_offset = None
@@ -995,7 +1037,7 @@ def process_videos(cfg, engine):
 
             if search_state and search_state.get("vmaf_slope"):
                 sl = search_state["vmaf_slope"]
-                if 0.1 <= sl <= 2.0:
+                if VMAF_SLOPE_MIN <= sl <= VMAF_SLOPE_MAX:
                     cal_now["vmaf_slope"] = sl
                     cal_updated = True
 
@@ -1016,9 +1058,11 @@ def process_videos(cfg, engine):
                 atomic_write_json(cp, cache)
 
                 # Roll fresh measurements into the cohort so subsequent
-                # new files start with an informed prior. Only the
-                # measurements taken this run are rolled in — values
-                # carried over from a previous run aren't double-counted.
+                # new files start with an informed prior. Only values
+                # computed in this pass are rolled in, never ones merely
+                # carried in the calibration block; a resumed file
+                # recomputes its offset and ratio from cached scores, so
+                # each run that reaches here rolls them in once more.
                 # (Each engine has its own cohort file; different
                 # encoders must never share calibration.) The offset and
                 # ratio go into THIS file's sampling-mode cohort: mixing
@@ -1044,35 +1088,33 @@ def process_videos(cfg, engine):
             # floor) step the quantizer down; overshoot (VMAF more than
             # VMAF_OVERSHOOT above target with bitrate headroom over the
             # floor) steps it up — without this, any candidate that
-            # arrives here too low (e.g. a resumed quantizer verified
-            # against a changed target) ships an oversized file. Each
-            # move is a slope-sized jump, not a step-by-1, so it
-            # converges in 1-2 encodes.
+            # arrives here too low (e.g. a sample search whose offset
+            # under-corrected) ships an oversized file. Each move is a
+            # slope-sized jump, not a step-by-1, so it converges in 1-2
+            # encodes. Both models start from what this file measured
+            # (the search's fits, or on a resume the stored slope and
+            # the per-file or cohort decay), and fall back to the cold
+            # start only when nothing was. The clamps are the shared
+            # sanity ranges: the decay's is engine-neutral, since each
+            # engine's curve sits in a different place inside it.
             slope_v = clamp(
                 (search_state.get("vmaf_slope") if search_state else None)
-                or DEFAULT_VMAF_SLOPE,
-                0.1, 2.0,
+                or stored_slope or DEFAULT_VMAF_SLOPE,
+                VMAF_SLOPE_MIN, VMAF_SLOPE_MAX,
             )
             decay_b = clamp(
                 (search_state.get("bitrate_decay") if search_state else None)
-                or engine_decay,
-                0.05, 0.4,
+                or dec_prior or engine_decay,
+                DECAY_MIN, DECAY_MAX,
             )
             # VMAF jumps aim at the CENTER of the acceptance band
             # [target - tol, target + VMAF_OVERSHOOT] and round to the
             # grid, so slope error spreads symmetrically inside the band.
-            # (The old floor-ed step against a target + OVERSHOOT/2 aim
-            # stacked every landing into the band's top quarter, where
-            # one slope misread walked back out — the +2-then-+1
-            # re-encode crawl this replaces.)
+            # A floored step against a higher aim stacks every landing in
+            # the band's top quarter, where one slope misread walks back
+            # out and costs another full encode.
             refine_aim = target + (VMAF_OVERSHOOT - cfg["vmaf_tolerance"]) / 2
             full_points = {}
-
-            def record_point(q, vm, kbps=None):
-                if (kbps is None and min_kbps and meta["duration"] > 1
-                        and dst_path(q).exists()):
-                    kbps = video_kbps(dst_path(q), meta["duration"])
-                full_points[q] = {"vmaf": vm, "kbps": kbps}
 
             if best_vmaf and math.isfinite(best_vmaf.get("mean", float("nan"))):
                 full_points[best_q] = {
@@ -1206,14 +1248,7 @@ def process_videos(cfg, engine):
                     f" {BOLD}{grid.fmt(try_q)}{RESET}"
                     f" {DIM}(jump {grid.fmt_delta(try_q - best_q)}){RESET}"
                 )
-                if not dst_path(try_q).exists():
-                    t0 = time.time()
-                    engine.encode(
-                        filepath, dst_path(try_q), meta, try_q, cfg,
-                        show_progress=True, expected_frames=expected_frames,
-                        resumable=True,
-                    )
-                    t_enc += time.time() - t0
+                full_encode(try_q)
                 t0 = time.time()
                 adj = measure(filepath, dst_path(try_q), try_q)
                 if (math.isfinite(adj.get("mean", float("nan")))
@@ -1228,19 +1263,14 @@ def process_videos(cfg, engine):
                 # A step onto a full-file search probe reuses its bitrate.
                 adj_kbps = full_probes.get("kbps", {}).get(try_q)
                 if adj_kbps is None:
-                    adj_kbps = (
-                        video_kbps(dst_path(try_q), meta["duration"])
-                        if meta["duration"] > 1 and dst_path(try_q).exists()
-                        else None
-                    )
-                vc_a = vmaf_pass_color(adj["mean"], target, cfg["vmaf_tolerance"])
+                    adj_kbps = video_kbps(dst_path(try_q), meta["duration"])
                 print(
-                    f"{'':>{LABEL_W + 1}}VMAF {BOLD}{vc_a}{adj['mean']:.2f}{RESET}"
-                    f"  {DIM}P5 {adj['p5']:.2f}{RESET}"
+                    f"{'':>{LABEL_W + 1}}"
+                    f"{fmt_vmaf(adj, target, cfg['vmaf_tolerance'])}"
                     f"{fmt_s2(s2_seen.get(try_q))}"
                     f"{size_kbps_suffix(dst_path(try_q), adj_kbps)}"
                 )
-                record_point(try_q, adj, kbps=adj_kbps)
+                full_points[try_q] = {"vmaf": adj, "kbps": adj_kbps}
                 best_q, best_vmaf = try_q, adj
 
                 # Re-fit both models from the measured full-encode points.
@@ -1253,7 +1283,7 @@ def process_videos(cfg, engine):
                     m = (full_points[c1v]["vmaf"]["mean"]
                          - full_points[c2v]["vmaf"]["mean"]) / (c2v - c1v)
                     if m > 0:
-                        slope_v = clamp(m, 0.1, 2.0)
+                        slope_v = clamp(m, VMAF_SLOPE_MIN, VMAF_SLOPE_MAX)
                 qs_b = sorted(c for c, p in full_points.items() if p["kbps"])
                 if len(qs_b) >= 2:
                     c1b, c2b = qs_b[0], qs_b[-1]
@@ -1261,7 +1291,7 @@ def process_videos(cfg, engine):
                     if b1 > 0 and b2 > 0:
                         m = math.log(b1 / b2) / (c2b - c1b)
                         if m > 0:
-                            decay_b = clamp(m, 0.05, 0.4)
+                            decay_b = clamp(m, DECAY_MIN, DECAY_MAX)
 
             # The loop can end on an invalid point (e.g. an overshoot
             # probe that undershot while its bounce-back quantizer was
@@ -1287,37 +1317,64 @@ def process_videos(cfg, engine):
                     best_q = pick
                     best_vmaf = full_points[pick]["vmaf"]
 
-            # Keep the resume point in sync with the refined result so a
-            # rerun resumes at the final quantizer, not the pre-refine one.
-            rec_now = cache.get("recommended")
-            if isinstance(rec_now, dict) and rec_now.get(engine.rec_q_key) != best_q:
-                rec_now[engine.rec_q_key] = best_q
-                atomic_write_json(cp, cache)
-
             final = dst_path(best_q)
             if not final.exists():
                 print(f" {CROSS} Final encode missing")
+                _file_error = True
                 continue
 
+            # Every other output at this file's names goes: probes, refine
+            # steps, and anything a run under other settings left. A
+            # forced encode stays, recognized by its forced block entry
+            # at the size on disk: a ladder of forced values is the A/B
+            # workflow, and a searched run must not clear it.
+            forced = cache.get("forced")
+            forced = forced if isinstance(forced, dict) else {}
             for c in all_qs:
-                if c != best_q and dst_path(c).exists():
-                    try:
-                        dst_path(c).unlink()
-                    except OSError:
-                        pass
+                d = dst_path(c)
+                if c == best_q or not d.exists():
+                    continue
+                fe = forced.get(grid.fmt(c))
+                if (isinstance(fe, dict) and fe.get("crop") == meta["crop"]
+                        and fe.get("size") == d.stat().st_size):
+                    continue
+                try:
+                    d.unlink()
+                except OSError:
+                    continue
+                outputs.pop(grid.fmt(c), None)
 
             # The final output exists, so this file's segment work dirs
             # (any quantizer — refine may have left several) are spent.
             core_segments.cleanup_file_segments(root_cache, file_hash)
 
             out_sz = final.stat().st_size
-
-            if out_sz >= in_sz:
+            larger = out_sz >= in_sz
+            if larger:
                 final.unlink()
+                outputs.pop(grid.fmt(best_q), None)
+
+            # The file is finished: one write, the last of this file's
+            # cache writes, records where refine settled and how the
+            # file ended (see the skip-existing check). A stop before it
+            # leaves the file pending, and the next run resumes it. An
+            # unmeasured verify stays pending, so the next run measures
+            # it again.
+            rec_now = cache["recommended"]
+            rec_now[engine.rec_q_key] = best_q
+            if larger:
+                rec_now["outcome"] = "larger"
+            elif math.isfinite(best_vmaf["mean"]):
+                rec_now["outcome"] = "kept"
+            atomic_write_json(cp, cache)
+
+            if larger:
                 stats["deleted"] += 1
                 print(
-                    f" {CROSS} Larger ({BOLD}{out_sz / 1e6:.1f}MB{RESET}"
-                    f" vs {BOLD}{in_sz / 1e6:.1f}MB{RESET}) - deleted"
+                    f" {CROSS} Larger than the source"
+                    f" ({BOLD}{fmt_size(out_sz)}{RESET} vs"
+                    f" {BOLD}{fmt_size(in_sz)}{RESET}), deleted;"
+                    f" the source is kept"
                 )
                 continue
 
@@ -1337,11 +1394,15 @@ def process_videos(cfg, engine):
                 t_vmaf += time.time() - t0
 
             saved = (1.0 - out_sz / in_sz) * 100
-            # The refine loop already measured this encode's video bitrate
-            # when a floor applies; reuse it rather than re-summing packets.
-            out_kbps = full_points.get(best_q, {}).get("kbps")
-            if out_kbps is None:
-                out_kbps = result_kbps(final, out_sz, meta["duration"])
+            # This encode's video bitrate was already read: by the refine
+            # loop for a point it measured, otherwise by the verify or the
+            # full-file search (the only point outside full_points is the
+            # one whose VMAF measurement failed).
+            out_kbps = result_kbps(
+                full_points[best_q]["kbps"] if best_q in full_points
+                else actual_kbps_now,
+                out_sz, meta["duration"],
+            )
             # Output bitrate rides the result line next to VMAF (where the
             # eye looks for "how did this encode turn out"); the size line
             # below stays size + saved%.
@@ -1351,12 +1412,10 @@ def process_videos(cfg, engine):
             )
             in_str = fmt_size(in_sz)
             out_str = fmt_size(out_sz)
-            vc = vmaf_pass_color(best_vmaf["mean"], target, cfg["vmaf_tolerance"])
             print(SEP)
             print(
                 f" {CHECK} {engine.qname} {BOLD}{grid.fmt(best_q)}{RESET}"
-                f"  VMAF {BOLD}{vc}{best_vmaf['mean']:.2f}{RESET}"
-                f"  {DIM}P5 {best_vmaf['p5']:.2f}{RESET}"
+                f"  {fmt_vmaf(best_vmaf, target, cfg['vmaf_tolerance'])}"
                 f"{kbps_final}"
             )
             if extra_s2:
@@ -1385,10 +1444,12 @@ def process_videos(cfg, engine):
             print(f" {CROSS} {e}")
         finally:
             cleanup_temp()
-            # A failed file keeps its samples for the rerun; a finished
-            # one deletes them. A partial clip set is a temp and is
-            # already gone either way.
-            if not _file_error:
+            # A failed file is counted and keeps its samples for the
+            # rerun; a finished one deletes them. A partial clip set is a
+            # temp and is already gone either way.
+            if _file_error:
+                stats["failed"] += 1
+            else:
                 for p in (sample_src, sample_concat):
                     if p:
                         try:
@@ -1418,11 +1479,16 @@ def process_videos(cfg, engine):
             f"{CHECK} Saved: {GREEN}{BOLD}{stats['saved'] / 1e9:.2f}GB{RESET}"
             f" ({GREEN}{BOLD}{pct:.1f}%{RESET})"
         )
-        if stats["deleted"] > 0:
-            print(f"{ORANGE} Deleted: {BOLD}{stats['deleted']}{RESET}")
         print(f"{CHECK} Time: {BOLD}{fmt_time(time.time() - t_start)}{RESET}")
     else:
         print(f"{CHECK} No files processed")
+    if stats["deleted"]:
+        print(
+            f"{ORANGE} Larger than the source: {BOLD}{stats['deleted']}{RESET}"
+            f"{ORANGE} (deleted, sources kept){RESET}"
+        )
+    if stats["failed"]:
+        print(f"{CROSS} Failed: {BOLD}{stats['failed']}{RESET}")
 
     print(f"{SEP}\n{CHECK} Done")
-    return 0
+    return 1 if stats["failed"] else 0

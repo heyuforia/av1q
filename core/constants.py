@@ -173,8 +173,15 @@ DEFAULT_BITRATE_DECAY = math.log(2) / 6
 # refits from every probe pair, and a bound landing sized by this guess
 # is never taken as proof (the min_q short-circuit in core/search.py
 # waits for a measured slope). The refine loop starts from it too when
-# the search measured none.
+# neither this run's search nor the file's calibration measured one.
 DEFAULT_VMAF_SLOPE = 0.5
+
+# Range a measured VMAF slope is clamped into, one range for the search,
+# the refine loop and the stored calibration. A jump is error ÷ slope,
+# so the floor caps a jump at 10× the error and the ceiling keeps a
+# noisy steep reading from shrinking the jump to nothing.
+VMAF_SLOPE_MIN = 0.1
+VMAF_SLOPE_MAX = 1.5
 
 # Floor-bound mode: a seed that clears the target by at least
 # FLOOR_BOUND_VMAF_MARGIN while its bitrate sits under

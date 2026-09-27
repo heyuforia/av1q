@@ -18,7 +18,7 @@ from .bitrate import effective_sample_floor, measured_kbps
 from .constants import (
     DEFAULT_VMAF_SLOPE, ENDGAME_SNAP_GAIN, FLOOR_BOUND_KBPS_RATIO,
     FLOOR_BOUND_VMAF_MARGIN, INTRA_ONLY_CODECS, MIN_BITRATE_KBPS,
-    VMAF_OVERSHOOT,
+    VMAF_OVERSHOOT, VMAF_SLOPE_MAX, VMAF_SLOPE_MIN,
 )
 from .probe import res_tier
 from .ui import BOLD, DIM, RESET, fmt_s2, fmt_size, label
@@ -280,7 +280,8 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
         if (q0 != q1 and math.isfinite(vm0["mean"])
                 and math.isfinite(vm1["mean"])):
             slope = clamp(
-                abs(vm0["mean"] - vm1["mean"]) / abs(q0 - q1), 0.1, 1.5
+                abs(vm0["mean"] - vm1["mean"]) / abs(q0 - q1),
+                VMAF_SLOPE_MIN, VMAF_SLOPE_MAX,
             )
             slope_measured = True
 

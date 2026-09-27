@@ -5,6 +5,7 @@ Windows) and makes the output streams redirect-safe, exactly once, for
 every launcher.
 """
 
+import math
 import os
 import sys
 
@@ -70,6 +71,18 @@ def fmt_size(n):
 def vmaf_pass_color(mean, target, tol):
     """GREEN when a VMAF mean meets target within tolerance, else no color."""
     return GREEN if mean >= target - tol else ""
+
+
+def fmt_vmaf(vm, target, tol):
+    """'VMAF <mean>  P5 <p5>' field of a full-encode result line, the mean
+    pass-colored. A failed measurement (its reason already printed)
+    reads as unmeasured."""
+    if not math.isfinite(vm["mean"]):
+        return f"VMAF {DIM}unmeasured{RESET}"
+    return (
+        f"VMAF {BOLD}{vmaf_pass_color(vm['mean'], target, tol)}"
+        f"{vm['mean']:.2f}{RESET}  {DIM}P5 {vm['p5']:.2f}{RESET}"
+    )
 
 
 def fmt_s2(s2):

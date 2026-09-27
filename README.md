@@ -84,7 +84,7 @@ A seed alone won't redo files that a previous run already encoded, since their f
 python av1q.py --force-cq 33
 ```
 
-Finished files are remembered and skipped on later runs, and outputs at different forced values sit side by side in the output folder, so encoding a small ladder like 30, 33, 36 is an easy way to compare quality by eye. The chosen value is treated as final, so the output is kept even when it ends up larger than the source.
+Finished files are remembered and skipped on later runs, and outputs at different forced values sit side by side in the output folder, where a later normal run of the same file leaves them, so encoding a small ladder like 30, 33, 36 is an easy way to compare quality by eye. The chosen value is treated as final, so the output is kept even when it ends up larger than the source.
 
 **Auto-crop letterboxed or pillarboxed videos:**
 
@@ -134,7 +134,7 @@ The search is adaptive, similar to Newton's method: it converges on the right CQ
 5. **Verify and refine.** Full-file VMAF and bitrate are checked against their targets. P5 is measured and reported but is not a gate. A miss in either direction triggers a corrective re-encode: a shortfall lowers the CQ, while VMAF landing well above target with bitrate headroom to spare raises it to reclaim wasted bitrate. Each jump is sized from the measured slopes and converges in 1 or 2 passes. A re-encode predicted to trim less than about 3% of bitrate is skipped as costing more than it saves.
 6. **Calibrate.** Sample-to-full deltas (bitrate ratio, VMAF offset, quality slope, bitrate decay) are cached per file and rolled into cross-file averages. Re-runs of the same file, and new files once a few have been processed, aim at the right CQ on the first probe.
 
-Files that end up larger after encoding are deleted automatically. Forced encodes are the exception and are always kept.
+Files that end up larger after encoding are deleted automatically, and later runs skip them instead of encoding them again with the same settings. Forced encodes are the exception and are always kept.
 
 ## License
 

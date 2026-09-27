@@ -4,7 +4,9 @@ cohort prior (rolling averages with shrinkage)."""
 import json
 import time
 
-from .constants import DEFAULT_BITRATE_DECAY, SCENE_OFFSET_PRIOR
+from .constants import (
+    DEFAULT_BITRATE_DECAY, SCENE_OFFSET_PRIOR, VMAF_SLOPE_MAX, VMAF_SLOPE_MIN,
+)
 from .util import atomic_write_json, clamp
 
 
@@ -196,6 +198,23 @@ def decay_prior(per_file_cal, global_cal, default=DEFAULT_BITRATE_DECAY):
                 label += f", blended from {g:.3f}"
             return shrunk, label
     return None, None
+
+
+def vmaf_slope_prior(per_file_cal, enc_tag):
+    """The VMAF slope this file's last search measured, for a refine loop
+    that runs without a search this time (a resumed file), or None.
+
+    Per file only, never a cohort average: how fast VMAF falls per
+    quantizer step is a property of this source's content. Trusted only
+    when the block was written under the same encode settings, because
+    preset, grain and crop change the slope too.
+    """
+    if not isinstance(per_file_cal, dict) or per_file_cal.get("enc_tag") != enc_tag:
+        return None
+    s = per_file_cal.get("vmaf_slope")
+    if isinstance(s, (int, float)) and VMAF_SLOPE_MIN <= s <= VMAF_SLOPE_MAX:
+        return float(s)
+    return None
 
 
 # Sample→full bitrate ratio range. Samples cut from the hottest scenes
