@@ -164,9 +164,11 @@ class Engine:
                show_progress=False, expected_frames=0, resumable=False):
         """Encode source to dest at quantizer q.
 
-        resumable=True marks a full-file output encode the engine MAY
-        route through an interrupted-encode resume path (sample probes
-        never set it); engines without one simply ignore it."""
+        resumable=True marks a full-file output encode (sample probes
+        never set it): dest gets the source's audio, subtitles, fonts and
+        chapters beside the picture, and the engine MAY route the encode
+        through an interrupted-encode resume path; engines without one
+        ignore that part."""
         raise NotImplementedError
 
     def ssimu2_info(self, ref, dist, meta, cfg, ref_index=None):

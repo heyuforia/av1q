@@ -1,12 +1,12 @@
-"""Resumable segmented full-file encodes: manifest, validation, concat,
-and the shared source-stream remux.
+"""Resumable segmented full-file encodes (manifest, validation, concat)
+and the source-stream mux every full encode of both engines ends with.
 
 One continuous encoder writes keyframe-aligned segment files through
 ffmpeg's segment muxer, which finalizes each completed segment (header,
 trailer, cues) before opening the next — so a killed encode keeps every
 finished segment and only the in-flight one is lost. Resume restarts the
 encoder at a segment boundary, the segments are stream-copy concatenated,
-and audio/subs are remuxed from the source at the end.
+and audio/subs are muxed from the source at the end.
 
 The timestamp contract that makes the concat bit-compatible with a
 single-pass encode: segments are written with -reset_timestamps 0 (the
@@ -14,15 +14,15 @@ output timeline's PTS pass straight through into the segment files), a
 resumed encode re-enters that same timeline via -ss/-copyts/-start_at_zero,
 and the concat list declares each segment's exact duration (next segment's
 first PTS minus this one's), which zeroes the concat demuxer's timestamp
-delta so the original PTS survive unchanged. Full-file VMAF pairs frames
-by timestamp — this is what keeps it aligned.
+delta so the original PTS survive unchanged. The mux then keeps the
+video's start offset against the source's other streams.
 """
 
 import json
 import shutil
 
 from .tools import ffmpeg_exe, ffprobe_exe
-from .ui import DIM, ORANGE, RESET
+from .ui import DIM, RESET, label
 from .util import atomic_write_json, run_cmd
 
 MANIFEST_NAME = "manifest.json"
@@ -82,6 +82,75 @@ def manifest_matches(manifest, expected):
 
 def write_manifest(seg_dir, manifest):
     atomic_write_json(seg_dir / MANIFEST_NAME, manifest)
+
+
+def _on_disk(seg_dir, s):
+    """A manifest entry whose segment file is still present and non-empty
+    (anything malformed, e.g. a hand-edited manifest, is not)."""
+    if not (isinstance(s, dict) and isinstance(s.get("name"), str)
+            and isinstance(s.get("start_ms"), int)):
+        return False
+    try:
+        p = seg_dir / s["name"]
+        return p.is_file() and p.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def prepare(seg_dir, expected, probe=None):
+    """Bring a work dir to a resumable state for one encode identity.
+
+    Returns (manifest, resume_ms). A `complete` manifest (the encoder
+    finished, then the join was interrupted) is kept only while every
+    segment is still on disk, and then only the join remains. Otherwise
+    the manifest carries the kept segments and resume_ms the exact PTS to
+    re-enter at, None for frame 0. A dir made by another identity is
+    discarded whole.
+    """
+    probe = probe or _probe_start_ms
+    manifest = load_manifest(seg_dir)
+    if not manifest_matches(manifest, expected):
+        shutil.rmtree(seg_dir, ignore_errors=True)
+        manifest = {**expected, "complete": False, "segments": []}
+    seg_dir.mkdir(parents=True, exist_ok=True)
+
+    segs = manifest.get("segments")
+    if (manifest.get("complete") and isinstance(segs, list) and segs
+            and all(_on_disk(seg_dir, s) for s in segs)):
+        return manifest, None
+
+    kept, resume_ms = resume_state(seg_dir, manifest, probe=probe)
+    manifest["segments"] = kept
+    manifest["complete"] = False
+    write_manifest(seg_dir, manifest)
+    return manifest, resume_ms
+
+
+def finish_run(seg_dir, manifest, probe=None):
+    """Record an encoder run that exited cleanly: every segment it listed
+    must validate before the manifest may say `complete`.
+
+    Validation stops at the first bad segment, so a shortfall here would
+    otherwise mark a truncated timeline complete, and the join would ship
+    a video that ends early under full-length audio. Raising instead
+    leaves the manifest resumable: the next run keeps the good prefix.
+    """
+    probe = probe or _probe_start_ms
+    kept = manifest["segments"]
+    known = {s["name"] for s in kept}
+    listed = [
+        n for n in parse_segment_list(seg_dir / SEGMENT_LIST_NAME)
+        if n not in known
+    ]
+    new = validate_new_segments(seg_dir, kept, probe=probe)
+    if not listed or len(new) < len(listed):
+        raise RuntimeError(
+            f"Segmented encode: {len(new)} of {len(listed)} new segments"
+            f" validated; the next run resumes from the last good one"
+        )
+    manifest["segments"] = kept + new
+    manifest["complete"] = True
+    write_manifest(seg_dir, manifest)
 
 
 def parse_segment_list(csv_path):
@@ -198,13 +267,9 @@ def resume_state(seg_dir, manifest, probe=_probe_start_ms):
     deleted. resume_ms is None for a fresh start.
     """
     kept = []
-    for s in manifest.get("segments") or []:
-        p = seg_dir / s.get("name", "")
-        try:
-            if not (isinstance(s.get("start_ms"), int) and p.is_file()
-                    and p.stat().st_size > 0):
-                break
-        except OSError:
+    segs = manifest.get("segments")
+    for s in segs if isinstance(segs, list) else []:
+        if not _on_disk(seg_dir, s):
             break
         kept.append({"name": s["name"], "start_ms": s["start_ms"]})
     kept += validate_new_segments(seg_dir, kept, probe=probe)
@@ -284,22 +349,38 @@ def concat_segments(seg_dir, segments, out_path,
         raise RuntimeError("Segment concat produced no output")
 
 
-def mux_with_source_streams(video, source, dest_tmp, attachments=False):
-    """Mux encoded video with audio/subs/chapters/metadata from `source`
-    into `dest_tmp`. Subtitle copy can fail for codecs MKV won't take
-    as-is (e.g. mov_text from MP4) — retried as SRT, then dropped.
+def mux_with_source_streams(video, source, dest_tmp, probe=None):
+    """Mux encoded video with audio, subs, attachments (subtitle fonts),
+    chapters and metadata from `source` into `dest_tmp`. Subtitle copy can
+    fail for codecs MKV won't take as-is (e.g. mov_text from MP4) — retried
+    as SRT, then dropped.
+
+    ffmpeg shifts every input so its own first timestamp reads 0 (unless
+    -copyts, which also switches off MPEG-TS discontinuity repair). An
+    encode that keeps the source's timeline starts where the source's
+    picture starts, which on a file whose audio leads is later than the
+    source's first timestamp; rebased to 0 alone, the picture would play
+    that much early against the audio. -itsoffset by the video's own
+    start cancels its shift.
     """
+    probe = probe or _probe_start_ms
+    start_ms = probe(video)
+    if start_ms is None:
+        raise RuntimeError(f"Remux failed: {video.name} is unreadable")
+    offset = ["-itsoffset", ms_ts(start_ms)] if start_ms > 0 else []
+
     def mux_cmd(maps, codecs):
         return [
             ffmpeg_exe(), "-y", "-hide_banner", "-v", "error",
-            "-i", str(video), "-i", str(source),
+            *offset, "-i", str(video), "-i", str(source),
             *maps, "-map_chapters", "1", "-map_metadata", "1",
             *codecs, str(dest_tmp),
         ]
 
-    extra = ["-map", "1:t?"] if attachments else []
-    with_subs = ["-map", "0:v:0", "-map", "1:a?", "-map", "1:s?", *extra]
-    no_subs = ["-map", "0:v:0", "-map", "1:a?", *extra]
+    with_subs = [
+        "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?", "-map", "1:t?",
+    ]
+    no_subs = ["-map", "0:v:0", "-map", "1:a?", "-map", "1:t?"]
     attempts = [
         (with_subs, ["-c", "copy"], None),
         # MKV rejects some subtitle codecs as-is (e.g. mov_text from MP4)
@@ -310,7 +391,7 @@ def mux_with_source_streams(video, source, dest_tmp, attachments=False):
     for maps, codecs, note in attempts:
         try:
             if note:
-                print(f" {ORANGE}{'mux':<10}{RESET}{DIM}{note}{RESET}")
+                print(f"{label('mux')}{DIM}{note}{RESET}")
             run_cmd(mux_cmd(maps, codecs))
             last_err = None
             break

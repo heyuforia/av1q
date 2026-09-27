@@ -245,7 +245,6 @@ def main():
         "max_cq": args.max_cq,
         "film_grain": args.film_grain,
         "force_10bit": not args.no_10bit,
-        "maxrate_factor": 1.6,
         "target_vmaf": args.vmaf,
         "vmaf_tolerance": VMAF_TOLERANCE,
         "bitrate_margin": BITRATE_MARGIN,

@@ -1,11 +1,10 @@
-"""Mainline SVT-AV1 engine: av1q's original encode path, through
-ffmpeg's libsvtav1 wrapper. Color metadata, crop, and audio/subtitle
-passthrough all ride a single ffmpeg invocation."""
+"""Mainline SVT-AV1 engine: av1q's encode path, through ffmpeg's
+libsvtav1 wrapper. The picture is encoded first, crop and color
+metadata applied; the shared source-stream mux in core.segments then
+adds audio, subtitles, fonts and chapters."""
 
 import collections
 import math
-import os
-import shlex
 import shutil
 import subprocess
 import sys
@@ -13,13 +12,19 @@ import threading
 import time
 
 from .. import segments, ssimu2
-from ..constants import FALLBACK_MAXRATE, RESUMABLE_MIN_DURATION, SEGMENT_TIME
+from ..constants import (
+    FALLBACK_MAXRATE, MAXRATE_FACTOR, RESUMABLE_MIN_DURATION, SEGMENT_TIME,
+)
 from ..crop import crop_token
-from ..probe import res_tier
+from ..probe import high_bit_depth, res_tier
 from ..tools import ffmpeg_exe, find_ffvship_optional
-from ..ui import BOLD, DIM, GREEN, ORANGE, RESET, fmt_time
-from ..util import _temp_files, clamp, partial_hash, run_cmd
+from ..ui import BOLD, DIM, GREEN, RESET, fmt_time, label
+from ..util import _temp_files, fmt_cmd, partial_hash, run_cmd
 from .base import Engine, Grid
+
+# SVT-AV1 refuses a max bitrate above 100000 kbps and fails the encode at
+# init, so the peak cap is held to it.
+SVT_MAX_BITRATE = 100_000_000
 
 
 def enc_signature(cfg, crop=None):
@@ -30,8 +35,9 @@ def enc_signature(cfg, crop=None):
     return f"p{cfg['preset']}g{cfg['film_grain']}{crop_token(crop)}"
 
 
-def _run_ffmpeg_progress(cmd, duration, label, base_time=0.0):
-    """Run ffmpeg with -progress pipe:1 and render an inline progress bar.
+def _run_ffmpeg_progress(cmd, duration, prefix, base_time=0.0):
+    """Run ffmpeg with -progress pipe:1 and render an inline progress bar
+    after `prefix` (the stage label and quantizer).
 
     Parses key=value blocks on stdout; uses out_time_us against the known
     source duration so the bar stays accurate even when fps/bitrate vary
@@ -122,9 +128,7 @@ def _run_ffmpeg_progress(cmd, duration, label, base_time=0.0):
             parts.append(f"{fps_val:.1f}fps")
         if not final and kbps_val and kbps_val > 0:
             parts.append(f"{kbps_val:.0f}kbps")
-        sys.stdout.write(
-            f"\r\033[K{label} {bar} {'  '.join(parts)}"
-        )
+        sys.stdout.write(f"\r\033[K{prefix} {bar} {'  '.join(parts)}")
         sys.stdout.flush()
         active = True
 
@@ -155,9 +159,7 @@ def _run_ffmpeg_progress(cmd, duration, label, base_time=0.0):
         if proc.returncode != 0:
             tail = "\n".join(stderr_tail)
             raise RuntimeError(
-                f"ffmpeg exit {proc.returncode}\n"
-                f"{subprocess.list2cmdline(cmd) if os.name == 'nt' else ' '.join(map(shlex.quote, cmd))}"
-                f"\n{tail}"
+                f"ffmpeg exit {proc.returncode}\n{fmt_cmd(cmd)}\n{tail}"
             )
     except BaseException:
         try:
@@ -172,18 +174,24 @@ def _run_ffmpeg_progress(cmd, duration, label, base_time=0.0):
 
 def encode_av1(source, dest, meta, cq, cfg, show_progress=False,
                resumable=False):
-    """Encode video to AV1 using SVT-AV1 via ffmpeg.
+    """Encode `source` to AV1 at `cq` using SVT-AV1 via ffmpeg.
 
-    resumable marks a full-file output encode that may go through the
-    segmented path (_encode_segmented): the identical encoder invocation,
-    muxed into finalized segment files that survive a kill, so an
-    interrupted encode resumes at a segment boundary instead of
-    restarting from frame 0. Short sources and sample probes stay on the
-    single-pass path.
+    A sample probe (resumable False) encodes the picture straight to
+    dest: its source carries nothing else. A full-file output encode
+    (resumable True) writes the picture first, through the segmented
+    resume path on long sources (_encode_segmented), then the shared
+    source-stream mux adds audio, subtitles, fonts and chapters, the way
+    av1q-essential finishes too. So the live kbps on the progress bar is
+    the picture alone, like every bitrate this tool decides on.
     """
+    # ffmpeg's wrapper reads -crf 0 as "unset" and encodes at the
+    # encoder's own default CRF, while the cache would record 0.
+    if not 1 <= cq <= 63:
+        raise ValueError(f"CQ {cq} is outside libsvtav1's 1-63")
+
     pix = (
         "yuv420p10le"
-        if meta["hdr"] or "10le" in meta["pix_fmt"] or cfg["force_10bit"]
+        if meta["hdr"] or high_bit_depth(meta["pix_fmt"]) or cfg["force_10bit"]
         else "yuv420p"
     )
 
@@ -195,16 +203,11 @@ def encode_av1(source, dest, meta, cq, cfg, show_progress=False,
     if meta["cr"]:
         color_args += ["-color_range", meta["cr"]]
 
+    # Capped CRF (see MAXRATE_FACTOR). Setting any cap also switches
+    # SVT's recode loop on for key and alt-ref frames at every preset.
     bitrate = meta.get("bitrate") or FALLBACK_MAXRATE[res_tier(meta["w"], meta["h"])]
-    maxrate = min(int(bitrate * cfg["maxrate_factor"]), 100_000_000)
-    crf = clamp(cq, 0, 63)
+    maxrate = min(int(bitrate * MAXRATE_FACTOR), SVT_MAX_BITRATE)
 
-    # No tiles: ffmpeg's libsvtav1 wrapper never exposed a "-tiles" option
-    # (only tile-columns/tile-rows via -svtav1-params), SVT-AV1 threads well
-    # without them, and tiles cost ~0.6-1.3% compression efficiency — they
-    # only pay off for client decode speed, which CPU playback of AV1 at
-    # these bitrates doesn't need.
-    threads = os.cpu_count() or 1
     fg = cfg["film_grain"]
     # Quantization matrices: off by default in mainline, a ~1-3% rate-
     # distortion win that VMAF credits directly, so the search converts it
@@ -212,16 +215,20 @@ def encode_av1(source, dest, meta, cq, cfg, show_progress=False,
     # qm-min 2 / chroma-qm-min 4 follow SVT-AV1-Essential's curated
     # defaults (mainline's qm-min 8 barely lets the matrices act).
     #
-    # irefresh-type=2 (closed GOP): ffmpeg's wrapper overrides the
-    # encoder's own default down to open GOP, where the periodic keyint
-    # refreshes are intra-only frames that don't reset the reference
-    # buffers and never get the container keyframe flag — players can't
-    # seek to them and the segment muxer can't cut on them. Closed GOP
-    # makes every keyint refresh a true key frame: seekable output, and
-    # the split points the segmented resume path requires.
+    # irefresh-type=2 (closed GOP) is already the encoder's default and
+    # ffmpeg's (the wrapper sets +cgop), and is pinned here because the
+    # segmented resume path cannot work without it: only a closed-GOP
+    # refresh is a true key frame, seekable and keyframe-flagged, and the
+    # segment muxer cuts only on those. An open-GOP refresh is an
+    # intra-only frame that is neither.
+    #
+    # No scd: mainline SVT-AV1 switches scene change detection off
+    # whatever it is asked (its warning hides under -v error) and never
+    # inserts key frames at cuts, so the keyint is the only seek
+    # granularity there is.
     svt_params = (
         f"tune=0:sharpness=1:film-grain={fg}:film-grain-denoise=0"
-        f":enable-tf=0:enable-overlays=1:scd=1"
+        f":enable-tf=0:enable-overlays=1"
         f":enable-qm=1:qm-min=2:chroma-qm-min=4"
         f":irefresh-type=2"
     )
@@ -230,139 +237,106 @@ def encode_av1(source, dest, meta, cq, cfg, show_progress=False,
     if meta.get("crop"):
         vf_args = ["-vf", f"crop={meta['crop']}"]
 
-    enc_args = [
+    # No tiles: ffmpeg's wrapper has no tile option of its own (only
+    # tile-columns/tile-rows through -svtav1-params), and tiles cost
+    # ~0.6-1.3% compression efficiency for a client decode speed that CPU
+    # playback of AV1 at these bitrates doesn't need. No -threads or
+    # -bufsize either: the wrapper never hands the thread count to
+    # SVT-AV1, which sizes its own pool, and SVT reads the buffer size
+    # only in VBR and CBR, never in capped CRF.
+    video_args = [
+        "-map", "0:v:0", *vf_args,
         "-pix_fmt", pix,
         "-c:v", "libsvtav1",
         "-preset", str(cfg["preset"]),
-        "-crf", str(crf),
-        # No -g: SVT's own default keyint is fps-aware ~5s (161 frames at
-        # 24fps, 321 at 60fps), mini-gop aligned. The old fixed -g 250
-        # meant ~10s seek granularity at 24fps — and since mainline scd=1
-        # does NOT insert keyframes at scene cuts (that's a fork-only
-        # behavior), the interval is the ONLY seek granularity there is.
+        "-crf", str(cq),
+        # No -g: SVT's own default keyint rounds the frame rate up to
+        # whole mini-GOPs and spans five of those seconds (161 frames at
+        # 24fps, 321 at 60fps).
         "-svtav1-params", svt_params,
-        "-threads", str(threads),
         "-maxrate", str(maxrate),
-        "-bufsize", str(maxrate * 2),
         "-fps_mode", "passthrough",
         *color_args,
     ]
 
-    if (resumable and cfg.get("resume_encodes", True)
-            and (meta.get("duration") or 0) >= RESUMABLE_MIN_DURATION):
-        _encode_segmented(source, dest, meta, cq, cfg, pix, vf_args,
-                          enc_args, show_progress)
+    if not resumable:
+        tmp = dest.with_suffix(".tmp.mkv")
+        _temp_files.add(tmp)
+        _ffmpeg_encode(["-i", str(source)], video_args, [str(tmp)],
+                       meta, cq, show_progress)
+        tmp.replace(dest)
+        _temp_files.discard(tmp)
         return
+
+    work = None
+    if (cfg["resume_encodes"]
+            and (meta.get("duration") or 0) >= RESUMABLE_MIN_DURATION):
+        video, work = _encode_segmented(source, meta, cq, cfg, pix,
+                                        video_args, show_progress)
+    else:
+        video = dest.with_suffix(".video.tmp.mkv")
+        _temp_files.add(video)
+        _ffmpeg_encode(["-i", str(source)], video_args, [str(video)],
+                       meta, cq, show_progress)
 
     tmp = dest.with_suffix(".tmp.mkv")
     _temp_files.add(tmp)
-    try:
-        if tmp.exists():
-            tmp.unlink()
-    except OSError:
-        pass
-
-    # Subtitle fallback ladder, mirroring core.segments'
-    # mux_with_source_streams: MKV rejects some subtitle codecs as-is
-    # (e.g. mov_text from MP4) at header write — before any video is
-    # encoded — so stepping down to SRT, then to no subs, costs nothing.
-    # Only an early failure (no real output yet) walks the ladder; a
-    # mid-encode failure re-raises rather than re-paying the encode.
-    duration = meta.get("duration") or 0.0
-    sub_attempts = [
-        (["-map", "0:s?"], ["-c:s", "copy"], None),
-        (["-map", "0:s?"], ["-c:s", "srt"], None),
-        ([], [], "subtitles incompatible with MKV — dropped"),
-    ]
-    for attempt, (sub_map, sub_codec, note) in enumerate(sub_attempts):
-        cmd = [
-            ffmpeg_exe(), "-y", "-hide_banner", "-v", "error", "-nostats",
-            "-i", str(source),
-            "-map", "0:v:0", "-map", "0:a?", *sub_map,
-            *vf_args,
-            "-c:a", "copy", *sub_codec,
-            *enc_args, str(tmp),
-        ]
-        try:
-            if note:
-                print(f" {ORANGE}{'mux':<10}{RESET}{DIM}{note}{RESET}")
-            if show_progress and duration > 1.0:
-                out_path = cmd.pop()
-                cmd += ["-progress", "pipe:1", out_path]
-                label = f" {ORANGE}{'encode':<10}{RESET}CQ {BOLD}{cq}{RESET}"
-                _run_ffmpeg_progress(cmd, duration, label)
-            else:
-                run_cmd(cmd)
-            break
-        except RuntimeError:
-            try:
-                early = not tmp.exists() or tmp.stat().st_size < (64 << 10)
-            except OSError:
-                early = True
-            if attempt == len(sub_attempts) - 1 or not early:
-                raise
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except OSError:
-                pass
-
-    if dest.exists():
-        dest.unlink()
-    tmp.rename(dest)
+    segments.mux_with_source_streams(video, source, tmp)
+    tmp.replace(dest)
     _temp_files.discard(tmp)
+    if work:
+        shutil.rmtree(work, ignore_errors=True)
+    else:
+        video.unlink(missing_ok=True)
+        _temp_files.discard(video)
 
 
-def _encode_segmented(source, dest, meta, cq, cfg, pix, vf_args, enc_args,
-                      show_progress):
-    """Resumable full encode: one continuous encoder, segment-muxed.
+def _ffmpeg_encode(in_args, video_args, out_args, meta, cq, show_progress,
+                   base_time=0.0):
+    """One encoder run; out_args ends with the output path. show_progress
+    draws the inline bar (see _run_ffmpeg_progress for base_time)."""
+    cmd = [
+        ffmpeg_exe(), "-y", "-hide_banner", "-v", "error", "-nostats",
+        *in_args, *video_args, *out_args,
+    ]
+    duration = meta.get("duration") or 0.0
+    if show_progress and duration > 1.0:
+        cmd[-1:-1] = ["-progress", "pipe:1"]
+        _run_ffmpeg_progress(
+            cmd, duration, f"{label('encode')}CQ {BOLD}{cq}{RESET}",
+            base_time=base_time,
+        )
+    else:
+        run_cmd(cmd)
+
+
+def _encode_segmented(source, meta, cq, cfg, pix, video_args, show_progress):
+    """Resumable picture encode: one continuous encoder, segment-muxed.
+    Returns (joined video, work dir).
 
     The segment muxer finalizes each completed ~SEGMENT_TIME segment
     before opening the next, so the bitstream is identical to the
     single-pass encode while every finished segment survives a kill.
-    Resume drops the last finished segment (its first-packet PTS is the
-    only exactly-knowable boundary — see core.segments.resume_state),
-    re-enters the encode there, then concatenates all segments and
-    remuxes audio/subs/chapters from the source.
+    core.segments owns the resume state: it keeps the finished segments
+    minus the last one (its first-packet PTS is the only exactly-knowable
+    boundary), and the encode re-enters at that PTS.
 
     Segment files and the manifest deliberately stay OUT of _temp_files:
-    surviving Ctrl-C and crashes is their entire purpose. Only the final
-    mux temp is registered. The work dir is removed on success; the
-    pipeline sweeps a file's dirs once its output is final.
+    surviving Ctrl-C and crashes is their entire purpose. The caller
+    removes the work dir once the output is final; the pipeline sweeps a
+    file's dirs too.
     """
     file_hash = partial_hash(source)
     enc_tag = enc_signature(cfg, meta.get("crop"))
     sdir = segments.segment_dir(cfg["cache_dir"], file_hash, enc_tag, str(cq))
-    expected = segments.manifest_expected(
-        file_hash, enc_tag, str(cq), SEGMENT_TIME, pix
+    manifest, resume_ms = segments.prepare(
+        sdir,
+        segments.manifest_expected(
+            file_hash, enc_tag, str(cq), SEGMENT_TIME, pix
+        ),
     )
-    manifest = segments.load_manifest(sdir)
-    if not segments.manifest_matches(manifest, expected):
-        if sdir.exists():
-            shutil.rmtree(sdir, ignore_errors=True)
-        manifest = {**expected, "complete": False, "segments": []}
-    sdir.mkdir(parents=True, exist_ok=True)
 
-    # A "complete" manifest (encoder finished, then concat/mux was
-    # interrupted) is only trusted while every segment is still on disk;
-    # otherwise fall back to the normal reconcile-and-resume path.
-    def _seg_ok(s):
-        try:
-            p = sdir / s["name"]
-            return p.is_file() and p.stat().st_size > 0
-        except (KeyError, TypeError, OSError):
-            return False
-
-    if manifest.get("complete") and not (
-            manifest.get("segments")
-            and all(_seg_ok(s) for s in manifest["segments"])):
-        manifest["complete"] = False
-
-    if not manifest.get("complete"):
-        kept, resume_ms = segments.resume_state(sdir, manifest)
-        manifest["segments"] = kept
-        segments.write_manifest(sdir, manifest)
-
+    if not manifest["complete"]:
         base_time = 0.0
         in_args = ["-i", str(source)]
         ts_args = []
@@ -383,59 +357,31 @@ def _encode_segmented(source, dest, meta, cq, cfg, pix, vf_args, enc_args,
                        "-i", str(source)]
             ts_args = ["-copyts", "-start_at_zero"]
             print(
-                f" {ORANGE}{'resume':<10}{RESET}{BOLD}{len(kept)}{RESET}"
+                f"{label('resume')}{BOLD}{len(manifest['segments'])}{RESET}"
                 f" finished segment(s) kept"
                 f" {DIM}re-encoding from {fmt_time(base_time)}{RESET}"
             )
 
-        cmd = [
-            ffmpeg_exe(), "-y", "-hide_banner", "-v", "error", "-nostats",
-            *in_args, "-map", "0:v:0",
-            *vf_args, *enc_args, *ts_args,
-            "-f", "segment",
-            "-segment_time", str(SEGMENT_TIME),
-            "-segment_format", "matroska",
-            "-segment_list", str(sdir / segments.SEGMENT_LIST_NAME),
-            "-segment_list_type", "csv",
-            "-segment_start_number", str(len(kept)),
-            "-reset_timestamps", "0",
-            str(sdir / segments.SEGMENT_PATTERN),
-        ]
-
-        duration = meta.get("duration") or 0.0
-        if show_progress and duration > 1.0:
-            out_path = cmd.pop()
-            cmd += ["-progress", "pipe:1", out_path]
-            label = f" {ORANGE}{'encode':<10}{RESET}CQ {BOLD}{cq}{RESET}"
-            _run_ffmpeg_progress(cmd, duration, label, base_time=base_time)
-        else:
-            run_cmd(cmd)
-
-        new = segments.validate_new_segments(sdir, kept)
-        if not new:
-            raise RuntimeError("Segmented encode produced no segments")
-        manifest["segments"] = kept + new
-        manifest["complete"] = True
-        segments.write_manifest(sdir, manifest)
+        _ffmpeg_encode(
+            in_args, video_args,
+            [
+                *ts_args,
+                "-f", "segment",
+                "-segment_time", str(SEGMENT_TIME),
+                "-segment_format", "matroska",
+                "-segment_list", str(sdir / segments.SEGMENT_LIST_NAME),
+                "-segment_list_type", "csv",
+                "-segment_start_number", str(len(manifest["segments"])),
+                "-reset_timestamps", "0",
+                str(sdir / segments.SEGMENT_PATTERN),
+            ],
+            meta, cq, show_progress, base_time=base_time,
+        )
+        segments.finish_run(sdir, manifest)
 
     joined = sdir / segments.JOINED_NAME
     segments.concat_segments(sdir, manifest["segments"], joined)
-
-    tmp = dest.with_suffix(".tmp.mkv")
-    _temp_files.add(tmp)
-    try:
-        if tmp.exists():
-            tmp.unlink()
-    except OSError:
-        pass
-    # No attachments: matches the single-pass path, which maps only
-    # video/audio/subs from the source.
-    segments.mux_with_source_streams(joined, source, tmp)
-    if dest.exists():
-        dest.unlink()
-    tmp.rename(dest)
-    _temp_files.discard(tmp)
-    shutil.rmtree(sdir, ignore_errors=True)
+    return joined, sdir
 
 
 class IntGrid(Grid):

@@ -17,7 +17,7 @@ from ..probe import is_vfr, probe_hdr_metadata
 from ..sampling import clean_sample_source
 from ..segments import mux_with_source_streams
 from ..tools import ffmpeg_exe, find_encoder, find_ffvship_optional
-from ..ui import BOLD, DIM, GREEN, MIDDOT, ORANGE, RESET, fmt_time
+from ..ui import BOLD, DIM, GREEN, MIDDOT, RESET, fmt_time, label
 from ..util import _temp_files, make_temp_log
 from .base import Engine, Grid
 
@@ -290,8 +290,10 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
             parts.append(f"{fps_val:.1f}fps")
         if not final and kbps:
             parts.append(f"{kbps:.0f}kbps")
-        label = f" {ORANGE}{'encode':<10}{RESET}CRF {BOLD}{crf_str(crf)}{RESET}"
-        sys.stdout.write(f"\r\033[K{label} {bar} {'  '.join(parts)}")
+        sys.stdout.write(
+            f"\r\033[K{label('encode')}CRF {BOLD}{crf_str(crf)}{RESET}"
+            f" {bar} {'  '.join(parts)}"
+        )
         sys.stdout.flush()
         rendered = True
 
@@ -397,11 +399,11 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
         return
 
     # Remux: AV1 video from the encoder + audio/subs/chapters/attachments
-    # from the source (shared with av1q's segmented path — the SRT/drop
+    # from the source (shared with av1q's full encodes — the SRT/drop
     # subtitle fallback ladder lives in core.segments).
     tmp_mkv = dest.with_suffix(".tmp.mkv")
     _temp_files.add(tmp_mkv)
-    mux_with_source_streams(enc_out, source, tmp_mkv, attachments=True)
+    mux_with_source_streams(enc_out, source, tmp_mkv)
 
     try:
         enc_out.unlink()

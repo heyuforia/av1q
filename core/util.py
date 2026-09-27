@@ -44,6 +44,14 @@ def suppress_win_error_dialog():
         k32.SetErrorMode(prev)
 
 
+def fmt_cmd(cmd):
+    """A command line spelled the way this OS's shell would take it, for
+    failure messages."""
+    if os.name == "nt":
+        return subprocess.list2cmdline(cmd)
+    return " ".join(map(shlex.quote, cmd))
+
+
 def run_cmd(cmd):
     """Run a command and return the result. Raises on failure.
 
@@ -56,11 +64,7 @@ def run_cmd(cmd):
                        text=True, encoding="utf-8", errors="replace")
     if p.returncode:
         tail = "\n".join((p.stderr or "").splitlines()[-80:])
-        raise RuntimeError(
-            f"exit {p.returncode}\n"
-            f"{subprocess.list2cmdline(cmd) if os.name == 'nt' else ' '.join(map(shlex.quote, cmd))}"
-            f"\n{tail}"
-        )
+        raise RuntimeError(f"exit {p.returncode}\n{fmt_cmd(cmd)}\n{tail}")
     return p
 
 

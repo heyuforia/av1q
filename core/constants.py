@@ -70,6 +70,15 @@ SCAN_TIMEOUT_MAX = 3600
 
 TARGET_VMAF_BY_RES = {0: 93.0, 720: 94.0, 2160: 90.0}
 
+# av1q's peak cap: libsvtav1 runs capped CRF with a max bitrate of
+# MAXRATE_FACTOR × the source's own bitrate (the container's rate, audio
+# included). A ceiling on peaks, never a target: SVT checks it over each
+# 60-frame window and allows 50% over it, so a stretch may reach ~2.4×
+# the source's average. When the container states no bitrate,
+# FALLBACK_MAXRATE's per-tier value stands in for the source's rate and
+# is multiplied the same way. av1q-essential encodes uncapped.
+MAXRATE_FACTOR = 1.6
+
 FALLBACK_MAXRATE = {
     0: 8_000_000, 720: 12_000_000, 1080: 25_000_000,
     1440: 35_000_000, 2160: 45_000_000, 4320: 60_000_000,

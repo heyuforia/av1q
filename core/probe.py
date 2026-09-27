@@ -5,6 +5,7 @@ hardware-decode probe, and resolution tiering."""
 import json
 import math
 import platform
+import re
 import subprocess
 
 from .tools import ffmpeg_exe, ffprobe_exe
@@ -35,6 +36,21 @@ def hw_decode_unsafe(profile):
     out still falls back to the software attempt."""
     prof = (profile or "").lower()
     return any(t in prof for t in HW_UNSAFE_PROFILES)
+
+
+def high_bit_depth(pix_fmt):
+    """True when a pixel format carries more than 8 bits per sample.
+
+    ffmpeg spells every deeper format with its depth right before the
+    endianness suffix (yuv420p10le, yuv444p12le, p010le, gray10be,
+    yuv444p10msble); 8-bit formats carry no suffix (yuv420p, nv12,
+    rgb24). Matching "10le" alone misses 9, 12 and 16 bits and every
+    big-endian spelling, and drops those sources to 8 bits. Packed raw
+    RGB (rgb565le) reads as deep too; no library source uses it, and
+    10 bits is the safe side.
+    """
+    m = re.search(r"(\d+)(?:msb)?[lb]e$", pix_fmt or "")
+    return bool(m) and int(m.group(1)) > 8
 
 
 def detect_hwaccel():

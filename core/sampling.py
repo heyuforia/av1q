@@ -12,6 +12,7 @@ from .constants import (
     MINI_SAMPLE_COUNT, MINI_SAMPLE_DURATION, MINI_SAMPLE_MIN_RATIO,
     SAMPLE_COUNT_MAX, SAMPLE_SCALE_K, SAMPLE_SCALE_REF,
 )
+from .probe import high_bit_depth
 from .tools import ffmpeg_exe
 from .ui import DIM, MIDDOT, RED, RESET
 from .util import _temp_files, clamp, run_cmd
@@ -383,7 +384,7 @@ def clean_sample_source(concat, meta, cfg):
     _temp_files.add(tmp)
     pix = (
         "yuv420p10le"
-        if meta["hdr"] or "10le" in meta["pix_fmt"]
+        if meta["hdr"] or high_bit_depth(meta["pix_fmt"])
         else "yuv420p"
     )
     cmd = [
