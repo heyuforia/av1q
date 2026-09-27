@@ -110,10 +110,21 @@ def sidecar_crop(data, file_hash):
     return f"{w}:{h}:{x}:{y}", None
 
 
-def read_crop_sidecar(filepath, file_hash):
-    """<file>.crop.json's verdict on this file, as (crop, note) per
+def sidecar_path(cache_dir, filepath, file_hash):
+    """Where the crop sidecar for this file lives: the shared cache
+    root, never the source's own folder, so input folders stay clean.
+    The name carries the source's name for a reader looking for it by
+    eye, and the identity hash so a changed file or a same-named file in
+    another folder never reads another file's verdict."""
+    return (
+        cache_dir / "_crop" / f"{filepath.name}.{file_hash[:16]}.crop.json"
+    )
+
+
+def read_crop_sidecar(cache_dir, filepath, file_hash):
+    """The sidecar's verdict on this file, as (crop, note) per
     sidecar_crop; (None, None) when there is no sidecar."""
-    sidecar = filepath.with_suffix(filepath.suffix + ".crop.json")
+    sidecar = sidecar_path(cache_dir, filepath, file_hash)
     if not sidecar.exists():
         return None, None
     try:
@@ -125,10 +136,10 @@ def read_crop_sidecar(filepath, file_hash):
     return sidecar_crop(data, file_hash)
 
 
-def load_crop_sidecar(filepath, file_hash):
+def load_crop_sidecar(cache_dir, filepath, file_hash):
     """'W:H:X:Y' from a high-confidence sidecar that still matches the
     file, else None (see sidecar_crop for the rules)."""
-    return read_crop_sidecar(filepath, file_hash)[0]
+    return read_crop_sidecar(cache_dir, filepath, file_hash)[0]
 
 
 def detect_crop_window(source, start, duration, limit, round_to, cache_dir):

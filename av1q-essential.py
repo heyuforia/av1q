@@ -218,7 +218,7 @@ def main():
     )
     parser.add_argument(
         "--no-crops", action="store_true",
-        help="Ignore <file>.crop.json sidecars",
+        help="Ignore crop sidecars in _cache/_crop",
     )
     parser.add_argument(
         "--auto-crop", action="store_true",

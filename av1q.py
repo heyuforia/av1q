@@ -47,7 +47,8 @@ from core.crop import (
     SCAN_WINDOWS, WINDOW_DURATION, LIMIT_SDR, LIMIT_HDR, ROUND,
     MIN_KEEP_RATIO, AGREE_RATIO,
     crop_scan_cfg, crop_token, load_crop_sidecar, read_crop_sidecar,
-    sidecar_crop, detect_crop_window, aggregate_crops, detect_crop_for_file,
+    sidecar_crop, sidecar_path, detect_crop_window, aggregate_crops,
+    detect_crop_for_file,
 )
 from core import search as core_search
 from core import pipeline as core_pipeline
@@ -171,8 +172,8 @@ def main():
     )
     parser.add_argument(
         "--no-crops", action="store_true",
-        help="Ignore <file>.crop.json sidecars (otherwise auto-applied when present "
-             "and confidence=high)",
+        help="Ignore crop sidecars in _cache/_crop (otherwise auto-applied "
+             "when present and confidence=high)",
     )
     parser.add_argument(
         "--auto-crop", action="store_true",

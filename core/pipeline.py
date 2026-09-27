@@ -9,8 +9,9 @@ including the printed output's quantizer labels and grid formatting.
 
 Two cache scopes, deliberately distinct:
   cfg["cache_dir"]        shared between pipelines — scene analysis,
-                          sample extraction, crop temp logs (source
-                          facts; the formats are identical).
+                          sample extraction, crop sidecars and temp
+                          logs (source facts; the formats are
+                          identical).
   engine.cache_root(cfg)  per-pipeline — result caches, calibration,
                           sample encodes, FFMS2 indexes. Different
                           encoders must never share these.
@@ -42,7 +43,7 @@ from .constants import (
 )
 from .crop import (
     crop_scan_cfg, crop_token, detect_crop_for_file, load_crop_sidecar,
-    read_crop_sidecar, sidecar_crop,
+    read_crop_sidecar, sidecar_crop, sidecar_path,
 )
 from .probe import parse_rate, probe_video, res_tier
 from .sampling import (
@@ -220,7 +221,8 @@ def process_videos(cfg, engine):
             c, _ = load_cache(root_cache, fh, engine.sig)
             if recommended_matches(
                     c.get("recommended"), engine, cfg,
-                    load_crop_sidecar(f, fh) if cfg["use_crops"] else None,
+                    load_crop_sidecar(cache_dir, f, fh)
+                    if cfg["use_crops"] else None,
                     cfg["target_vmaf"]):
                 prior.append((f, fh))
         if prior:
@@ -299,7 +301,7 @@ def process_videos(cfg, engine):
                 )
 
             expected_crop = (
-                load_crop_sidecar(filepath, file_hash)
+                load_crop_sidecar(cache_dir, filepath, file_hash)
                 if cfg["use_crops"] else None
             )
             dst_path = make_dst_path(expected_crop)
@@ -455,7 +457,7 @@ def process_videos(cfg, engine):
             # says why — a scanned file about to be encoded uncropped
             # is worth a line.
             meta["crop"] = None
-            sidecar = filepath.with_suffix(filepath.suffix + ".crop.json")
+            sidecar = sidecar_path(cache_dir, filepath, file_hash)
             if cfg["auto_crop"] and not sidecar.exists():
                 try:
                     data = detect_crop_for_file(
@@ -465,6 +467,7 @@ def process_videos(cfg, engine):
                     print(f"{label('crop err')}{e}")
                 else:
                     try:
+                        sidecar.parent.mkdir(parents=True, exist_ok=True)
                         atomic_write_json(sidecar, data, indent=2)
                     except OSError as e:
                         print(
@@ -474,7 +477,9 @@ def process_videos(cfg, engine):
                     if cfg["use_crops"]:
                         meta["crop"] = sidecar_crop(data, file_hash)[0]
             elif cfg["use_crops"]:
-                meta["crop"], note = read_crop_sidecar(filepath, file_hash)
+                meta["crop"], note = read_crop_sidecar(
+                    cache_dir, filepath, file_hash
+                )
                 if meta["crop"]:
                     print(f"{label('crop')}{BOLD}{meta['crop']}{RESET}")
                 elif note:

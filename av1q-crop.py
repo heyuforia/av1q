@@ -2,8 +2,9 @@
 """
 av1q-crop — Batch letterbox/pillarbox crop detection for av1q.
 
-Writes a sidecar JSON (<file>.crop.json) beside each source. av1q reads
-these automatically (use --no-crops to ignore). For a one-step workflow,
+Writes a sidecar JSON per source under _cache/_crop, named after the
+source, so input folders stay clean. av1q reads these automatically
+(use --no-crops to ignore). For a one-step workflow,
 run av1q.py --auto-crop instead — it does the same detection inline
 before each encode.
 
@@ -30,13 +31,15 @@ from av1q import (
     crop_scan_cfg,
     partial_hash,
     probe_video,
+    sidecar_path,
     detect_crop_for_file,
     run_launcher,
 )
 
 
 def process_file(source, cfg):
-    sidecar = source.with_suffix(source.suffix + ".crop.json")
+    file_hash = partial_hash(source)
+    sidecar = sidecar_path(cfg["cache_dir"], source, file_hash)
     if sidecar.exists() and not cfg["force"]:
         print(f"{label('skip')}{DIM}sidecar exists (--force rewrites it){RESET}")
         return
@@ -57,13 +60,13 @@ def process_file(source, cfg):
         print(f" {CHECK} Already AV1, skipping")
         return
 
-    file_hash = partial_hash(source)
     sidecar_data = detect_crop_for_file(source, meta, cfg, file_hash)
 
     if cfg["dry_run"]:
         print(f"{label('dry-run')}{DIM}sidecar not written{RESET}")
         return
 
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(sidecar, sidecar_data, indent=2)
 
 

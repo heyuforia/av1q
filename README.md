@@ -92,7 +92,7 @@ Finished files are remembered and skipped on later runs, and outputs at differen
 python av1q.py --auto-crop
 ```
 
-Before each encode the script samples 8 short windows, detects black bars, and applies the crop if the detection is confident. Results are cached as `<file>.crop.json` sidecars beside each source, so re-runs reuse them. Low-confidence detections (dark sources, mixed aspect ratios, rotated phone video) are saved for manual review but never auto-applied, and a sidecar that is present but not applied says why on the encode's crop line. Pass `--no-crops` to ignore sidecars entirely.
+Before each encode the script samples 8 short windows, detects black bars, and applies the crop if the detection is confident. Results are saved as sidecars in the `_cache/_crop` folder next to the script, named after each video, so re-runs reuse them and your video folders stay clean. Low-confidence detections (dark sources, mixed aspect ratios, rotated phone video) are saved for manual review but never auto-applied, and a sidecar that is present but not applied says why on the encode's crop line. Pass `--no-crops` to ignore sidecars entirely.
 
 To pre-scan a whole library before encoding, so you can review borderline sidecars first, the companion `av1q-crop.py` runs the same detection standalone and writes the same sidecar format:
 
@@ -120,7 +120,7 @@ python av1q.py
 | `--overwrite` | | Re-encode even if output exists |
 | `--dry-run` | | Find optimal CQ but skip final encoding |
 | `--auto-crop` | | Detect letterbox/pillarbox inline before each encode |
-| `--no-crops` | | Ignore `*.crop.json` sidecars (auto-applied by default) |
+| `--no-crops` | | Ignore crop sidecars (auto-applied by default) |
 | `--no-resume` | | Disable resumable segmented encoding for long sources |
 
 ## How it works
