@@ -14,7 +14,7 @@ import time
 
 from .. import ssimu2
 from ..crop import crop_token
-from ..probe import is_vfr, picture_timing, probe_hdr_metadata
+from ..probe import is_vfr, picture_timing
 from ..sampling import clean_sample_source
 from ..segments import mux_with_source_streams
 from ..tools import ffmpeg_exe, find_encoder, find_ffvship_optional
@@ -543,12 +543,8 @@ class EssentialEngine(Engine):
         timing = picture_timing(source)
         meta["picture_start"] = timing["start"]
         meta["picture_rate"] = timing["rate"]
-        # HDR10 static metadata rides the encoder flags (Y4M carries
-        # none).
-        meta["mastering"] = meta["cll"] = None
-        if meta["hdr"]:
-            meta["mastering"], meta["cll"] = probe_hdr_metadata(source)
-        return bool(meta["mastering"] or meta["cll"])
+        # The HDR10 static metadata build_color_args restates.
+        return super().prepare_meta(source, meta, cfg)
 
     def prep_sample(self, concat, meta, cfg):
         # The raw concat is only an intermediate here — the search runs

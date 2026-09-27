@@ -9,6 +9,7 @@ written before and after the package split must stay interchangeable.
 """
 
 from ..constants import DEFAULT_BITRATE_DECAY
+from ..probe import probe_hdr_metadata
 
 
 class Grid:
@@ -158,9 +159,18 @@ class Engine:
         return None
 
     def prepare_meta(self, source, meta, cfg):
-        """Engine-specific metadata enrichment before encoding starts.
-        Returns True when something user-visible was carried over."""
-        return False
+        """Source facts read once per file, before any encode of it.
+        Returns True when something user-visible was carried over.
+
+        Default: the HDR10 static metadata (meta["mastering"] and
+        meta["cll"], None when absent), which every engine states to its
+        encoder itself. No encoder finds it alone: the Y4M pipe carries
+        none, and ffmpeg hands libsvtav1 only what its first decoded
+        frame carries. An engine that reads more calls this too."""
+        meta["mastering"] = meta["cll"] = None
+        if meta["hdr"]:
+            meta["mastering"], meta["cll"] = probe_hdr_metadata(source)
+        return bool(meta["mastering"] or meta["cll"])
 
     def prep_sample(self, concat, meta, cfg):
         """Turn the raw sample concat into this engine's search source

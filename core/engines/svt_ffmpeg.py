@@ -1,7 +1,7 @@
 """Mainline SVT-AV1 engine: av1q's encode path, through ffmpeg's
-libsvtav1 wrapper. The picture is encoded first, crop and color
-metadata applied; the shared source-stream mux in core.segments then
-adds audio, subtitles, fonts and chapters."""
+libsvtav1 wrapper. The picture is encoded first, crop, color and
+HDR10 static metadata applied; the shared source-stream mux in
+core.segments then adds audio, subtitles, fonts and chapters."""
 
 import collections
 import math
@@ -232,6 +232,16 @@ def encode_av1(source, dest, meta, cq, cfg, show_progress=False,
         f":enable-qm=1:qm-min=2:chroma-qm-min=4"
         f":irefresh-type=2"
     )
+    # HDR10 static metadata (Engine.prepare_meta), stated outright. On
+    # its own ffmpeg hands the wrapper only what the first frame into
+    # the filter graph carries, and never refreshes it, so a HEVC
+    # capture that emits a picture without its SEI first loses it. The
+    # wrapper parses these params after that snapshot, so they win.
+    # Neither string holds a ':'.
+    if meta.get("mastering"):
+        svt_params += f":mastering-display={meta['mastering']}"
+    if meta.get("cll"):
+        svt_params += f":content-light={meta['cll']}"
 
     vf_args = []
     if meta.get("crop"):

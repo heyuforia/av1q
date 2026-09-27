@@ -23,7 +23,7 @@ For every file:
 - **Scene-based sampling.** Fast quality estimation, so the search never encodes the whole file.
 - **P5 quality reporting.** The 5th-percentile worst-frame VMAF is reported next to the mean, so you can spot files whose worst moments lag.
 - **SSIMULACRA2 reporting.** Every VMAF score is shown next to a GPU-computed [SSIMULACRA2](https://github.com/cloudinary/ssimulacra2) score as a second opinion. Informational only, it never influences the encode.
-- **HDR and color preservation.** Carries over color primaries, transfer, matrix, and range.
+- **HDR and color preservation.** Carries over color primaries, transfer, matrix, and range, plus the HDR10 mastering display and content light level metadata.
 - **10-bit output** by default, with film grain synthesis.
 - **Hardware-accelerated decoding.** CUDA, D3D11VA (Windows), VideoToolbox (macOS), and VAAPI (Linux) speed up quality measurement and scene detection. Encoding itself is always CPU.
 - **Optional auto-crop.** `--auto-crop` detects letterbox and pillarbox bars before each encode, or use the standalone `av1q-crop.py` to pre-scan a library. Confidence-gated, so ambiguous detections are never silently applied.
