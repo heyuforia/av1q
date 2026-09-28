@@ -10,24 +10,35 @@ import time
 from .analyze import span_complexity, window_of
 from .constants import (
     MIN_SCENE_DURATION, MINI_SAMPLE_COUNT, MINI_SAMPLE_DURATION,
-    MINI_SAMPLE_MIN_RATIO, SAMPLE_COUNT_MAX, SAMPLE_SCALE_K, SAMPLE_SCALE_REF,
+    MINI_SAMPLE_MIN_RATIO, SAMPLE_COUNT_MAX, SAMPLE_MIN_RATIO, SAMPLE_SCALE_K,
+    SAMPLE_SCALE_REF,
 )
 from .probe import high_bit_depth
 from .tools import ffmpeg_exe
-from .ui import DIM, MIDDOT, RED, RESET
+from .ui import BOLD, DIM, MIDDOT, RED, RESET, label
 from .util import _temp_files, clamp, run_cmd
 
 
+MINI_PLAN = (MINI_SAMPLE_COUNT, MINI_SAMPLE_DURATION, "mini")
+
+# Each plan's amortization gate: the source must run longer than this
+# many times what the plan's clips cut.
+_MIN_RATIO = {"standard": SAMPLE_MIN_RATIO, "mini": MINI_SAMPLE_MIN_RATIO}
+
+
 def sampling_plan(duration, cfg):
-    """Per-file sampling plan: (count, sample_duration, mode) or None.
+    """The largest sampling plan the runtime allows: (count,
+    sample_duration, mode) or None. Judged here on the stretches alone,
+    before any scan; choose_samples judges it again on the clips as cut
+    and may step it down.
 
     'standard' — the configured plan, when the source is meaningfully
-    longer than its extracted total (1.25×; below that each probe encodes
-    nearly the whole file and the final full encode + verify come on top).
-    The scene count scales up with duration so long features get enough
-    distinct scenes to represent their complexity range (see
-    SAMPLE_SCALE_* in constants): flat at the base count up to the
-    reference runtime, then +SAMPLE_SCALE_K per doubling, capped at
+    longer than its planned total (SAMPLE_MIN_RATIO; below that each
+    probe encodes nearly the whole file and the final full encode +
+    verify come on top). The scene count scales up with duration so long
+    features get enough distinct scenes to represent their complexity
+    range (see SAMPLE_SCALE_* in constants): flat at the base count up to
+    the reference runtime, then +SAMPLE_SCALE_K per doubling, capped at
     SAMPLE_COUNT_MAX. Clip length stays fixed. 'mini' — a scaled-down
     plan for short files that used to fall through to full-file search,
     where every probe is a full encode: a few tiny probes cost a fraction
@@ -38,7 +49,7 @@ def sampling_plan(duration, cfg):
     base = cfg["sample_count"]
     sampling_min = max(
         cfg["short_threshold"],
-        base * cfg["sample_duration"] * 1.25,
+        base * cfg["sample_duration"] * SAMPLE_MIN_RATIO,
     )
     if duration > sampling_min:
         count = int(clamp(
@@ -47,8 +58,99 @@ def sampling_plan(duration, cfg):
         ))
         return count, cfg["sample_duration"], "standard"
     if duration > MINI_SAMPLE_COUNT * MINI_SAMPLE_DURATION * MINI_SAMPLE_MIN_RATIO:
-        return MINI_SAMPLE_COUNT, MINI_SAMPLE_DURATION, "mini"
+        return MINI_PLAN
     return None
+
+
+def choose_samples(plan, scenes, complexity, keyframes, duration, cfg):
+    """The samples a source is searched on, as (sample_scenes, clips,
+    plan, even), or None for full-file search. even is True when the
+    samples are evenly spaced rather than complexity-selected.
+
+    plan is sampling_plan's, and it only ever steps down: to the mini
+    plan, then to none. Each plan is judged on its clips as cut
+    (plan_clips), lead-ins included, against the gate sampling_plan
+    applied to the stretches alone. Evenly spaced samples start on
+    keyframes and add nothing, so what steps a plan down is scene clips
+    between sparse keyframes, or a source with too few keyframes to
+    space samples on, whose clips all run from the same few and merge.
+
+    A scene list too thin to fill the plan is discarded and the samples
+    re-selected evenly spaced, which is representative by construction.
+    A plan that even spacing cannot fill either steps down too: a source
+    with one keyframe offers a single clip at its start, and no plan
+    rides on a single clip when it asked for more.
+    """
+    # Only the scenes long enough to hold a sample are candidates; a file
+    # whose every scene is shorter samples evenly, and must say so, or
+    # its representative samples get the scene margin and cohort.
+    candidates = sampleable(scenes, cfg)
+    plans = [plan, MINI_PLAN] if plan[2] == "standard" else [plan]
+    for count, dur, mode in plans:
+        if mode == "mini" and plan[2] == "mini":
+            print(
+                f"{label('short')}{duration:.0f}s source →"
+                f" mini-samples ({count}×{dur:.0f}s)"
+            )
+        # The plan already decided sampling applies, so disarm
+        # select_samples' own short-file bail-out and use the plan's clip
+        # length (mini plans cut shorter clips).
+        select_cfg = {**cfg, "sample_duration": dur, "short_threshold": 0}
+        picked = select_samples(
+            candidates, complexity, duration, count, keyframes, select_cfg,
+        )
+        even = not candidates
+        # A degenerate scene list can't fill the plan: select_samples
+        # picks each distinct scene at most once, so a source with a lone
+        # detected cut yields a single clip, and betting the whole search
+        # on it is how one near-static scene misreads a high-bitrate
+        # source as floor-bound. Too few scene samples → re-select evenly
+        # spaced (mirrors the count//2 guard on select_samples' keyframe
+        # path; the max(2, ·) stops mini plans from riding on a single
+        # clip, min(count, ·) keeps 1-sample plans valid). The even picks
+        # must reach it too, or the plan steps down.
+        need = min(count, max(2, count // 2))
+        if not even and picked and len(picked) < need:
+            print(
+                f"{label('fallback')}scenes fill only {len(picked)} of"
+                f" {count} samples, switching to evenly-spaced"
+            )
+            picked = select_samples(
+                [], complexity, duration, count, keyframes, select_cfg,
+            )
+            even = True
+        picked = picked or []
+        clips = plan_clips(picked, keyframes)
+        cut = sum(stop - start for start, stop in clips)
+        if len(picked) >= need and duration > cut * _MIN_RATIO[mode]:
+            info = (
+                "evenly-spaced samples" if even
+                else f"samples from {BOLD}{len(scenes)}{RESET} scenes"
+            )
+            print(f"{label('scenes')}{BOLD}{len(picked)}{RESET} {info}")
+            return picked, clips, (count, dur, mode), even
+        if len(picked) < need:
+            why = (
+                f"only {len(picked)} of {count} samples can start on a"
+                f" distinct keyframe"
+            )
+        else:
+            why = (
+                f"{len(clips)} clip{'s' if len(clips) != 1 else ''} cut from"
+                f" keyframes would run {cut:.0f}s of the {duration:.0f}s source"
+            )
+        then = (
+            f"switching to mini-samples ({MINI_PLAN[0]}×{MINI_PLAN[1]:.0f}s)"
+            if mode == "standard" else "using full VMAF"
+        )
+        print(f"{label('fallback')}{why}, {then}")
+    return None
+
+
+def sampleable(scenes, cfg):
+    """The scenes long enough to hold a sample (MIN_SCENE_DURATION, as
+    cfg["min_scene_duration"]). The rest are never candidates."""
+    return [sc for sc in scenes if sc["duration"] >= cfg["min_scene_duration"]]
 
 
 def select_samples(scenes, complexity, duration, count, keyframes, cfg):
@@ -89,9 +191,7 @@ def select_samples(scenes, complexity, duration, count, keyframes, cfg):
     # data every scene ties.
     neutral = sum(comp_map.values()) / len(comp_map) if comp_map else 0.0
     scored = []
-    for sc in scenes:
-        if sc["duration"] < cfg["min_scene_duration"]:
-            continue
+    for sc in sampleable(scenes, cfg):
         dur = min(sc["duration"], sample_dur)
         value, _ = span_complexity(comp_map, sc["time"], sc["time"] + dur)
         scored.append({

@@ -50,8 +50,8 @@ from .crop import (
 )
 from .probe import parse_rate, probe_video, res_tier
 from .sampling import (
-    complexity_bias, complexity_bias_margin, extract_samples, plan_clips,
-    sampling_plan, select_samples,
+    choose_samples, complexity_bias, complexity_bias_margin, extract_samples,
+    sampling_plan,
 )
 from .tools import have_ffmpeg, local_ffmpeg_dir, missing_ffmpeg_components
 from .ui import (
@@ -260,9 +260,10 @@ def process_videos(cfg, engine):
     t_start = time.time()
     global_cal = load_global_calibration(cal_root)
 
-    # Whether (and how) a file gets sampled is sampling_plan's call:
-    # the configured plan for long sources, a scaled-down mini plan for
-    # short ones, full-file search only below the mini amortization gate.
+    # Whether (and how) a file gets sampled: sampling_plan allows the
+    # configured plan for long sources, a scaled-down mini plan for short
+    # ones, full-file search only below the mini amortization gate, and
+    # choose_samples may step that down once the clips as cut are known.
     mini_min = MINI_SAMPLE_COUNT * MINI_SAMPLE_DURATION * MINI_SAMPLE_MIN_RATIO
 
     all_qs = grid.span(min_q, max_q)
@@ -680,20 +681,18 @@ def process_videos(cfg, engine):
                     f" from previous search{seed_note}"
                 )
 
-            sample_scenes = sample_clips = sample_src = sample_at_best = None
-            even_sampling = False
+            sample_clips = sample_src = sample_at_best = None
+            # Evenly spaced samples (intra-only sources, no detected
+            # scenes, a thin scene list) are representative, not
+            # complexity-biased: the sample→full bitrate ratio is ~1.0, so
+            # the floor search uses a small margin instead of the
+            # complexity-bias one. Mini-plan runs keep their own cohort
+            # (see cohort_keys). Both describe the plan actually sampled.
+            even_sampling = mini_sampling = False
             complexity = []  # per-window complexity; used for the margin estimate
             plan = sampling_plan(meta["duration"], cfg)
-            # Mini-plan runs keep their own cohort (see cohort_keys).
-            mini_sampling = bool(plan) and plan[2] == "mini"
 
             if existing_q is None and plan:
-                n_samples, s_dur, _ = plan
-                if mini_sampling:
-                    print(
-                        f"{label('short')}{meta['duration']:.0f}s source →"
-                        f" mini-samples ({n_samples}×{s_dur:.0f}s)"
-                    )
                 if meta["codec"] in INTRA_ONLY_CODECS:
                     print(f"{label('skip')}Intra-only codec ({meta['codec']}), using even samples")
                 # Stored per source in the shared cache root, so the
@@ -702,55 +701,16 @@ def process_videos(cfg, engine):
                 scenes, complexity, keyframes = scene_analysis(
                     filepath, meta, cfg, file_hash
                 )
-
-                # The plan already decided sampling applies, so disarm
-                # select_samples' own short-file bail-out and use the
-                # plan's clip length (mini plans cut shorter clips).
-                select_cfg = {
-                    **cfg, "sample_duration": s_dur, "short_threshold": 0,
-                }
-                sample_scenes = select_samples(
-                    scenes, complexity, meta["duration"], n_samples,
-                    keyframes, select_cfg,
+                # The plan judged again on its clips as cut, which may
+                # step it down to the mini plan or to full-file search.
+                # sample_clips is the picture the probes will encode, the
+                # same plan extract_samples cuts: the bias below reads it.
+                chosen = choose_samples(
+                    plan, scenes, complexity, keyframes, meta["duration"], cfg,
                 )
-                # No detected scenes (intra-only sources, or scdet found
-                # none) means the samples are evenly spaced and therefore
-                # representative, not complexity-biased — the sample→full
-                # bitrate ratio is ~1.0, so the floor search uses a small
-                # margin instead of the complexity-bias one.
-                even_sampling = not scenes
-                # A degenerate scene list can't fill the plan:
-                # select_samples picks each distinct scene at most once,
-                # so a source with a lone detected cut yields a single
-                # clip — and betting the whole search on it is how one
-                # near-static scene misreads a high-bitrate source as
-                # floor-bound. Too few scene samples → re-select evenly
-                # spaced, which is representative by construction
-                # (mirrors the count//2 guard on select_samples' keyframe
-                # path; the max(2, ·) stops mini plans from riding on a
-                # single clip, min(count, ·) keeps 1-sample plans valid).
-                min_scene_samples = min(n_samples, max(2, n_samples // 2))
-                if (not even_sampling and sample_scenes
-                        and len(sample_scenes) < min_scene_samples):
-                    print(
-                        f"{label('fallback')}scenes fill only"
-                        f" {len(sample_scenes)} of {n_samples} samples,"
-                        f" switching to evenly-spaced"
-                    )
-                    sample_scenes = select_samples(
-                        [], complexity, meta["duration"], n_samples,
-                        keyframes, select_cfg,
-                    )
-                    even_sampling = True
-                if sample_scenes:
-                    info = (
-                        f"samples from {BOLD}{len(scenes)}{RESET} scenes"
-                        if not even_sampling else "evenly-spaced samples"
-                    )
-                    print(f"{label('scenes')}{BOLD}{len(sample_scenes)}{RESET} {info}")
-                    # The picture the probes will encode, from the same
-                    # plan extract_samples cuts: the bias below reads it.
-                    sample_clips = plan_clips(sample_scenes, keyframes)
+                if chosen:
+                    sample_scenes, sample_clips, (_, _, mode), even_sampling = chosen
+                    mini_sampling = mode == "mini"
                     print(f"{label('extract')}Extracting samples...")
                     sample_concat = extract_samples(
                         filepath, sample_scenes, keyframes, cfg,
@@ -765,13 +725,10 @@ def process_videos(cfg, engine):
                     )
                     if not sample_src:
                         print(f"{label('fallback')}Extraction failed, using full encode")
-                        sample_scenes = None
                     else:
                         # Named while the file exists (the name carries
                         # its size); deleted with it below.
                         sample_idx = engine.sample_ref_index(cfg, sample_src)
-                else:
-                    print(f"{label('scenes')}Using full VMAF")
             elif existing_q is None:
                 print(f"{label('short')}≤{mini_min:.0f}s, full VMAF")
 

@@ -44,9 +44,17 @@ MIN_SCENE_DURATION = 2.0
 
 # Sources under this are too short to sample by scenes: the sampling
 # plan drops to the mini plan or full-file search (its own amortization
-# gate, 1.25× the extracted total, is higher at the default --samples),
-# and the crop scan uses evenly spaced windows instead of scene picks.
+# gate, SAMPLE_MIN_RATIO, is higher at the default --samples), and the
+# crop scan uses evenly spaced windows instead of scene picks.
 SHORT_THRESHOLD = 48
+
+# Amortization gate of the configured sampling plan: the source must run
+# longer than this many times what its clips cut, or each probe encodes
+# nearly the whole file and the final full encode and verify come on top.
+# Below it the plan steps down to the mini plan (MINI_SAMPLE_*). Counted
+# on the clips as cut, lead-ins included: a clip starts on the keyframe
+# before its scene, so sparse keyframes can stretch it far past its 6s.
+SAMPLE_MIN_RATIO = 1.25
 
 # scdet cut threshold, well under the filter's stock 10: soft cuts and
 # dissolves register too. A missed cut means a complex scene never
@@ -240,8 +248,9 @@ SEGMENT_TIME = 60
 # where every probe is a full encode; mini-samples keep probes cheap for
 # sources still long enough to amortize the final encode + verify that
 # the sample path adds on top. MIN_RATIO is that amortization gate:
-# below duration > count×duration×ratio, each probe nearly encodes the
-# whole file anyway and full-file search is strictly cheaper.
+# unless the source runs longer than ratio × what the clips cut (lead-ins
+# included, as SAMPLE_MIN_RATIO), each probe nearly encodes the whole
+# file anyway and full-file search is strictly cheaper.
 MINI_SAMPLE_COUNT = 3
 MINI_SAMPLE_DURATION = 2.0
 MINI_SAMPLE_MIN_RATIO = 2.5
