@@ -80,21 +80,24 @@ def sidecar_crop(data, file_hash):
     the file, else None. note is None when there is nothing to say (a
     'none' verdict found the full frame) and otherwise why a present
     sidecar is not applied — worth a line, because a file the user
-    scanned is about to be encoded uncropped. Hash mismatch means the
-    file was replaced after detection; a missing hash (hand-written
-    sidecar) is trusted.
+    scanned is about to be encoded uncropped. A changed file never gets
+    here: its new hash names another sidecar path. The hash inside
+    still refuses a sidecar copied by hand under another file's name;
+    a missing hash (hand-written sidecar) is trusted.
     """
     conf = data.get("confidence")
     if conf == "none":
         return None, None
-    if conf != "high":
+    if conf == "low":
         why = data.get("reason")
         return None, (
-            f"sidecar confidence {conf}, not applied"
+            "sidecar confidence low, not applied"
             + (f" ({why})" if isinstance(why, str) and why else "")
         )
+    if conf != "high":
+        return None, "sidecar malformed, ignored"
     if data.get("source_hash") and data["source_hash"] != file_hash:
-        return None, "sidecar predates a change to the file, ignored"
+        return None, "sidecar belongs to another file, ignored"
     try:
         w, h, x, y = data["width"], data["height"], data["x"], data["y"]
     except KeyError:

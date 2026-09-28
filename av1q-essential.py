@@ -218,11 +218,13 @@ def main():
     )
     parser.add_argument(
         "--no-crops", action="store_true",
-        help="Ignore crop sidecars in _cache/_crop",
+        help="Ignore crop sidecars in _cache/_crop (otherwise auto-applied "
+             "when present and confidence=high)",
     )
     parser.add_argument(
         "--auto-crop", action="store_true",
-        help="Detect letterbox/pillarbox crop inline before each encode",
+        help="Detect letterbox/pillarbox crop inline for each file before encoding "
+             "(skips files that already have a sidecar)",
     )
     parser.add_argument(
         "--seed-crf", type=float, default=None,
@@ -321,9 +323,10 @@ def main():
     cfg = {
         "input_dir": args.input,
         "output_dir": args.output,
-        # _cache is shared with av1q (sample extraction + temp logs);
-        # everything encoder/metric-specific lives under _essential so
-        # the two pipelines never clobber each other's per-file caches.
+        # _cache is shared with av1q (source facts: samples, scene
+        # analysis, crop sidecars, temp logs); everything encoder/metric-
+        # specific lives under _essential so the two pipelines never
+        # clobber each other's per-file caches.
         "cache_dir": cache_dir,
         "e_cache_dir": cache_dir / "_essential",
         "learned_dir": SCRIPT_DIR / "_learned",
