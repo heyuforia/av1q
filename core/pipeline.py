@@ -34,8 +34,8 @@ from .cache import load_cache, recommended_matches
 from .calibrate import (
     DECAY_MAX, DECAY_MIN, OFFSET_MAX, RATIO_MAX, RATIO_MIN,
     calibration_offset, decay_prior, file_calibration, ratio_prior,
-    load_global_calibration, scene_offset_center, update_global_calibration,
-    vmaf_slope_prior,
+    load_global_calibration, pair_sampled_as, scene_offset_center,
+    update_global_calibration, vmaf_slope_prior,
 )
 from .constants import (
     BITRATE_BAND, COMPLEXITY_MARGIN_FLOOR, DEFAULT_VMAF_SLOPE,
@@ -802,13 +802,14 @@ def process_videos(cfg, engine):
                 bias = complexity_bias(complexity, sample_clips)
                 # Apply learned VMAF offset (sample over/under-predicts
                 # full VMAF) so the sample search aims at the quantizer
-                # that will hit `target` on the full video. Per-file
-                # calibration takes precedence; on first encounter we fall
-                # back to the cohort average, blended toward this file's
-                # structural center — for complexity-selected samples that
-                # is SCENE_OFFSET_PRIOR scaled by the bias actually
-                # measured above (scene_offset_center), for evenly-spaced
-                # ones it is 0. Each mode reads its OWN cohort: the scene
+                # that will hit `target` on the full video. The file's own
+                # offset takes precedence when its pair was sampled the
+                # same way as this search; otherwise we fall back to the
+                # cohort average, blended toward this file's structural
+                # center — for complexity-selected samples that is
+                # SCENE_OFFSET_PRIOR scaled by the bias actually measured
+                # above (scene_offset_center), for evenly-spaced ones it
+                # is 0. Each mode reads its OWN cohort: the scene
                 # cohort's whole content is scene-selection bias, which
                 # doesn't apply to an evenly-spaced sample.
                 sample_target = target
@@ -859,11 +860,10 @@ def process_videos(cfg, engine):
                             f" {DIM}(complexity spread){RESET}"
                         )
 
-                # Cohort sample→full ratio prior: the cross-file other half
-                # of the floor calibration. Per-file ratio (in calibration)
-                # still takes precedence inside effective_sample_floor; this
-                # only kicks in for files that haven't been encoded yet, so a
-                # fresh file aims at the learned floor instead of paying the
+                # Sample→full ratio for the floor search, the only one it
+                # uses: the file's own when its pair was sampled the same
+                # way as this search, else the cohort's, so a fresh file
+                # aims at the learned floor instead of paying the
                 # conservative-margin tax. Each sampling mode reads its own
                 # cohort: evenly-spaced files used to be denied a cohort
                 # entirely and stayed pinned to EVEN_SAMPLE_MARGIN's implied
@@ -1036,18 +1036,35 @@ def process_videos(cfg, engine):
 
             # The sample→full pair, at the search's answer: the sample
             # half the search recorded there (sample_pair), the full half
-            # this verify, at the same quantizer only. Each half is
+            # this verify, at the same quantizer only. The block holds
+            # one pair, stamped with its quantizer and with the sampling
+            # mode and plan from the search's own record (a resume never
+            # sampled, so this run's mode says nothing). Each half is
             # measured once per block; a later pass that verifies again
             # (a resume, an --overwrite rerun) already holds it, and after
             # refine moved the file its quantizer is not the pair's any
             # more, so a half that failed to measure the first time is
-            # never taken from another quantizer. The isinstance guards:
-            # these come straight from the JSON cache, and a corrupt
-            # value must be ignored like every other calibration read,
-            # not crash the file on the arithmetic.
+            # never taken from another quantizer. A pair drawn another
+            # way (a new search at another quantizer, or sampled evenly
+            # after a scene scan failed) adds nothing: its half would be
+            # read beside the other pair's as one file's measurement.
+            # The isinstance guards: these come straight from the JSON
+            # cache, and a corrupt value must be ignored like every other
+            # calibration read, not crash the file on the arithmetic.
             pair = cache["recommended"].get("sample_pair")
             if not (isinstance(pair, dict) and pair.get("q") == grid.fmt(best_q)):
                 pair = None
+            pair_mode = {}
+            if pair:
+                pair_mode = {
+                    "even": bool(pair.get("even")),
+                    "mini": bool(pair.get("mini")),
+                }
+                holds_pair = "ratio" in cal_now or "vmaf_offset" in cal_now
+                if holds_pair and not (
+                        cal_now.get(engine.cal_q_key) == best_q
+                        and pair_sampled_as(cal_now, **pair_mode)):
+                    pair, pair_mode = None, {}
             if pair:
                 sample_kbps = pair.get("kbps")
                 sample_vmaf = pair.get("vmaf")
@@ -1070,6 +1087,7 @@ def process_videos(cfg, engine):
                         new["vmaf_offset"] = offset
                 if "ratio" in new or "vmaf_offset" in new:
                     cal_now[engine.cal_q_key] = best_q
+                    cal_now.update(pair_mode)
             cal_now.update(new)
 
             if cal_now != (file_cal or {}):
@@ -1094,8 +1112,7 @@ def process_videos(cfg, engine):
                     vmaf_offset=new.get("vmaf_offset"),
                     ratio=new.get("ratio"),
                     decay=new.get("decay"),
-                    even=bool(pair and pair.get("even")),
-                    mini=bool(pair and pair.get("mini")),
+                    **pair_mode,
                 )
                 global_cal = load_global_calibration(cal_root)
 

@@ -108,13 +108,30 @@ def cohort_keys(quantity, even, mini=False):
     return (_EVEN_KEYS if even else _SCENE_KEYS)[quantity]
 
 
+def pair_sampled_as(per_file_cal, even, mini):
+    """True when the block's sample→full pair (its ratio and offset) was
+    measured under this sampling mode and plan.
+
+    The pair is the file's own reading of the population its cohort
+    keys name, so it answers only a search that samples the same way: a
+    scene pair read on a run that sampled evenly (a scene scan that
+    failed once) charges that run the selection bias its sample does not
+    carry. A block that never recorded its mode matches none."""
+    return (
+        isinstance(per_file_cal, dict)
+        and per_file_cal.get("even") is bool(even)
+        and per_file_cal.get("mini") is bool(mini)
+    )
+
+
 def calibration_offset(per_file_cal, global_cal, prior_center=0.0, even=False,
                        mini=False):
     """Pick the sample→full VMAF offset used to aim the sample search.
 
     Per-file calibration is a direct measurement of this exact file and is
-    trusted as-is. The cohort average is indirect evidence (other files'
-    offsets), so it's shrunk toward prior_center by n/(n+COHORT_SHRINK_K).
+    trusted as-is when its pair was sampled the same way (pair_sampled_as).
+    The cohort average is indirect evidence (other files' offsets), so
+    it's shrunk toward prior_center by n/(n+COHORT_SHRINK_K).
 
     prior_center is the structural expectation for the sampling mode:
     complexity-selected samples are the file's hardest scenes and read
@@ -125,15 +142,16 @@ def calibration_offset(per_file_cal, global_cal, prior_center=0.0, even=False,
     each; with no cohort at all the center itself is the best estimate
     and is returned directly.
 
-    `even` and `mini` pick which cohort to read (see cohort_keys): the
+    `even` and `mini` are how this search sampled. They pick which cohort
+    to read (see cohort_keys) and which per-file pair counts: the
     sampling modes and plans measure different populations and never
-    share an average.
+    share a value.
 
     Returns (offset, source_label); (None, None) when neither source has
     a usable value and the center is 0. Values outside ±OFFSET_MAX are
     treated as corrupt and skipped.
     """
-    if isinstance(per_file_cal, dict):
+    if pair_sampled_as(per_file_cal, even, mini):
         o = per_file_cal.get("vmaf_offset")
         if isinstance(o, (int, float)) and -OFFSET_MAX <= o <= OFFSET_MAX:
             return float(o), "per-file"
@@ -257,12 +275,14 @@ RATIO_MIN, RATIO_MAX = 0.5, 1.3
 
 
 def ratio_prior(per_file_cal, global_cal, margin, even=False, mini=False):
-    """Pick the sample→full bitrate ratio for the search's floor threshold.
+    """Pick the sample→full bitrate ratio for the search's floor threshold,
+    the one ratio effective_sample_floor divides the floor by.
 
-    Mirrors decay_prior and calibration_offset: a per-file measured ratio
-    is a direct measurement of this file and trusted as-is; the cohort
-    average is shrunk toward the margin-implied ratio (1/margin — what
-    effective_sample_floor would otherwise assume) by n/(n+COHORT_SHRINK_K).
+    Mirrors calibration_offset: a per-file measured ratio is a direct
+    measurement of this file and trusted as-is when its pair was sampled
+    the same way (pair_sampled_as); the cohort average is shrunk toward
+    the margin-implied ratio (1/margin — what effective_sample_floor
+    would otherwise assume) by n/(n+COHORT_SHRINK_K).
 
     This is the cross-file half of the sample→full bitrate calibration. The
     cohort already learns the ratio after every file
@@ -282,11 +302,12 @@ def ratio_prior(per_file_cal, global_cal, margin, even=False, mini=False):
     shrinking toward it would hold every even-sampled file's threshold
     ~5% above the truth no matter how much evidence accumulated. `mini`
     picks the mini-plan cohort of the same mode; the centers are the same.
+    Both also pick which per-file pair counts.
 
     Returns (ratio, source_label); (None, None) when neither source has a
     usable value (the search then falls back to the raw margin).
     """
-    if isinstance(per_file_cal, dict):
+    if pair_sampled_as(per_file_cal, even, mini):
         r = per_file_cal.get("ratio")
         if isinstance(r, (int, float)) and RATIO_MIN <= r <= RATIO_MAX:
             return float(r), "per-file"

@@ -15,7 +15,6 @@ import math
 import time
 
 from .bitrate import effective_sample_floor, measured_kbps
-from .calibrate import file_calibration
 from .constants import (
     DEFAULT_VMAF_SLOPE, ENDGAME_SNAP_GAIN, FLOOR_BOUND_KBPS_RATIO,
     FLOOR_BOUND_VMAF_MARGIN, INTRA_ONLY_CODECS, MIN_BITRATE_KBPS,
@@ -172,14 +171,13 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
     def eff_floor():
         # Sample path converts the video floor into a sample-bitrate threshold.
         # Full path already measures video-only kbps, so compare raw. The
-        # cohort ratio prior (ratio_prior) supplements the per-file ratio in
-        # calibration: per-file > cohort > margin (see effective_sample_floor).
-        # The per-file ratio counts only when measured under these settings.
+        # ratio is the caller's pick (calibrate.ratio_prior), never read from
+        # the cache here: only the caller knows how the sample was drawn,
+        # and the file's own ratio counts only for a sample drawn the same way.
         if not tag:
             return min_kbps
         return effective_sample_floor(
-            min_kbps, cfg["bitrate_margin"], file_calibration(cache, enc_tag),
-            ratio_prior=ratio_prior,
+            min_kbps, cfg["bitrate_margin"], ratio=ratio_prior,
         )
 
     # The full path accepts a probe within ENDGAME_SNAP_GAIN under the
