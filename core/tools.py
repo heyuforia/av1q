@@ -205,51 +205,68 @@ def _find_in_tools(stem):
     return None
 
 
-def _gpu_vendor():
-    """Pick the FFVship build for this machine's GPU.
+# PCI-SIG vendor IDs of the GPU makers FFVship ships a native build for,
+# in the order they win when a machine holds both (an AMD iGPU beside an
+# NVIDIA card runs CUDA on the card).
+_GPU_VENDOR_IDS = (("10DE", "nvidia"), ("1002", "amd"))
+_DISPLAY_CLASS_GUID = "{4d36e968-e325-11ce-bfc1-08002be10318}"
 
-    Returns 'nvidia', 'amd', or 'Vulkan' (the universal fallback build),
-    matching the Vship release asset names FFVship_<vendor>.zip.
 
-    Reads the display-adapter class key from the registry, which is
-    instant. Only falls back to a PowerShell CIM query if that yields
-    nothing, because PowerShell cold start makes that path take 10+
-    seconds.
+def _present_display_adapters():
+    """Device instance IDs (PCI\\VEN_10DE&DEV_...\\...) of the display
+    adapters present right now, asked of the PnP configuration manager
+    with its present-only filter. Raises OSError when the query fails.
+
+    The display class key in the registry cannot answer this: it keeps
+    the driver entries of an adapter taken out of the machine but never
+    uninstalled, so a swapped-out NVIDIA card would pick the CUDA build
+    on an AMD machine and the SSIMULACRA2 column would fail every file.
     """
-    out = ""
+    import ctypes
+    from ctypes import wintypes
+
+    CR_SUCCESS, CR_BUFFER_SMALL = 0x00, 0x1A
+    CM_GETIDLIST_FILTER_PRESENT, CM_GETIDLIST_FILTER_CLASS = 0x100, 0x200
+    flags = CM_GETIDLIST_FILTER_CLASS | CM_GETIDLIST_FILTER_PRESENT
+    cm = ctypes.WinDLL("cfgmgr32")
+    size_fn = cm.CM_Get_Device_ID_List_SizeW
+    size_fn.argtypes = [ctypes.POINTER(wintypes.ULONG), wintypes.LPCWSTR,
+                        wintypes.ULONG]
+    list_fn = cm.CM_Get_Device_ID_ListW
+    list_fn.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.ULONG,
+                        wintypes.ULONG]
+    size_fn.restype = list_fn.restype = wintypes.ULONG
+    # A second pass covers an adapter arriving between the two calls.
+    for _ in range(2):
+        n = wintypes.ULONG()
+        cr = size_fn(ctypes.byref(n), _DISPLAY_CLASS_GUID, flags)
+        if cr != CR_SUCCESS:
+            break
+        buf = ctypes.create_unicode_buffer(n.value)
+        cr = list_fn(_DISPLAY_CLASS_GUID, buf, n.value, flags)
+        if cr == CR_SUCCESS:
+            return [s for s in buf[:n.value].split("\0") if s]
+        if cr != CR_BUFFER_SMALL:
+            break
+    raise OSError(f"CM_Get_Device_ID_List failed (CONFIGRET {cr:#x})")
+
+
+def _gpu_vendor():
+    """Pick the FFVship build for this machine's GPU: 'nvidia', 'amd', or
+    'Vulkan' (the universal build), matching the Vship release asset
+    names FFVship_<vendor>.zip.
+
+    Decided on the PCI vendor ID of each present display adapter, never
+    on its name. Every other adapter, and a failed query, takes Vulkan,
+    which runs on any Vulkan-capable GPU.
+    """
     try:
-        import winreg
-        with winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SYSTEM\CurrentControlSet\Control\Class"
-            r"\{4d36e968-e325-11ce-bfc1-08002be10318}",
-        ) as base:
-            for i in range(64):
-                try:
-                    sub = winreg.EnumKey(base, i)
-                except OSError:
-                    break
-                try:
-                    with winreg.OpenKey(base, sub) as k:
-                        out += winreg.QueryValueEx(k, "DriverDesc")[0].lower() + "\n"
-                except OSError:
-                    pass
-    except Exception:
-        pass
-    if not out:
-        try:
-            out = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "(Get-CimInstance Win32_VideoController).Name"],
-                capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=20,
-            ).stdout.lower()
-        except Exception:
-            return "Vulkan"
-    if any(k in out for k in ("nvidia", "geforce", "quadro")):
-        return "nvidia"
-    if any(k in out for k in ("amd", "radeon")):
-        return "amd"
+        ids = [i.upper() for i in _present_display_adapters()]
+    except (AttributeError, OSError):  # no cfgmgr32, or the query failed
+        return "Vulkan"
+    for vid, vendor in _GPU_VENDOR_IDS:
+        if any(i.startswith(f"PCI\\VEN_{vid}&") for i in ids):
+            return vendor
     return "Vulkan"
 
 
