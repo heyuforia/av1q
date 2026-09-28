@@ -120,8 +120,9 @@ MIN_BITRATE_KBPS = {0: 0, 720: 1000, 1080: 1800, 1440: 2500, 2160: 4500, 4320: 8
 # search accept the whole band, so neither spends an extra full encode
 # shaving the last few percent off a video that's already there (e.g.
 # trimming 5330kbps toward 5000 when the floor is 5000), and their bitrate
-# jumps aim at the band's center. 1.1 keeps the overshoot under ~one CQ
-# grid step.
+# jumps aim at the band's center, as does the sample search when its
+# sample→full ratio carries no cushion. 1.1 keeps the overshoot under ~one
+# CQ grid step.
 BITRATE_BAND = 1.1
 
 # Sample→full bitrate margin for evenly-spaced sampling. The normal margin

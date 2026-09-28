@@ -88,7 +88,8 @@ def _hyperbolic_crossing(pts, lf):
 
 def search(source, meta, target, enc_func, cfg, engine,
            *, tag=None, measure_fn=None, probe_fn=None, s2_fn=None,
-           s2_ref_index=None, decay_prior=None, ratio_prior=None):
+           s2_ref_index=None, decay_prior=None, ratio_prior=None,
+           center_floor=False):
     """Find the optimal quantizer that hits the target VMAF.
 
     Adaptive Newton-style search: encode at successive grid points,
@@ -103,6 +104,11 @@ def search(source, meta, target, enc_func, cfg, engine,
       measure_fn(ref, dist, q) -> {'mean','p5'}        cached VMAF
       probe_fn(path)           -> probe_video() dict   (duration lookup)
       s2_fn(ref, dist, meta, ref_index) -> dict|None   SSIMU2 info column
+
+    center_floor aims the sample path's floor model at the bitrate
+    band's center, as the full path always does. The caller sets it when
+    ratio_prior is a best estimate with no cushion in it (see
+    estimate_max_q_for_floor).
 
     Returns (best, vmaf_result, enc_time, vmaf_time, state). state
     carries the fitted models for the caller's refine loop (the VMAF
@@ -273,21 +279,25 @@ def search(source, meta, target, enc_func, cfg, engine,
     def estimate_max_q_for_floor():
         """Highest quantizer the floor model lets the search encode at.
 
-        The sample path takes the grid point at or below the crossing of
-        the sample threshold itself: its probes are cheap predictions,
-        and refine backstops the full encode.
+        The CENTER aim: the grid point nearest the crossing of the center
+        of the bitrate band [floor, floor × BITRATE_BAND], never past the
+        floor crossing. A landing anywhere in the band is accepted, and a
+        miss under the waiver costs another full encode, so a prediction
+        with error on both sides aims at the middle. The floor crossing
+        bound is the edge aim itself, so this never encodes at a higher
+        quantizer than the edge aim would. The grid point at or below the
+        center crossing is not it: on an integer grid a step is wider
+        than the band, so that point lands above the band about half the
+        time and buys a climb when VMAF is over.
 
-        The full path's probes are full encodes, so they aim at the
-        CENTER of the bitrate band [floor, floor × BITRATE_BAND], as a
-        miss past the waiver costs another encode: the grid point nearest
-        the center crossing, never past the floor crossing. One rule in
-        both directions. The grid point at or below the center crossing
-        (refine's deficit step) is not it: on an integer grid a step is
-        wider than the band, so that point lands above the band about
-        half the time and buys a climb when VMAF is over, and in
-        simulation it spent more full encodes than the edge aim it
-        replaced. The floor crossing bound is the edge aim itself, so
-        this never encodes at a higher quantizer than that aim would.
+        The full path always takes it: its probes are full encodes. The
+        sample path takes it with center_floor, when its ratio is a best
+        estimate. Otherwise its threshold carries a cushion (the cold
+        margin, or a cohort still shrunk toward it) and it aims at the
+        threshold itself, the EDGE: centering on top of a cushion lands
+        the full encode high, and in simulation it spent up to 12% more
+        full encodes on the quarter grid, where aiming at the center of a
+        best estimate spent 2-4% fewer.
 
         The result is always clamped into the measured bracket: never
         below a quantizer known to clear the floor, never at/above one
@@ -300,7 +310,7 @@ def search(source, meta, target, enc_func, cfg, engine,
         below = [c for c in bitrate_points if bitrate_points[c] < floor]
 
         est = grid.floor(crossing(floor))
-        if not tag:
+        if not tag or center_floor:
             center = crossing(floor * math.sqrt(BITRATE_BAND))
             est = min(grid.quantize(center), est)
 

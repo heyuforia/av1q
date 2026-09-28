@@ -880,11 +880,20 @@ def process_videos(cfg, engine):
                         f"{label('calibr')}bitrate ratio {BOLD}{rat_prior:.2f}{RESET}"
                         f" {DIM}({rat_src}){RESET}"
                     )
+                # The floor aims at the band's center only on a ratio with
+                # no cushion in it: the file's own, or an even cohort,
+                # which shrinks toward the structural 1.0. The cold margin
+                # and a scene cohort (shrunk toward that margin) already
+                # hold one, so the search aims at their threshold itself.
+                center_floor = rat_prior is not None and (
+                    even_sampling or rat_src == "per-file"
+                )
 
                 best_q, sample_at_best, _, vt, search_state = core_search.search(
                     sample_src, meta, sample_target, do_enc_sample,
                     search_cfg, engine, tag="sample",
                     decay_prior=dec_prior, ratio_prior=rat_prior,
+                    center_floor=center_floor,
                     measure_fn=lambda ref, dist, q: measure(
                         ref, dist, q, tag="sample"),
                     probe_fn=probe_video,
@@ -1190,13 +1199,21 @@ def process_videos(cfg, engine):
                         # edge aim any under-prediction lands short and
                         # costs a whole extra encode (a real file jumped
                         # to the edge and landed 1796kbps against an 1800
-                        # floor). grid.ceil keeps the rounding bias on
-                        # the safe (above-floor) side — overshooting the
-                        # band top re-encodes nothing, undershooting the
-                        # floor does.
+                        # floor). The search's rule: the grid point
+                        # nearest the center crossing, never short of the
+                        # floor crossing. Rounding every step up past the
+                        # center instead lands above the band about half
+                        # the time on an integer grid, where a step is
+                        # wider than the band, and in simulation spent 10
+                        # to 30% more refine encodes there. The price:
+                        # this rule ends a few files in a hundred more
+                        # inside the ENDGAME_SNAP_GAIN sliver under the
+                        # floor, which the waiver below accepts, and past
+                        # it no more often. Ben's verdict.
                         step_b = max(
                             grid.step,
-                            grid.ceil(
+                            grid.ceil(math.log(min_kbps / cur_kbps) / decay_b),
+                            grid.quantize(
                                 math.log(
                                     min_kbps * math.sqrt(BITRATE_BAND)
                                     / cur_kbps
