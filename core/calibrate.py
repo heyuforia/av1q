@@ -194,6 +194,10 @@ def scene_offset_center(bias, reference_bias):
     a true offset of +0.04) and the -0.75 end is assumed to sit at the
     reference bias; the clamp is what makes that assumption safe, since
     the result can only ever shrink the correction, never exceed it.
+    That point was read off each scene's start window, not its clip as
+    the bias is read now, so it is not on the current scale, and other
+    readings on that old scale showed no link between bias and offset.
+    Only files sampled under the span reading can test the law.
     Returns SCENE_OFFSET_PRIOR unchanged when the bias is unmeasurable.
     """
     if bias is None or not reference_bias or reference_bias <= 1.0:

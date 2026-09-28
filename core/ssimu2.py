@@ -70,7 +70,12 @@ def _geometry(path):
 def _video_frame_count(path, duration=None):
     """Video packet count via demux only (packets stand in for frames,
     same as the keyframe/complexity scans). None when uncountable.
-    `duration` sizes the whole-file pass's budget (scan_budget)."""
+    `duration` sizes the whole-file pass's budget (scan_budget).
+
+    On field-coded interlaced H.264 each field is a packet, so the gate
+    refuses a pair that is really aligned ("N vs 2N frames"). Accepted:
+    the column is display only, and a true frame count would decode the
+    whole file."""
     key = _file_key(path)
     if key is None:
         return None

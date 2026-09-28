@@ -58,7 +58,16 @@ def manifest_expected(file_hash, enc_tag, q_key, segment_time, pix):
     segments were produced by a different encode and must be discarded.
     pix is part of the identity even though enc_signature never carried
     it: a bit-depth flip between interruption and resume would otherwise
-    stream-copy 8-bit and 10-bit segments into one corrupt file."""
+    stream-copy 8-bit and 10-bit segments into one corrupt file.
+
+    The identity holds what the settings choose, never the encoder build
+    or how the code spells the encode's params. So a dir left before an
+    encoder upgrade or a params change joins its segments to new ones: a
+    valid bitstream with one seam (params added later, such as the HDR10
+    metadata, then ride only the keyframes from the resume point on).
+    --overwrite keeps the dir too, on purpose: discarding it would cost
+    an interrupted --overwrite run its work on the natural rerun with
+    the same command line."""
     return {
         "source_hash": file_hash,
         "enc_tag": enc_tag,
@@ -333,6 +342,10 @@ def concat_segments(seg_dir, segments, out_path,
     joined video earlier than a single-pass encode places it (a constant
     A/V offset once audio is remuxed). -output_ts_offset adds exactly
     that first start back, restoring the original PTS in every case.
+
+    The joined file is a second full copy of the video beside its
+    segments for a short time, kept on purpose: disk space is not the
+    constraint, and the work dir is deleted once the output is final.
     """
     if not segments:
         raise RuntimeError("No segments to concatenate")
@@ -383,7 +396,10 @@ def mux_with_source_streams(video, source, dest_tmp, probe=None,
     picture starts, which on a file whose audio leads is later than the
     source's first timestamp; rebased to 0 alone, the picture would play
     that much early against the audio. -itsoffset by the video's own
-    start cancels its shift.
+    start cancels its shift. Discontinuity repair is per ffmpeg run: the
+    picture is repaired in its encode run and the audio here, so a
+    timestamp jump the two streams do not share equally can land them a
+    little apart.
 
     start_ms is that start for a video file that does not carry it (a
     pipe-fed encoder writes its picture from 0); None reads it from the

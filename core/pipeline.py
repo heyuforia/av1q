@@ -723,6 +723,10 @@ def process_videos(cfg, engine):
                         engine.prep_sample(sample_concat, meta, cfg)
                         if sample_concat else None
                     )
+                    # A failed cut or clean pass falls back to the
+                    # full-file search at any source length, on purpose,
+                    # even on a feature film where every probe is a full
+                    # encode.
                     if not sample_src:
                         print(f"{label('fallback')}Extraction failed, using full encode")
                     else:
@@ -1209,7 +1213,7 @@ def process_videos(cfg, engine):
                         # this rule ends a few files in a hundred more
                         # inside the ENDGAME_SNAP_GAIN sliver under the
                         # floor, which the waiver below accepts, and past
-                        # it no more often. Ben's verdict.
+                        # it no more often. The owner's verdict.
                         step_b = max(
                             grid.step,
                             grid.ceil(math.log(min_kbps / cur_kbps) / decay_b),
@@ -1408,6 +1412,12 @@ def process_videos(cfg, engine):
             # (any quantizer — refine may have left several) are spent.
             core_segments.cleanup_file_segments(root_cache, file_hash)
 
+            # A source whose picture runs under the floor pays a search
+            # and a full encode only for the floor-meeting result to be
+            # deleted here. It cannot be told up front: a clean source
+            # can stay under the floor even at the minimum quantizer and
+            # still come out smaller. The `larger` outcome keeps it to
+            # once per settings.
             out_sz = final.stat().st_size
             larger = out_sz >= in_sz
             if larger:

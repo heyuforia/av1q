@@ -314,8 +314,10 @@ def clip_span(t, dur, keyframes):
 
     Nothing before a file's first keyframe can be cut, so a stretch that
     starts before it runs its `dur` from that keyframe. Without a keyframe
-    list the span is the stretch itself, and the cut takes whatever
-    pre-roll its seek lands on.
+    list (the packet scan failed) the span is the stretch itself, and the
+    cut takes whatever pre-roll its seek lands on, which the amortization
+    gate in choose_samples cannot see. That run only: a failed scan is
+    never stored, so the next run scans again.
     """
     if not keyframes:
         return t, t + dur

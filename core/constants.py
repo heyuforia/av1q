@@ -104,7 +104,10 @@ TARGET_VMAF_BY_RES = {0: 93.0, 720: 94.0, 2160: 93.0}
 # 60-frame window and allows 50% over it, so a stretch may reach ~2.4×
 # the source's average. When the container states no bitrate,
 # FALLBACK_MAXRATE's per-tier value stands in for the source's rate and
-# is multiplied the same way. av1q-essential encodes uncapped.
+# is multiplied the same way. av1q-essential encodes uncapped. The
+# container's rate stays the base: a picture-only rate would need a
+# packet read of every source, and would change av1q's encodes at equal
+# CQ with nothing in the encode signature to notice.
 MAXRATE_FACTOR = 1.6
 
 FALLBACK_MAXRATE = {

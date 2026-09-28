@@ -30,9 +30,15 @@ SVT_MAX_BITRATE = 100_000_000
 
 
 def enc_signature(cfg, crop=None):
-    """Tag covering everything that changes encoder output for one source
+    """Tag covering the settings that change encoder output for one source
     at a given CQ: preset, film grain, and crop. Used in cache keys and
     sample-encode filenames so stale variants are never reused.
+
+    --no-10bit stays out on purpose. It changes the pixel format of 8-bit
+    SDR sources only, but the skip check runs before the probe and sees
+    only cfg, so carrying it here would search and encode every finished
+    10-bit source again for an identical file. A --no-10bit rerun may
+    therefore reuse a 10-bit encode.
     """
     return f"p{cfg['preset']}g{cfg['film_grain']}{crop_token(crop)}"
 
@@ -371,6 +377,10 @@ def _encode_segmented(source, meta, cq, cfg, pix, video_args, show_progress):
             # frame. 1ms of slack can't admit the previous frame (frame
             # durations are >= 8ms) and -copyts means the seek target
             # never shapes output timestamps, only the discard cutoff.
+            # -copyts also switches off ffmpeg's MPEG-TS discontinuity
+            # repair, so a capture with a timestamp jump before the
+            # resume point can re-enter on another timeline than its
+            # first run made.
             in_args = ["-ss", segments.ms_ts(max(0, resume_ms - 1)),
                        "-i", str(source)]
             ts_args = ["-copyts", "-start_at_zero"]

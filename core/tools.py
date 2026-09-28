@@ -335,7 +335,8 @@ def _staging_path(dest, name):
     """Where a download of `name` into dest is written before it is
     trusted: a name the lookup never matches, carrying this process's id
     so two first runs launched together never write or delete each
-    other's file."""
+    other's file. Ctrl-C cleans it up; a hard kill mid-download leaves it
+    behind, and no sweep removes it (accepted)."""
     return dest / f"partial-{os.getpid()}-{name}"
 
 
@@ -409,7 +410,9 @@ def find_ffvship_optional():
     """Locate FFVship under ./tools (any depth) or PATH; None if absent.
 
     On Windows, a miss triggers a one-time auto-download of the pinned
-    build matching the detected GPU into tools/FFVship/.
+    build matching the detected GPU into tools/FFVship/. A failed
+    download is not remembered, by choice, so every launch that finds no
+    FFVship tries again and can wait out the download's 120 s timeout.
     """
     global _ffvship_exe
     if _ffvship_exe is False:
