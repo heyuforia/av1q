@@ -187,6 +187,27 @@ def window_of(t):
     return int(t / COMPLEXITY_WINDOW) * COMPLEXITY_WINDOW
 
 
+def span_complexity(comp_map, start, stop):
+    """Complexity of the picture in [start, stop), as (mean, seconds):
+    each window it touches weighted by the seconds of the span inside
+    it. comp_map maps window_of starts to complexity. A window with no
+    entry (a gap in the stream) has no picture to count, so it adds no
+    seconds; (None, 0.0) when no window of the span has a value.
+
+    Read over the span, never at its start: a scene that starts late in
+    a window would otherwise be ranked by the picture before it."""
+    total = secs = 0.0
+    w = window_of(start)
+    while w < stop:
+        v = comp_map.get(w)
+        inside = min(stop, w + COMPLEXITY_WINDOW) - max(start, w)
+        if isinstance(v, (int, float)) and v > 0 and inside > 0:
+            total += v * inside
+            secs += inside
+        w += COMPLEXITY_WINDOW
+    return (total / secs if secs else None), secs
+
+
 def complexity_windows(packets):
     """Per-window complexity from a read_packets list, as
     [{time, complexity}] in window order.
@@ -196,8 +217,9 @@ def complexity_windows(packets):
     the picture was to code, and a window's mean averages that over
     every frame in it, so a keyframe landing in one window and not the
     next moves the number by a few percent instead of deciding it. The
-    scale is arbitrary — consumers rank windows and take ratios between
-    them (sampling.complexity_bias), never read the value on its own.
+    scale is arbitrary — consumers read it over a span (span_complexity)
+    to rank scenes and take ratios (sampling.complexity_bias), never read
+    the value on its own.
     """
     windows = {}
     for t, size, _ in packets:

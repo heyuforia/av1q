@@ -29,14 +29,17 @@ VMAF_TOLERANCE = 0.1
 # evenly-spaced samples use EVEN_SAMPLE_MARGIN instead (below).
 BITRATE_MARGIN = 1.20
 
-# Sample clip length. 6s spans several GOPs at any common keyint, enough
-# for one probe's VMAF to average over real coding decisions; variety
-# comes from sampling more scenes (SAMPLE_SCALE_*), never longer ones.
+# Sample clip length: the stretch of each scene a clip is meant to hold.
+# 6s spans several GOPs at any common keyint, enough for one probe's VMAF
+# to average over real coding decisions; variety comes from sampling more
+# scenes (SAMPLE_SCALE_*), never longer ones. A clip that must start on
+# the keyframe before its scene runs longer by that lead-in.
 SAMPLE_DURATION = 6.0
 
-# Scenes shorter than this are never sampled: a clip is cut to
-# min(scene, SAMPLE_DURATION), and under 2s it is too few frames for a
-# VMAF mean to say anything about the scene.
+# Scenes shorter than this are never sampled: a clip holds min(scene,
+# SAMPLE_DURATION), and under 2s it is too few frames for a VMAF mean to
+# say anything about the scene. For the same reason a clip starts on a
+# keyframe inside its scene only when this much of the stretch is left.
 MIN_SCENE_DURATION = 2.0
 
 # Sources under this are too short to sample by scenes: the sampling
@@ -53,9 +56,9 @@ SCENE_THRESHOLD = 3
 # Packet-stat complexity is measured per window of this many seconds:
 # fine enough to tell one scene from the next, coarse enough that a
 # window's mean packet size averages over a whole GOP's worth of frames
-# instead of reading one keyframe. The scene list and the sample picks
-# map onto these windows (analyze.window_of), so every consumer must
-# bucket time the same way.
+# instead of reading one keyframe. Scenes and sample clips are read over
+# the windows they span, each weighted by its seconds inside the span
+# (analyze.span_complexity), so every consumer buckets time the same way.
 COMPLEXITY_WINDOW = 5.0
 
 # Wall-clock budget for one whole-file pass (the scdet decode, a packet

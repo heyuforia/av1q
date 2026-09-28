@@ -7,10 +7,10 @@ import math
 import os
 import time
 
-from .analyze import window_of
+from .analyze import span_complexity, window_of
 from .constants import (
-    MINI_SAMPLE_COUNT, MINI_SAMPLE_DURATION, MINI_SAMPLE_MIN_RATIO,
-    SAMPLE_COUNT_MAX, SAMPLE_SCALE_K, SAMPLE_SCALE_REF,
+    MIN_SCENE_DURATION, MINI_SAMPLE_COUNT, MINI_SAMPLE_DURATION,
+    MINI_SAMPLE_MIN_RATIO, SAMPLE_COUNT_MAX, SAMPLE_SCALE_K, SAMPLE_SCALE_REF,
 )
 from .probe import high_bit_depth
 from .tools import ffmpeg_exe
@@ -82,19 +82,22 @@ def select_samples(scenes, complexity, duration, count, keyframes, cfg):
         ]
 
     comp_map = {window_of(c["time"]): c["complexity"] for c in complexity}
-    # A scene whose window has no entry (a gap in the stream) ranks at
-    # the whole-file mean: it neither beats a measurably hotter scene nor
-    # loses to a cooler one. Without packet data every scene ties.
+    # Each scene is ranked by the picture its sample is meant to hold, its
+    # first min(scene, sample_dur) seconds. A span with no window entry (a
+    # gap in the stream) ranks at the whole-file mean: it neither beats a
+    # measurably hotter scene nor loses to a cooler one. Without packet
+    # data every scene ties.
     neutral = sum(comp_map.values()) / len(comp_map) if comp_map else 0.0
-    scored = [
-        {
-            "time": sc["time"],
-            "duration": sc["duration"],
-            "complexity": comp_map.get(window_of(sc["time"]), neutral),
-        }
-        for sc in scenes
-        if sc["duration"] >= cfg["min_scene_duration"]
-    ]
+    scored = []
+    for sc in scenes:
+        if sc["duration"] < cfg["min_scene_duration"]:
+            continue
+        dur = min(sc["duration"], sample_dur)
+        value, _ = span_complexity(comp_map, sc["time"], sc["time"] + dur)
+        scored.append({
+            "time": sc["time"], "duration": dur,
+            "complexity": neutral if value is None else value,
+        })
 
     if not scored:
         return select_samples([], complexity, duration, count, keyframes, cfg)
@@ -110,22 +113,19 @@ def select_samples(scenes, complexity, duration, count, keyframes, cfg):
         )
         if cands:
             best = max(cands, key=lambda x: x["complexity"])
-            selected.append({
-                "time": best["time"],
-                "duration": min(best["duration"], sample_dur),
-            })
+            selected.append({"time": best["time"], "duration": best["duration"]})
             used.add(best["time"])
 
     return selected or None
 
 
-def complexity_bias(complexity, sample_scenes):
-    """How much hotter the selected scenes are than the whole file.
+def complexity_bias(complexity, clips):
+    """How much hotter the sample is than the whole file.
 
     The a-priori measure of complexity-selection bias — available before
     any encode, from the packet-stat complexity (complexity_windows) that
-    already ranked the scenes: the ratio of the selected scenes' mean
-    complexity to the whole-file mean. 1.0 means the sample turned out
+    already ranked the scenes: the ratio of the sample's mean complexity
+    to the whole-file mean. 1.0 means the sample turned out
     representative after all (the file's hottest scenes are barely above
     its average); above 1.0 means the sample really is the hard part.
 
@@ -135,31 +135,30 @@ def complexity_bias(complexity, sample_scenes):
     single cause. Returns None when the complexity data is missing or
     degenerate, and callers fall back to their fixed cold-start guess.
 
-    complexity is complexity_windows' per-window list; sample_scenes is
-    select_samples' output (only `time`/`duration`), so the selected scenes
-    are mapped back to their windows the same way select_samples does.
+    complexity is complexity_windows' per-window list; clips is
+    plan_clips' output, the picture actually cut, lead-ins included, so
+    the reading is of what the probes encode. Each second of it counts
+    once, as each second of the concat weighs once in a probe's bitrate.
     """
-    if not complexity or not sample_scenes:
+    if not complexity or not clips:
         return None
     comp_map = {window_of(c["time"]): c["complexity"] for c in complexity}
     all_vals = [
         c["complexity"] for c in complexity
         if isinstance(c.get("complexity"), (int, float)) and c["complexity"] > 0
     ]
-    sel_vals = []
-    for s in sample_scenes:
-        v = comp_map.get(window_of(s["time"]))
-        if isinstance(v, (int, float)) and v > 0:
-            sel_vals.append(v)
-    if not all_vals or not sel_vals:
+    total = secs = 0.0
+    for start, stop in clips:
+        value, inside = span_complexity(comp_map, start, stop)
+        if value is not None:
+            total += value * inside
+            secs += inside
+    if not all_vals or not secs:
         return None
-    mean_all = sum(all_vals) / len(all_vals)
-    if mean_all <= 0:
-        return None
-    return (sum(sel_vals) / len(sel_vals)) / mean_all
+    return (total / secs) / (sum(all_vals) / len(all_vals))
 
 
-def complexity_bias_margin(complexity, sample_scenes, base_margin, floor_margin):
+def complexity_bias_margin(complexity, clips, base_margin, floor_margin):
     """Estimate the sample→full bitrate margin from this file's complexity spread.
 
     The floor search needs to know how much hotter the sampled scenes
@@ -175,7 +174,7 @@ def complexity_bias_margin(complexity, sample_scenes, base_margin, floor_margin)
     might — and the two-sided refine loop backstops whatever it misses.
     Returns base_margin when the complexity data is missing or degenerate.
     """
-    bias = complexity_bias(complexity, sample_scenes)
+    bias = complexity_bias(complexity, clips)
     if bias is None:
         return base_margin
     return clamp(bias, floor_margin, base_margin)
@@ -188,17 +187,79 @@ def _clock(t):
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
+# A keyframe this close after a scene's start is the scene's first frame.
+# The scene scan and the packet list state one frame's time from two
+# pipelines: older ffmpeg builds print the scan's at six significant
+# digits (whole hundredths past 1000s), and a container start offset is
+# taken off in stream ticks by ffmpeg and in floats by read_packets. The
+# value covers both, and stays under one frame at any rate up to 100fps,
+# so it never takes a neighbouring frame for the cut.
+SAME_FRAME_SLACK = 0.01
+
+
+def clip_span(t, dur, keyframes):
+    """The picture a sample clip holds, as (start, stop): the `dur`
+    seconds from t that select_samples ranked, reached from a keyframe,
+    because a stream-copied clip can only begin on one.
+
+    The clip always ends where the ranked stretch ends. It starts on the
+    keyframe at the scene's own first frame when there is one
+    (SAME_FRAME_SLACK), else on the keyframe before t, with a lead-in of
+    the scene before it, or on the first keyframe after t when that one
+    is strictly nearer and still leaves MIN_SCENE_DURATION of the stretch
+    (all of it when the stretch is shorter). A clip timed from its
+    keyframe instead can hold none of its scene: a 2.2s scene 2.2s past
+    a keyframe, with the next one 5.2s on, is cut wholly from the scene
+    before it.
+
+    Nothing before a file's first keyframe can be cut, so a stretch that
+    starts before it runs its `dur` from that keyframe. Without a keyframe
+    list the span is the stretch itself, and the cut takes whatever
+    pre-roll its seek lands on.
+    """
+    if not keyframes:
+        return t, t + dur
+    stop = t + dur
+    i = bisect.bisect_right(keyframes, t)
+    if i == 0:
+        return keyframes[0], keyframes[0] + dur
+    before = keyframes[i - 1]
+    if i < len(keyframes):
+        after = keyframes[i]
+        if after - t <= SAME_FRAME_SLACK or (
+                after - t < t - before
+                and stop - after >= min(dur, MIN_SCENE_DURATION)):
+            return after, stop
+    return before, stop
+
+
+def plan_clips(scenes, keyframes):
+    """Every selected scene's clip_span, in time order, with clips that
+    overlap merged into one: a stretch cut twice would weigh double in
+    every probe. The one plan both the cut (extract_samples) and the
+    bias reading (complexity_bias) are made from."""
+    merged = []
+    for start, stop in sorted(
+        clip_span(sc["time"], sc["duration"], keyframes) for sc in scenes
+    ):
+        if merged and start < merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], stop))
+        else:
+            merged.append((start, stop))
+    return merged
+
+
 # How far ahead of the gate the input seek aims (seconds). Landing early
 # only demuxes a little more that the gate then drops; the value merely
 # has to keep the output -ss clearly positive.
 PRE_SEEK = 1.0
 
 
-def cut_window(t, dur, keyframes):
-    """Where ffmpeg seeks, gates and stops to stream-copy `dur` seconds of
-    picture from the keyframe nearest t: (seek, gate, length, start).
-    seek is the input -ss, gate the output -ss relative to it (None for
-    none), length the -t, and start where the clip really begins.
+def cut_window(start, stop, keyframes):
+    """Where ffmpeg seeks, gates and stops to stream-copy the picture in
+    [start, stop), start being a keyframe (clip_span): (seek, gate,
+    length). seek is the input -ss, gate the output -ss relative to it
+    (None for none), and length the -t.
 
     A stream-copied clip can only begin on a keyframe, and one input -ss
     cannot be trusted to land on the keyframe chosen: each demuxer
@@ -222,21 +283,20 @@ def cut_window(t, dur, keyframes):
     if not keyframes:
         # No keyframe list (the packet scan failed): seek at the scene
         # time and accept whatever pre-roll the landing brings.
-        return math.ceil(t * 1000 + 1e-3) / 1000, None, dur, t
-    kf = min(keyframes, key=lambda k: abs(k - t))
-    j = bisect.bisect_left(keyframes, kf)
+        return math.ceil(start * 1000 + 1e-3) / 1000, None, stop - start
+    j = bisect.bisect_left(keyframes, start)
     if j == 0:
         # The first keyframe is the first packet: reading from the start
         # lands on it in every container, and nothing precedes it.
-        return 0.0, None, kf + dur, kf
-    mid = (keyframes[j - 1] + kf) / 2
+        return 0.0, None, stop
+    mid = (keyframes[j - 1] + start) / 2
     seek = max(0.0, math.floor((mid - PRE_SEEK) * 1000) / 1000)
     gate = math.floor((mid - seek) * 1000) / 1000
-    return seek, gate, kf + dur - (seek + gate), kf
+    return seek, gate, stop - (seek + gate)
 
 
 def extract_samples(source, scenes, keyframes, cfg, file_hash=None):
-    """Cut each selected scene from its keyframe by stream copy and join
+    """Cut each selected scene's clip (plan_clips) by stream copy and join
     the clips into one video-only concat under _cache/_samples/. Returns
     the concat, or None when no clip could be cut.
 
@@ -260,18 +320,10 @@ def extract_samples(source, scenes, keyframes, cfg, file_hash=None):
     ).encode("utf-8")).hexdigest()[:10]
     concat_out = sample_dir / f"samples_{tag}_{scene_sig}.mkv"
 
-    # Each scene is cut from its nearest keyframe (cut_window). Two
-    # scenes that snap to the same keyframe would cut the same clip
-    # twice and weight that stretch double in every probe, so the
-    # second is dropped.
-    cuts = []
-    for sc in scenes:
-        win = cut_window(sc["time"], sc["duration"], keyframes)
-        if all(win[3] != c[3] for c in cuts):
-            cuts.append(win)
+    spans = plan_clips(scenes, keyframes)
     where = (
-        f"{len(cuts)} clip{'s' if len(cuts) != 1 else ''} at"
-        f" {' '.join(_clock(c[3]) for c in cuts)}"
+        f"{len(spans)} clip{'s' if len(spans) != 1 else ''} at"
+        f" {' '.join(_clock(start) for start, _ in spans)}"
     )
 
     if concat_out.exists() and concat_out.stat().st_size > 0:
@@ -283,7 +335,8 @@ def extract_samples(source, scenes, keyframes, cfg, file_hash=None):
 
     ts = int(time.time() * 1000)
     attempted, clips = [], []
-    for i, (seek, gate, length, _) in enumerate(cuts):
+    for i, (start, stop) in enumerate(spans):
+        seek, gate, length = cut_window(start, stop, keyframes)
         clip = sample_dir / f"sample_{ts}_{i}.mkv"
         attempted.append(clip)
         _temp_files.add(clip)
@@ -321,7 +374,7 @@ def extract_samples(source, scenes, keyframes, cfg, file_hash=None):
         "\n".join(f"file '{c.name}'" for c in clips), encoding="utf-8"
     )
 
-    complete = len(clips) == len(cuts)
+    complete = len(clips) == len(spans)
     out = concat_out if complete else sample_dir / (
         f"samples_{tag}_{scene_sig}_part{ts}.mkv"
     )
@@ -356,7 +409,7 @@ def extract_samples(source, scenes, keyframes, cfg, file_hash=None):
     if not complete:
         _temp_files.add(out)
         print(
-            f"{'':>11}{DIM}{len(clips)} of {len(cuts)} clips cut; this"
+            f"{'':>11}{DIM}{len(clips)} of {len(spans)} clips cut; this"
             f" set is not kept, the next run cuts it again{RESET}"
         )
     return out

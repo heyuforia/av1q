@@ -50,8 +50,8 @@ from .crop import (
 )
 from .probe import parse_rate, probe_video, res_tier
 from .sampling import (
-    complexity_bias, complexity_bias_margin, extract_samples, sampling_plan,
-    select_samples,
+    complexity_bias, complexity_bias_margin, extract_samples, plan_clips,
+    sampling_plan, select_samples,
 )
 from .tools import have_ffmpeg, local_ffmpeg_dir, missing_ffmpeg_components
 from .ui import (
@@ -680,7 +680,7 @@ def process_videos(cfg, engine):
                     f" from previous search{seed_note}"
                 )
 
-            sample_scenes = sample_src = sample_at_best = None
+            sample_scenes = sample_clips = sample_src = sample_at_best = None
             even_sampling = False
             complexity = []  # per-window complexity; used for the margin estimate
             plan = sampling_plan(meta["duration"], cfg)
@@ -748,6 +748,9 @@ def process_videos(cfg, engine):
                         if not even_sampling else "evenly-spaced samples"
                     )
                     print(f"{label('scenes')}{BOLD}{len(sample_scenes)}{RESET} {info}")
+                    # The picture the probes will encode, from the same
+                    # plan extract_samples cuts: the bias below reads it.
+                    sample_clips = plan_clips(sample_scenes, keyframes)
                     print(f"{label('extract')}Extracting samples...")
                     sample_concat = extract_samples(
                         filepath, sample_scenes, keyframes, cfg,
@@ -839,7 +842,7 @@ def process_videos(cfg, engine):
                 # is built from (complexity_bias_margin), so the two halves
                 # of the sample→full prediction can't disagree about how
                 # biased the sample is.
-                bias = complexity_bias(complexity, sample_scenes)
+                bias = complexity_bias(complexity, sample_clips)
                 # Apply learned VMAF offset (sample over/under-predicts
                 # full VMAF) so the sample search aims at the quantizer
                 # that will hit `target` on the full video. Per-file
@@ -884,9 +887,9 @@ def process_videos(cfg, engine):
                 search_margin = cfg["bitrate_margin"]
                 if even_sampling:
                     search_margin = min(search_margin, EVEN_SAMPLE_MARGIN)
-                elif sample_scenes:
+                elif sample_clips:
                     search_margin = complexity_bias_margin(
-                        complexity, sample_scenes, search_margin,
+                        complexity, sample_clips, search_margin,
                         COMPLEXITY_MARGIN_FLOOR,
                     )
                 search_cfg = cfg
