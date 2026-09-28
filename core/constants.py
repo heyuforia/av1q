@@ -16,9 +16,10 @@ INTRA_ONLY_CODECS = {"prores", "dnxhd", "mjpeg", "rawvideo", "ffv1", "jpeg2000",
 OUTPUT_CONTAINER = ".mkv"
 
 # VMAF noise epsilon: two scores closer than this are the same score. It
-# is the acceptance band's lower edge (target - tol), the refine loop's
-# hysteresis above the band top, and the pass/fail color's threshold —
-# nothing anywhere acts on a difference smaller than this.
+# is the acceptance band's lower edge (target - tol), the hysteresis above
+# the band top wherever a full encode is judged (the refine loop and the
+# full-file search), and the pass/fail color's threshold — nothing
+# anywhere acts on a difference smaller than this.
 VMAF_TOLERANCE = 0.1
 
 # Cold-start sample→full bitrate margin for complexity-selected samples:
@@ -115,11 +116,12 @@ FALLBACK_MAXRATE = {
 MIN_BITRATE_KBPS = {0: 0, 720: 1000, 1080: 1800, 1440: 2500, 2160: 4500, 4320: 8000}
 
 # Bitrate acceptance band: a video anywhere in [floor, floor × BITRATE_BAND]
-# has hit the floor closely enough. The refine loop accepts the whole band,
-# so it never spends an extra full encode shaving the last few percent off
-# a video that's already there (e.g. trimming 5330kbps toward 5000 when the
-# floor is 5000), and its bitrate jumps aim at the band's center. 1.1 keeps
-# the overshoot under ~one CQ grid step.
+# has hit the floor closely enough. The refine loop and the full-file
+# search accept the whole band, so neither spends an extra full encode
+# shaving the last few percent off a video that's already there (e.g.
+# trimming 5330kbps toward 5000 when the floor is 5000), and their bitrate
+# jumps aim at the band's center. 1.1 keeps the overshoot under ~one CQ
+# grid step.
 BITRATE_BAND = 1.1
 
 # Sample→full bitrate margin for evenly-spaced sampling. The normal margin
