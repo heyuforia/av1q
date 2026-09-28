@@ -126,7 +126,7 @@ def search_crf(source, meta, target, cache, cache_path, enc_func, cfg, tag=None)
     probe_video / ssimu2_info keeps working.
     """
     return core_search.search(
-        source, meta, target, cache, cache_path, enc_func, cfg, _ENGINE,
+        source, meta, target, enc_func, cfg, _ENGINE,
         tag=tag,
         measure_fn=lambda ref, dist, q: vmaf_cached_e(
             ref, dist, meta, q, cache, cache_path, cfg, tag=tag),

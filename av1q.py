@@ -91,7 +91,7 @@ def search_cq(source, meta, target, cache, cache_path,
     av1q.probe_video / av1q.measure_ssimu2_display keeps working.
     """
     return core_search.search(
-        source, meta, target, cache, cache_path, enc_func, cfg, _ENGINE,
+        source, meta, target, enc_func, cfg, _ENGINE,
         tag=tag,
         measure_fn=lambda ref, dist, q: vmaf_cached(
             ref, dist, meta, q, cache, cache_path, threads, tag=tag),

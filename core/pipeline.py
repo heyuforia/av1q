@@ -882,8 +882,8 @@ def process_videos(cfg, engine):
                     )
 
                 best_q, sample_at_best, _, vt, search_state = core_search.search(
-                    sample_src, meta, sample_target, cache, cp,
-                    do_enc_sample, search_cfg, engine, tag="sample",
+                    sample_src, meta, sample_target, do_enc_sample,
+                    search_cfg, engine, tag="sample",
                     decay_prior=dec_prior, ratio_prior=rat_prior,
                     measure_fn=lambda ref, dist, q: measure(
                         ref, dist, q, tag="sample"),
@@ -900,8 +900,8 @@ def process_videos(cfg, engine):
                         pass
             else:
                 best_q, best_vmaf, _, vt, search_state = core_search.search(
-                    filepath, meta, target, cache, cp,
-                    full_encode, cfg, engine, decay_prior=dec_prior,
+                    filepath, meta, target, full_encode, cfg, engine,
+                    decay_prior=dec_prior,
                     measure_fn=lambda ref, dist, q: measure(ref, dist, q),
                     probe_fn=probe_video,
                     s2_fn=lambda ref, dist, m, ri: engine.ssimu2_info(

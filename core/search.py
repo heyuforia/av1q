@@ -22,7 +22,7 @@ from .constants import (
 )
 from .probe import res_tier
 from .ui import BOLD, DIM, RESET, fmt_s2, fmt_size, label
-from .util import atomic_write_json, clamp, partial_hash
+from .util import clamp, partial_hash
 
 
 def search_ref_index(engine, cfg, source, tag):
@@ -86,7 +86,7 @@ def _hyperbolic_crossing(pts, lf):
     return c + b / (lf - a)
 
 
-def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
+def search(source, meta, target, enc_func, cfg, engine,
            *, tag=None, measure_fn=None, probe_fn=None, s2_fn=None,
            s2_ref_index=None, decay_prior=None, ratio_prior=None):
     """Find the optimal quantizer that hits the target VMAF.
@@ -157,7 +157,6 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
 
     floor_cap = max_q
     bitrate_points = {}
-    enc_tag = engine.signature(cfg, meta.get("crop"))
 
     # Fallback d(log kbps)/dQ before two probes have measured the local
     # slope: the engine cohort's learned decay when the caller supplies
@@ -365,11 +364,6 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
 
         if kbps:
             bitrate_points[q] = kbps
-            if tag:
-                cache["entries"].setdefault(grid.fmt(q), {})[
-                    f"{tag}_kbps_{enc_tag}"
-                ] = kbps
-                atomic_write_json(cache_path, cache)
 
             # Anything above q would read lower still, so q caps the
             # search even when the full path's waiver accepts q itself.
