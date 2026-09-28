@@ -449,6 +449,9 @@ class SvtAv1FfmpegEngine(Engine):
     def cache_root(self, cfg):
         return cfg["cache_dir"]
 
+    def calibration_root(self, cfg):
+        return cfg["learned_dir"] / "av1q"
+
     def q_bounds(self, cfg):
         return cfg["min_cq"], cfg["max_cq"]
 

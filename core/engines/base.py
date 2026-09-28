@@ -102,6 +102,13 @@ class Engine:
         """Per-pipeline cache directory (never shared between engines)."""
         raise NotImplementedError
 
+    def calibration_root(self, cfg):
+        """Per-pipeline home of the cross-file calibration (never shared
+        between engines). Outside the cache on purpose: the cache holds
+        facts about files already done and is deleted freely, while this
+        holds what they taught about the library and the encoder."""
+        raise NotImplementedError
+
     def q_bounds(self, cfg):
         """(min, max) quantizer bounds from cfg, in grid-native type."""
         raise NotImplementedError

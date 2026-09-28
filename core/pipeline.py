@@ -7,14 +7,17 @@ persistence → the consolidated refine loop → final selection and
 cleanup. Everything engine-specific goes through the Engine interface,
 including the printed output's quantizer labels and grid formatting.
 
-Two cache scopes, deliberately distinct:
+Two cache scopes, deliberately distinct, and the calibration beside them:
   cfg["cache_dir"]        shared between pipelines — scene analysis,
                           sample extraction, crop sidecars and temp
                           logs (source facts; the formats are
                           identical).
-  engine.cache_root(cfg)  per-pipeline — result caches, calibration,
-                          sample encodes, FFMS2 indexes. Different
-                          encoders must never share these.
+  engine.cache_root(cfg)  per-pipeline — result caches, per-file
+                          calibration, sample encodes, FFMS2 indexes.
+                          Different encoders must never share these.
+  engine.calibration_root(cfg)
+                          per-pipeline cross-file cohort, outside the
+                          cache so deleting the cache keeps it.
 """
 
 import math
@@ -112,6 +115,7 @@ def process_videos(cfg, engine):
         return 1
 
     root_cache = engine.cache_root(cfg)
+    cal_root = engine.calibration_root(cfg)
     min_q, max_q = engine.q_bounds(cfg)
     # How this encoder's quantizer maps to bitrate before anything is
     # measured. Per engine, never a shared constant (Engine.default_decay).
@@ -254,7 +258,7 @@ def process_videos(cfg, engine):
         "saved": 0, "orig": 0, "deleted": 0, "failed": 0,
     }
     t_start = time.time()
-    global_cal = load_global_calibration(root_cache)
+    global_cal = load_global_calibration(cal_root)
 
     # Whether (and how) a file gets sampled is sampling_plan's call:
     # the configured plan for long sources, a scaled-down mini plan for
@@ -1107,14 +1111,14 @@ def process_videos(cfg, engine):
             # shares one average.
             if new:
                 update_global_calibration(
-                    root_cache,
+                    cal_root,
                     vmaf_offset=new.get("vmaf_offset"),
                     ratio=new.get("ratio"),
                     decay=new.get("decay"),
                     even=bool(pair and pair.get("even")),
                     mini=bool(pair and pair.get("mini")),
                 )
-                global_cal = load_global_calibration(root_cache)
+                global_cal = load_global_calibration(cal_root)
 
             # Consolidated refine for quality/bitrate misses in BOTH
             # directions. Deficits (VMAF below target, bitrate below the
@@ -1229,15 +1233,25 @@ def process_videos(cfg, engine):
                         min_kbps and cur_kbps
                         and cur_kbps <= min_kbps * BITRATE_BAND
                     )
-                    # Bitrate headroom over the floor caps how far the
-                    # quantizer can rise (log-linear model, same as the
-                    # search). A file that's over target because the floor
-                    # pinned its quantizer gets ceiling == best_q and is
-                    # accepted as-is.
+                    # Bitrate headroom caps how far the quantizer can rise
+                    # (log-linear model, same as the search). It aims at
+                    # the CENTER of the bitrate band, like the deficit
+                    # jump: aimed at the floor edge, any over-read of the
+                    # decay lands under the floor (a real file came out at
+                    # 1760kbps against an 1800 floor), and a landing past
+                    # the waiver buys a third encode. Rounded to the
+                    # nearest step, but never past the floor edge itself.
+                    # A file that's over target because the floor pinned
+                    # its quantizer gets ceiling == best_q and is accepted
+                    # as-is.
                     ceiling = max_q
                     if min_kbps and cur_kbps:
-                        headroom = grid.floor(
-                            math.log(cur_kbps / min_kbps) / decay_b
+                        headroom = min(
+                            grid.quantize(math.log(
+                                cur_kbps
+                                / (min_kbps * math.sqrt(BITRATE_BAND))
+                            ) / decay_b),
+                            grid.floor(math.log(cur_kbps / min_kbps) / decay_b),
                         )
                         ceiling = min(
                             ceiling, grid.quantize(best_q + max(0, headroom))

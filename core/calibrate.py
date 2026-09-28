@@ -10,10 +10,11 @@ from .constants import (
 from .util import atomic_write_json, clamp
 
 
-def load_global_calibration(cache_dir):
-    """Load cross-file rolling averages used as defaults for new files.
-    A missing, unreadable or malformed file is an empty cohort."""
-    path = cache_dir / "_global_calibration.json"
+def load_global_calibration(root):
+    """Load cross-file rolling averages used as defaults for new files,
+    from an engine's calibration root (Engine.calibration_root). A
+    missing, unreadable or malformed file is an empty cohort."""
+    path = root / "_global_calibration.json"
     if not path.exists():
         return {}
     try:
@@ -309,12 +310,12 @@ def ratio_prior(per_file_cal, global_cal, margin, even=False, mini=False):
     return None, None
 
 
-def update_global_calibration(cache_dir, vmaf_offset=None, ratio=None,
+def update_global_calibration(root, vmaf_offset=None, ratio=None,
                               decay=None, even=False, mini=False):
-    """Roll new measurements into the cohort calibration cache.
+    """Roll new measurements into the engine's cohort calibration file.
 
     Per-file calibration only helps on re-runs of the same file. The
-    cohort cache gives new files an informed starting point so first-
+    cohort gives new files an informed starting point so first-
     encounter sample-vs-full mispredict is corrected up front, avoiding
     a wasted second full encode. n is capped at N_CAP.
 
@@ -324,7 +325,7 @@ def update_global_calibration(cache_dir, vmaf_offset=None, ratio=None,
     bitrate, which is the same physics however the file was sampled, so
     both modes feed and read one shared average.
     """
-    g = load_global_calibration(cache_dir)
+    g = load_global_calibration(root)
 
     def roll(key, n_key, val):
         if val is None:
@@ -345,6 +346,6 @@ def update_global_calibration(cache_dir, vmaf_offset=None, ratio=None,
     roll("decay", "n_decay", decay)
     g["t"] = time.time()
 
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    path = cache_dir / "_global_calibration.json"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / "_global_calibration.json"
     atomic_write_json(path, g)

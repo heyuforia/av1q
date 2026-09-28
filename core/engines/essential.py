@@ -487,6 +487,9 @@ class EssentialEngine(Engine):
     def cache_root(self, cfg):
         return cfg["e_cache_dir"]
 
+    def calibration_root(self, cfg):
+        return cfg["learned_dir"] / "essential"
+
     def q_bounds(self, cfg):
         return cfg["min_crf"], cfg["max_crf"]
 

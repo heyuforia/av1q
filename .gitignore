@@ -12,6 +12,7 @@ pytest.ini
 
 # Runtime work folders and artifacts
 _cache/
+_learned/
 Video Input/
 AV1 Output/
 *.tmp.mkv

@@ -245,7 +245,8 @@ def main():
              "not mistaken for options. Flags av1q sets itself (--tune, "
              "--film-grain, --color-*, etc.) are ignored here — use the "
              "matching av1q option instead. Changing this re-runs the search; "
-             "clear _cache/_essential if you want a clean slate.",
+             "clear _cache/_essential and _learned/essential if you want a "
+             "clean slate.",
     )
 
     args = parser.parse_args()
@@ -325,6 +326,7 @@ def main():
         # the two pipelines never clobber each other's per-file caches.
         "cache_dir": cache_dir,
         "e_cache_dir": cache_dir / "_essential",
+        "learned_dir": SCRIPT_DIR / "_learned",
         "container": OUTPUT_CONTAINER,
         "recurse": not args.no_recurse,
         "skip_existing": not args.overwrite,

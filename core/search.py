@@ -463,14 +463,21 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
             # picks it); every other probe in this loop is measured.
             if not math.isfinite(vm["mean"]):
                 break
+            # A probe under the floor is never the answer (selection
+            # below discards it), so landing on the VMAF aim there is not
+            # convergence: the floor model steps down to the cap instead.
+            q_violates_floor = (
+                q in bitrate_points and not meets_floor(bitrate_points[q])
+            )
             in_band = target - tol <= vm["mean"] <= target + VMAF_OVERSHOOT
-            if tag is None and in_band:
+            if tag is None and in_band and not q_violates_floor:
                 break
             # Sample-path convergence: within tol of the aim is done (tol
             # doubles as the epsilon — VMAF differences under it are
             # noise). Grid resolution bounds it below: when the remaining
             # delta rounds to no step, the `next_q == q` break fires.
-            if tag is not None and abs(vm["mean"] - aim) <= tol:
+            if (tag is not None and abs(vm["mean"] - aim) <= tol
+                    and not q_violates_floor):
                 break
             delta = (vm["mean"] - aim) / slope
             bitrate_bound = min(floor_cap, estimate_max_q_for_floor())
@@ -480,9 +487,6 @@ def search(source, meta, target, cache, cache_path, enc_func, cfg, engine,
             # the floor), accept any overshoot as long as VMAF meets target
             # and this point's bitrate isn't already below the predicted
             # floor.
-            q_violates_floor = (
-                q in bitrate_points and not meets_floor(bitrate_points[q])
-            )
             if (vm["mean"] >= target - tol
                     and q >= effective_max and not q_violates_floor):
                 # Say which of the two ceilings held it: the floor model,

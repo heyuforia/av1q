@@ -238,6 +238,7 @@ def main():
         "input_dir": args.input,
         "output_dir": args.output,
         "cache_dir": script_dir / "_cache",
+        "learned_dir": script_dir / "_learned",
         "container": OUTPUT_CONTAINER,
         "recurse": not args.no_recurse,
         "skip_existing": not args.overwrite,
