@@ -72,18 +72,18 @@ SCAN_TIMEOUT_MAX = 3600
 # picture fills in width or height. A picture within this fraction of a
 # screen's width or height still fills it: rips trim a few pixels off
 # the edges (1916x800, 3832x1600), and an exact rule would drop such a
-# film a whole tier, to a lower floor and the other VMAF model. The
-# tiers sit at least 1.33x apart, so the allowance never lifts a picture
-# into the tier above its own.
+# film a whole tier, to a lower floor, and a 4K film to the HD target
+# and VMAF model. The tiers sit at least 1.33x apart, so the allowance
+# never lifts a picture into the tier above its own.
 TIER_ALLOWANCE = 0.05
 
 # Automatic VMAF target per resolution tier, used when --vmaf is not
 # given. A tier without its own entry takes the next lower one (1080p
-# and 1440p read 720's). Every tier sits in the 93 to 95 band where an
-# encode reads as indistinguishable from its source on average. A file
-# finished under an older value keeps its encode: the skip check runs
-# before the probe, so it cannot know the automatic target. --overwrite
-# searches it again at the new value.
+# and 1440p read 720's, 4320p reads 2160's). Every tier sits in the 93
+# to 95 band where an encode reads as indistinguishable from its source
+# on average. A file finished under an older value keeps its encode:
+# the skip check runs before the probe, so it cannot know the automatic
+# target. --overwrite searches it again at the new value.
 TARGET_VMAF_BY_RES = {0: 93.0, 720: 94.0, 2160: 93.0}
 
 # av1q's peak cap: libsvtav1 runs capped CRF with a max bitrate of

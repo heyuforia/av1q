@@ -19,7 +19,7 @@ For every file:
 
 - **VMAF-targeted encoding.** Hits a perceptual quality target instead of a fixed CRF.
 - **Resolution-aware defaults.** VMAF targets auto-select by resolution: 94 for HD, 93 for SD, 93 for 4K.
-- **Bitrate floors.** Per-resolution minimums (1 Mbps at 720p, 1.8 at 1080p, 2.5 at 1440p, 4.5 at 2160p, 8 at 4320p) prevent VMAF-misleading low-bitrate encodes. They're starvation backstops, not targets.
+- **Bitrate floors.** Per-resolution minimums (1 Mbps at 720p, 1.8 at 1080p, 2.5 at 1440p, 4.5 at 2160p, 8 at 4320p) prevent VMAF-misleading low-bitrate encodes. They're starvation backstops, not targets. A file's resolution is the 16:9 screen its picture fills in width or height, so a widescreen film stored without its black bars (1920x800) counts as 1080p, and a portrait clip counts like its landscape twin.
 - **Scene-based sampling.** Fast quality estimation, so the search never encodes the whole file.
 - **P5 quality reporting.** The 5th-percentile worst-frame VMAF is reported next to the mean, so you can spot files whose worst moments lag.
 - **SSIMULACRA2 reporting.** Every VMAF score is shown next to a GPU-computed [SSIMULACRA2](https://github.com/cloudinary/ssimulacra2) score as a second opinion. Informational only, it never influences the encode.
