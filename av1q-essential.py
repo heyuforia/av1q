@@ -206,7 +206,8 @@ def main():
     )
     parser.add_argument(
         "--overwrite", action="store_true",
-        help="Re-encode even if output exists",
+        help="Encode every file again, finished ones included, reusing "
+             "no encode an earlier run made",
     )
     parser.add_argument(
         "--samples", type=int, default=8,

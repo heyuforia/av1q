@@ -508,10 +508,22 @@ def process_videos(cfg, engine):
             # sits at the exact name this run would write. It is reused
             # only when this record says these settings made it at its
             # current size; anything else is encoded again.
+            #
+            # --overwrite forgets the record here, on disk, before its
+            # first encode: the record cannot tell an encoder upgrade
+            # from the build that made the file, and a run killed
+            # mid-encode leaves the old file whole, so a rerun with or
+            # without the flag would take it back at the recommended
+            # quantizer. The encodes this run makes refill the record
+            # as they land, so the refine loop still reuses them. A dry
+            # run makes no full encode and leaves it alone.
             enc_tag = engine.signature(cfg, meta.get("crop"))
             outputs = cache.get("outputs")
             if not isinstance(outputs, dict):
                 outputs = cache["outputs"] = {}
+            elif outputs and not cfg["skip_existing"] and not cfg["dry_run"]:
+                outputs.clear()
+                atomic_write_json(cp, cache)
 
             def record_output(q):
                 outputs[grid.fmt(q)] = {
@@ -568,7 +580,8 @@ def process_videos(cfg, engine):
                     f" {DIM}(skipping search){RESET}"
                 )
                 # A file these settings already made at this quantizer,
-                # by any earlier run, is that encode and is reused.
+                # by any earlier run, is that encode and is reused
+                # (unless --overwrite forgot the record above).
                 final = full_encode(force_q)
                 if not final.exists():
                     print(f" {CROSS} Final encode missing")
@@ -772,7 +785,11 @@ def process_videos(cfg, engine):
                     f"sample_enc_{file_hash[:8]}_{enc_tag}_{grid.fmt(q)}"
                     f"{engine.sample_ext}"
                 )
-                if d.exists() and d.stat().st_size > 0:
+                # A probe a stopped search left on disk is reused, except
+                # under --overwrite: it is an earlier run's encode, like
+                # any output.
+                if (cfg["skip_existing"] and d.exists()
+                        and d.stat().st_size > 0):
                     sample_enc_cache[q] = d
                     return d
                 t0 = time.time()

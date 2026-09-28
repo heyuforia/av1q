@@ -117,7 +117,7 @@ python av1q.py
 | `--force-cq` | | Encode at exactly this CQ, skipping sampling, search, VMAF, and refinement |
 | `--no-10bit` | | Disable forced 10-bit encoding |
 | `--no-recurse` | | Don't process subdirectories |
-| `--overwrite` | | Re-encode even if output exists |
+| `--overwrite` | | Encode every file again, finished ones included, reusing no encode an earlier run made |
 | `--dry-run` | | Find optimal CQ but skip final encoding |
 | `--auto-crop` | | Detect letterbox/pillarbox inline before each encode |
 | `--no-crops` | | Ignore crop sidecars (auto-applied by default) |
