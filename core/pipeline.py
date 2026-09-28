@@ -636,8 +636,10 @@ def process_videos(cfg, engine):
                 stats["orig"] += in_sz
                 continue
 
-            tier = max(k for k in TARGET_VMAF_BY_RES if min(meta["w"], meta["h"]) >= k)
-            target = cfg.get("target_vmaf") or TARGET_VMAF_BY_RES[tier]
+            tier = res_tier(meta["w"], meta["h"])
+            target = cfg.get("target_vmaf") or TARGET_VMAF_BY_RES[
+                max(k for k in TARGET_VMAF_BY_RES if k <= tier)
+            ]
 
             # Persistent FFMS2 reference index for this source (SSIMU2
             # info column only — display, never gating).
@@ -800,7 +802,7 @@ def process_videos(cfg, engine):
                 sample_enc_cache[q] = d
                 return d
 
-            min_kbps = MIN_BITRATE_KBPS.get(res_tier(meta["w"], meta["h"]), 0)
+            min_kbps = MIN_BITRATE_KBPS.get(tier, 0)
             floor_str = (
                 f" {DIM}{MIDDOT}{RESET} floor {BOLD}{min_kbps}kbps{RESET}"
                 if min_kbps else ""

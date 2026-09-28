@@ -6,7 +6,9 @@ import math
 import subprocess
 import time
 
-from .probe import UNTAGGED, detect_hwaccel, get_fps, hw_decode_unsafe
+from .probe import (
+    UNTAGGED, detect_hwaccel, get_fps, hw_decode_unsafe, res_tier,
+)
 from .tools import ffmpeg_exe, ffprobe_exe
 from .ui import RED, RESET
 from .util import (
@@ -100,7 +102,13 @@ def measure_vmaf(ref, dist, meta, subsample, threads, cache_dir):
     log = make_temp_log(cache_dir, "vmaf", "json")
 
     th = f":n_threads={threads}" if threads > 1 else ""
-    model = "vmaf_4k_v0.6.1" if meta["h"] >= 2160 else "vmaf_v0.6.1"
+    # The 4K model assumes a 4K screen, so it follows the resolution
+    # tier: a 3840x1600 film fills a 4K screen's width, and a portrait
+    # 1440x2560 clip is a 1440p picture turned on its side.
+    model = (
+        "vmaf_4k_v0.6.1" if res_tier(meta["w"], meta["h"]) >= 2160
+        else "vmaf_v0.6.1"
+    )
 
     try:
         hw = detect_hwaccel()

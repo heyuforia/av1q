@@ -8,6 +8,7 @@ import platform
 import re
 import subprocess
 
+from .constants import TIER_ALLOWANCE
 from .tools import ffmpeg_exe, ffprobe_exe
 from .util import run_cmd, scan_budget
 
@@ -241,10 +242,22 @@ def get_fps(filepath):
 
 
 def res_tier(w, h):
-    """Resolution tier based on the short dimension (handles vertical video)."""
-    short = min(w, h)
+    """Resolution tier: the largest 16:9 screen (720, 1080, 1440, 2160 or
+    4320 lines) whose width or height the picture fills, within
+    TIER_ALLOWANCE. A film stored without its bars (1920x800) fills a
+    1080p screen's width, the same tier as that film stored with them; a
+    4:3 picture (1440x1080) fills its height. The long side meets the
+    screen's width and the short side its height, so a portrait or
+    rotated picture tiers like its landscape twin.
+
+    Read on the stored frame before any crop, so a crop never moves a
+    file's tier. The one tier feeds the bitrate floor, the automatic
+    VMAF target, the VMAF model and av1q's peak-cap stand-in.
+    """
+    long_side, short_side = max(w, h), min(w, h)
+    fill = 1 - TIER_ALLOWANCE
     for t in (4320, 2160, 1440, 1080, 720):
-        if short >= t:
+        if long_side >= t * 16 // 9 * fill or short_side >= t * fill:
             return t
     return 0
 
