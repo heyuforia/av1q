@@ -2,6 +2,7 @@
 
 import contextlib
 import hashlib
+import itertools
 import json
 import os
 import shlex
@@ -14,6 +15,7 @@ from pathlib import Path
 from .constants import SCAN_TIMEOUT_MAX, SCAN_TIMEOUT_MIN
 
 _temp_files = set()
+_log_seq = itertools.count()  # next() is atomic under the GIL
 
 
 @contextlib.contextmanager
@@ -42,6 +44,22 @@ def suppress_win_error_dialog():
         yield
     finally:
         k32.SetErrorMode(prev)
+
+
+def own_process_group():
+    """Popen keyword arguments that start a child in its own process
+    group (its own session off Windows), where the console's Ctrl-C
+    never reaches it.
+
+    A child that gets the Ctrl-C decides its own end: ffmpeg exits 255,
+    but SvtAv1EncApp stops at its next input frame, finishes what it
+    has and exits 0, and a piece of a full encode is trusted on exit 0.
+    So only the pool stops these children (Popen.terminate), and their
+    exit code then says they were stopped.
+    """
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
 
 
 def fmt_cmd(cmd):
@@ -131,12 +149,17 @@ def atomic_write_json(path, obj, indent=None):
 def make_temp_log(cache_dir, prefix, ext):
     """Create and register a unique temp-log path under `cache_dir`.
 
-    Names combine pid and a microsecond timestamp so they stay unique even
-    in tight loops (cropdetect runs one per window). The file is added to
-    `_temp_files` so cleanup_temp() removes it if the caller doesn't.
+    Names combine pid, a per-process count and a microsecond timestamp:
+    the Windows clock can tick coarser than a microsecond, and parallel
+    encoders ask for a feed log each in the same instant, so the time
+    alone repeats. The file is added to `_temp_files` so cleanup_temp()
+    removes it if the caller doesn't.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
-    log = cache_dir / f"{prefix}_{os.getpid()}_{int(time.time() * 1_000_000)}.{ext}"
+    log = cache_dir / (
+        f"{prefix}_{os.getpid()}_{next(_log_seq)}"
+        f"_{int(time.time() * 1_000_000)}.{ext}"
+    )
     _temp_files.add(log)
     return log
 

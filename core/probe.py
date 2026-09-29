@@ -433,16 +433,20 @@ _SHOWINFO_FIRST = re.compile(r"\bn:\s*0\s+pts:\s*(-?\d+|NOPTS)")
 def picture_timing(filepath):
     """How ffmpeg itself decodes v:0, read off its first decoded frame.
 
-    Returns {"start", "rate"}:
-      start  seconds from the container start to the first frame the
-             decoder outputs, on the timeline every ffmpeg run here uses.
-             Not the stream's stated start time: a capture whose leading
-             frames do not decode starts its picture later than that.
-      rate   ffmpeg's own frame-rate guess for the stream (the rate its
-             filter graph and every -fps_mode cfr output run at) as
-             'num/den', or None when it has none. Not r_frame_rate: an
-             interlaced H.264 stream states its field rate there, and
-             ffmpeg corrects it to the frame rate from the codec.
+    Returns {"start", "start_pts", "rate"}:
+      start      seconds from the container start to the first frame the
+                 decoder outputs, on the timeline every ffmpeg run here
+                 uses. Not the stream's stated start time: a capture whose
+                 leading frames do not decode starts its picture later.
+      start_pts  that frame's pts in the filter graph's input time base,
+                 the exact value setpts' STARTPTS takes in a run from the
+                 file's start; None when the frame has no timestamp.
+      rate       ffmpeg's own frame-rate guess for the stream (the rate
+                 its filter graph and every -fps_mode cfr output run at)
+                 as 'num/den', or None when it has none. Not
+                 r_frame_rate: an interlaced H.264 stream states its field
+                 rate there, and ffmpeg corrects it to the frame rate from
+                 the codec.
 
     showinfo's config line and first frame line carry both facts, and
     -frames:v 1 stops the decode there. Raises RuntimeError when ffmpeg
@@ -459,12 +463,12 @@ def picture_timing(filepath):
     if not config or not first:
         raise RuntimeError(f"No decodable video frame in {filepath.name}")
     tb_num, tb_den, fr_num, fr_den = (int(g) for g in config.groups())
-    pts = first.group(1)
+    pts = None if first.group(1) == "NOPTS" else int(first.group(1))
     start = 0.0
-    if pts != "NOPTS" and tb_den:
-        start = max(0.0, int(pts) * tb_num / tb_den)
+    if pts is not None and tb_den:
+        start = max(0.0, pts * tb_num / tb_den)
     rate = f"{fr_num}/{fr_den}" if fr_num > 0 and fr_den > 0 else None
-    return {"start": start, "rate": rate}
+    return {"start": start, "start_pts": pts, "rate": rate}
 
 
 # A frame interval this far off the median is irregular. Container

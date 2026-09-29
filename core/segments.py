@@ -1,22 +1,22 @@
-"""Resumable segmented full-file encodes (manifest, validation, concat)
-and the source-stream mux every full encode of both engines ends with.
+"""The work dirs of full-file encodes (manifest, probes, concat) and the
+source-stream mux every full encode of both engines ends with.
 
-One continuous encoder writes keyframe-aligned segment files through
-ffmpeg's segment muxer, which finalizes each completed segment (header,
-trailer, cues) before opening the next — so a killed encode keeps every
-finished segment and only the in-flight one is lost. Resume restarts the
-encoder at a segment boundary, the segments are stream-copy concatenated,
-and audio/subs are muxed from the source at the end.
+core.chunks encodes a full picture as pieces, each written by its own
+encoder process into one work dir per (source, settings, quantizer).
+A piece is renamed into place only when its encoder exited cleanly and
+the manifest then records it, so a killed encode keeps every finished
+piece and loses only the ones in flight. The pieces are stream-copy
+concatenated, and audio/subs are muxed from the source at the end.
 
-The timestamp contract that makes the concat bit-compatible with a
-single-pass encode: segments are written with -reset_timestamps 0 (the
-output timeline's PTS pass straight through into the segment files), a
-resumed encode re-enters that same timeline via -ss/-copyts/-start_at_zero,
-and the concat list declares each segment's exact duration (next segment's
-first PTS minus this one's), which zeroes the concat demuxer's timestamp
-delta so the original PTS survive unchanged. The mux then keeps the
-video's start offset against the source's other streams (read from the
-video file, or supplied by an engine whose encoder output restarts at 0).
+The timestamp contract of the concat: every piece's record holds where
+its picture starts on the joined timeline, and the concat list declares
+each piece's exact duration (next piece's start minus this one's), which
+zeroes the concat demuxer's timestamp delta so every piece keeps its own
+timestamps. A split encode starts a new encoder keyframe at each seam,
+so its bitstream is not the one a single pass would write; the frames
+and their timestamps are. The mux then keeps the video's start offset
+against the source's other streams (read from the video file, or
+supplied by an engine whose encoder output restarts at 0).
 """
 
 import json
@@ -32,8 +32,6 @@ from .util import atomic_write_json, run_cmd
 HDR10_MUX_OPTIONS = ("mastering_display", "content_light")
 
 MANIFEST_NAME = "manifest.json"
-SEGMENT_LIST_NAME = "segments.csv"
-SEGMENT_PATTERN = "seg_%05d.mkv"
 CONCAT_LIST_NAME = "concat.txt"
 JOINED_NAME = "joined.mkv"
 
@@ -52,19 +50,22 @@ def segment_dir(cache_root, file_hash, enc_tag, q_key):
     return segment_root(cache_root) / f"{file_hash[:8]}_{enc_tag}_{q_key}"
 
 
-def manifest_expected(file_hash, enc_tag, q_key, segment_time, pix):
-    """The identity a segment dir must match to be resumed. Any mismatch
-    (source changed, settings changed, different quantizer) means the
-    segments were produced by a different encode and must be discarded.
-    pix is part of the identity even though enc_signature never carried
-    it: a bit-depth flip between interruption and resume would otherwise
-    stream-copy 8-bit and 10-bit segments into one corrupt file.
+def manifest_expected(file_hash, enc_tag, q_key, plan, extra):
+    """The identity a work dir must match to be resumed. Any mismatch
+    (source changed, settings changed, different quantizer, other
+    pieces) means the pieces were produced by a different encode and
+    must be discarded.
+
+    plan is core.chunks' piece list in its JSON form (whole numbers
+    only, so the identity read back from disk compares equal), [] for a
+    picture encoded in one piece. extra holds what the engine's pieces
+    also depend on beside its signature (Engine.chunk_identity).
 
     The identity holds what the settings choose, never the encoder build
     or how the code spells the encode's params. So a dir left before an
-    encoder upgrade or a params change joins its segments to new ones: a
+    encoder upgrade or a params change joins its pieces to new ones: a
     valid bitstream with one seam (params added later, such as the HDR10
-    metadata, then ride only the keyframes from the resume point on).
+    metadata, then ride only the pieces encoded from then on).
     --overwrite keeps the dir too, on purpose: discarding it would cost
     an interrupted --overwrite run its work on the natural rerun with
     the same command line."""
@@ -72,8 +73,8 @@ def manifest_expected(file_hash, enc_tag, q_key, segment_time, pix):
         "source_hash": file_hash,
         "enc_tag": enc_tag,
         "q": q_key,
-        "segment_time": segment_time,
-        "pix": pix,
+        "plan": plan,
+        **extra,
     }
 
 
@@ -100,10 +101,10 @@ def write_manifest(seg_dir, manifest):
 
 
 def _on_disk(seg_dir, s):
-    """A manifest entry whose segment file is still present and non-empty
+    """A manifest record whose piece is still present and non-empty
     (anything malformed, e.g. a hand-edited manifest, is not)."""
     if not (isinstance(s, dict) and isinstance(s.get("name"), str)
-            and isinstance(s.get("start_ms"), int)):
+            and isinstance(s.get("start_us"), int)):
         return False
     try:
         p = seg_dir / s["name"]
@@ -112,101 +113,49 @@ def _on_disk(seg_dir, s):
         return False
 
 
-def prepare(seg_dir, expected, probe=None):
-    """Bring a work dir to a resumable state for one encode identity.
+def prepare(seg_dir, expected):
+    """Bring a work dir to a resumable state for one encode identity and
+    return its manifest.
 
-    Returns (manifest, resume_ms). A `complete` manifest (the encoder
-    finished, then the join was interrupted) is kept only while every
-    segment is still on disk, and then only the join remains. Otherwise
-    the manifest carries the kept segments and resume_ms the exact PTS to
-    re-enter at, None for frame 0. A dir made by another identity is
+    manifest["done"] maps a piece's index (as a string, JSON's only key
+    type) to its record {"name", "start_us"}. A record is kept only while
+    its file is still on disk: a manifest that says "done" is not
+    evidence. Every other file in the dir (a piece killed in flight, an
+    interrupted join) is deleted, and a dir made by another identity is
     discarded whole.
     """
-    probe = probe or _probe_start_ms
     manifest = load_manifest(seg_dir)
     if not manifest_matches(manifest, expected):
         shutil.rmtree(seg_dir, ignore_errors=True)
-        manifest = {**expected, "complete": False, "segments": []}
+        manifest = {**expected, "done": {}}
     seg_dir.mkdir(parents=True, exist_ok=True)
 
-    segs = manifest.get("segments")
-    if (manifest.get("complete") and isinstance(segs, list) and segs
-            and all(_on_disk(seg_dir, s) for s in segs)):
-        return manifest, None
-
-    kept, resume_ms = resume_state(seg_dir, manifest, probe=probe)
-    manifest["segments"] = kept
-    manifest["complete"] = False
+    done = manifest.get("done")
+    kept = {
+        k: {"name": s["name"], "start_us": s["start_us"]}
+        for k, s in (done.items() if isinstance(done, dict) else ())
+        if _on_disk(seg_dir, s)
+    }
+    manifest["done"] = kept
+    keep = {s["name"] for s in kept.values()} | {MANIFEST_NAME}
+    for p in seg_dir.iterdir():
+        if p.name not in keep:
+            try:
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    p.unlink()
+            except OSError:
+                pass
     write_manifest(seg_dir, manifest)
-    return manifest, resume_ms
+    return manifest
 
 
-def finish_run(seg_dir, manifest, probe=None):
-    """Record an encoder run that exited cleanly: every segment it listed
-    must validate before the manifest may say `complete`.
-
-    Validation stops at the first bad segment, so a shortfall here would
-    otherwise mark a truncated timeline complete, and the join would ship
-    a video that ends early under full-length audio. Raising instead
-    leaves the manifest resumable: the next run keeps the good prefix.
-    """
-    probe = probe or _probe_start_ms
-    kept = manifest["segments"]
-    known = {s["name"] for s in kept}
-    listed = [
-        n for n in parse_segment_list(seg_dir / SEGMENT_LIST_NAME)
-        if n not in known
-    ]
-    new = validate_new_segments(seg_dir, kept, probe=probe)
-    if not listed or len(new) < len(listed):
-        raise RuntimeError(
-            f"Segmented encode: {len(new)} of {len(listed)} new segments"
-            f" validated; the next run resumes from the last good one"
-        )
-    manifest["segments"] = kept + new
-    manifest["complete"] = True
-    write_manifest(seg_dir, manifest)
-
-
-def parse_segment_list(csv_path):
-    """Segment basenames from ffmpeg's -segment_list CSV, in file order.
-
-    Rows are `filename,start_time,end_time`, written as each segment is
-    finalized — so the list is the authority on which segments completed.
-    A kill can tear the last line mid-write; malformed rows are skipped.
-    Only the basename is trusted (the filename column echoes whatever
-    pattern path ffmpeg was given). ffmpeg CSV-quotes that column when
-    the path contains `,` or `"` (doubling embedded quotes) — the quotes
-    must come off before the basename split, or an install path with a
-    comma in it turns every finished encode into a parse failure.
-    """
-    try:
-        text = csv_path.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return []
-    names = []
-    for line in text.splitlines():
-        parts = line.rsplit(",", 2)
-        if len(parts) != 3:
-            continue
-        field = parts[0].strip()
-        if len(field) >= 2 and field.startswith('"') and field.endswith('"'):
-            field = field[1:-1].replace('""', '"')
-        name = field.replace("\\", "/").rsplit("/", 1)[-1].strip()
-        try:
-            float(parts[1]), float(parts[2])
-        except ValueError:
-            continue
-        if name:
-            names.append(name)
-    return names
-
-
-def _probe_start_ms(path):
+def probe_start_ms(path):
     """First video packet PTS in ms (MKV's native timescale), or None.
 
-    This is the ms-exact resume/concat anchor — CSV float seconds are
-    not trusted for timeline math, the container is.
+    This is the ms-exact concat and mux anchor: the container is trusted
+    for timeline math, never a planned time.
     """
     try:
         r = run_cmd([
@@ -226,8 +175,42 @@ def _probe_start_ms(path):
     return None
 
 
-def _probe_duration_s(path):
-    """Container duration in seconds (finalized segments carry it)."""
+def probe_pts_span(path):
+    """(first, last) video packet PTS of an MKV piece in ms, or None when
+    it has no readable packet: where its picture starts and ends."""
+    try:
+        r = run_cmd([
+            ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "packet=pts", "-of", "csv=p=0", str(path),
+        ])
+    except RuntimeError:
+        return None
+    pts = []
+    for line in (r.stdout or "").splitlines():
+        try:
+            pts.append(int(line.strip().rstrip(",")))
+        except ValueError:
+            continue  # N/A, or a blank line
+    return (min(pts), max(pts)) if pts else None
+
+
+def probe_packet_count(path):
+    """Video packets in a piece, demux only, or None when it cannot be
+    read. On an AV1 piece each packet is one shown frame: a temporal
+    unit, which the encoder writes as one IVF frame and one MKV block."""
+    try:
+        r = run_cmd([
+            ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
+            "-count_packets", "-show_entries", "stream=nb_read_packets",
+            "-of", "default=nw=1:nk=1", str(path),
+        ])
+        return int((r.stdout or "").strip())
+    except (RuntimeError, ValueError):
+        return None
+
+
+def probe_duration_s(path):
+    """Container duration in seconds (a finished piece carries it)."""
     try:
         r = run_cmd([
             ffprobe_exe(), "-v", "error", "-show_entries", "format=duration",
@@ -238,85 +221,23 @@ def _probe_duration_s(path):
         return None
 
 
-def validate_new_segments(seg_dir, known, probe=_probe_start_ms):
-    """Validate this run's CSV segments against what's on disk.
-
-    Returns the ordered list of {"name", "start_ms"} entries for segments
-    that verifiably completed: listed in the CSV, present, non-empty,
-    probeable, and monotonically after the previous one. Validation stops
-    at the first failure — segments after a gap can't be stitched. Never
-    trust the list alone (a finished-looking manifest with a missing file
-    is how resume ships a truncated video).
-    """
-    known_names = {s["name"] for s in known}
-    last_ms = known[-1]["start_ms"] if known else -1
-    out = []
-    for name in parse_segment_list(seg_dir / SEGMENT_LIST_NAME):
-        if name in known_names:
-            continue
-        p = seg_dir / name
-        try:
-            if not p.is_file() or p.stat().st_size == 0:
-                break
-        except OSError:
-            break
-        start = probe(p)
-        if start is None or start <= last_ms:
-            break
-        out.append({"name": name, "start_ms": start})
-        last_ms = start
-    return out
-
-
-def resume_state(seg_dir, manifest, probe=_probe_start_ms):
-    """Reconcile an interrupted dir: (kept_segments, resume_ms).
-
-    Merges the manifest's previously validated segments with whatever the
-    interrupted run's CSV finalized, then drops the LAST segment: the
-    resume seek target must be the exact PTS of the first frame not yet
-    encoded, and a segment's first-packet PTS is the only boundary that
-    is knowable exactly (a last-packet-plus-duration guess can drop or
-    duplicate a frame at the seam on irregular sources). Re-encoding one
-    segment is the price of an exact seam. Every file in the dir that
-    isn't kept (the dropped segment, the in-flight truncated one) is
-    deleted. resume_ms is None for a fresh start.
-    """
-    kept = []
-    segs = manifest.get("segments")
-    for s in segs if isinstance(segs, list) else []:
-        if not _on_disk(seg_dir, s):
-            break
-        kept.append({"name": s["name"], "start_ms": s["start_ms"]})
-    kept += validate_new_segments(seg_dir, kept, probe=probe)
-
-    resume_ms = None
-    if kept:
-        dropped = kept.pop()
-        resume_ms = dropped["start_ms"]
-    if not kept:
-        resume_ms = None
-
-    keep_names = {s["name"] for s in kept}
-    for p in seg_dir.glob("seg_*.mkv"):
-        if p.name not in keep_names:
-            try:
-                p.unlink()
-            except OSError:
-                pass
-    return kept, resume_ms
-
-
 def ms_ts(ms):
     """ms -> an exact 'S.mmm' seconds string for -ss / duration fields."""
     return f"{ms // 1000}.{ms % 1000:03d}"
 
 
+def us_ts(us):
+    """µs -> an exact 'S.uuuuuu' seconds string, the finest step ffmpeg
+    parses a time into."""
+    return f"{us // 1_000_000}.{us % 1_000_000:06d}"
+
+
 def build_concat_list(segments, last_duration_s):
-    """ffconcat text with exact per-segment durations.
+    """ffconcat text with exact per-piece durations.
 
     duration(i) = start(i+1) - start(i): declaring the exact slice length
     zeroes the concat demuxer's per-file timestamp delta, so the original
-    PTS pass through unchanged. The last segment's duration only affects
+    PTS pass through unchanged. The last piece's duration only affects
     total-duration metadata; the container's own value is fine there.
     """
     lines = ["ffconcat version 1.0"]
@@ -324,7 +245,7 @@ def build_concat_list(segments, last_duration_s):
         lines.append(f"file '{s['name']}'")
         if i + 1 < len(segments):
             lines.append(
-                f"duration {ms_ts(segments[i + 1]['start_ms'] - s['start_ms'])}"
+                f"duration {us_ts(segments[i + 1]['start_us'] - s['start_us'])}"
             )
         elif last_duration_s:
             lines.append(f"duration {last_duration_s:.6f}")
@@ -332,8 +253,8 @@ def build_concat_list(segments, last_duration_s):
 
 
 def concat_segments(seg_dir, segments, out_path,
-                    probe_duration=_probe_duration_s):
-    """Stream-copy concat all segments into one video-only file.
+                    probe_duration=probe_duration_s):
+    """Stream-copy concat all pieces, in order, into one video-only file.
 
     The concat demuxer re-bases every file by (cumulative start − the
     file's own start), which with exact durations is a uniform shift of
@@ -343,12 +264,12 @@ def concat_segments(seg_dir, segments, out_path,
     A/V offset once audio is remuxed). -output_ts_offset adds exactly
     that first start back, restoring the original PTS in every case.
 
-    The joined file is a second full copy of the video beside its
-    segments for a short time, kept on purpose: disk space is not the
-    constraint, and the work dir is deleted once the output is final.
+    The joined file is a second full copy of the video beside its pieces
+    for a short time, kept on purpose: disk space is not the constraint,
+    and the work dir is deleted once the output is final.
     """
     if not segments:
-        raise RuntimeError("No segments to concatenate")
+        raise RuntimeError("No pieces to concatenate")
     last_dur = probe_duration(seg_dir / segments[-1]["name"])
     lst = seg_dir / CONCAT_LIST_NAME
     lst.write_text(build_concat_list(segments, last_dur), encoding="utf-8")
@@ -361,11 +282,11 @@ def concat_segments(seg_dir, segments, out_path,
         ffmpeg_exe(), "-y", "-hide_banner", "-v", "error",
         "-f", "concat", "-safe", "0", "-i", str(lst),
         "-map", "0:v:0", "-c", "copy",
-        "-output_ts_offset", ms_ts(segments[0]["start_ms"]),
+        "-output_ts_offset", us_ts(segments[0]["start_us"]),
         str(out_path),
     ])
     if not out_path.exists() or out_path.stat().st_size == 0:
-        raise RuntimeError("Segment concat produced no output")
+        raise RuntimeError("Piece concat produced no output")
 
 
 def mux_states_hdr10():
@@ -397,7 +318,8 @@ def mux_with_source_streams(video, source, dest_tmp, probe=None,
     source's first timestamp; rebased to 0 alone, the picture would play
     that much early against the audio. -itsoffset by the video's own
     start cancels its shift. Discontinuity repair is per ffmpeg run: the
-    picture is repaired in its encode run and the audio here, so a
+    picture is repaired in its encode run (a timeline with a jump is
+    never split, see analyze.read_timeline) and the audio here, so a
     timestamp jump the two streams do not share equally can land them a
     little apart.
 
@@ -406,7 +328,7 @@ def mux_with_source_streams(video, source, dest_tmp, probe=None,
     video file.
     """
     if start_ms is None:
-        start_ms = (probe or _probe_start_ms)(video)
+        start_ms = (probe or probe_start_ms)(video)
     if start_ms is None:
         raise RuntimeError(f"Remux failed: {video.name} is unreadable")
     offset = ["-itsoffset", ms_ts(start_ms)] if start_ms > 0 else []

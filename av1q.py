@@ -51,6 +51,7 @@ from core.crop import (
     detect_crop_for_file,
 )
 from core import search as core_search
+from core.chunks import default_workers
 from core import pipeline as core_pipeline
 from core import vmaf as core_vmaf
 from core.engines.svt_ffmpeg import SvtAv1FfmpegEngine, enc_signature, encode_av1
@@ -188,9 +189,16 @@ def main():
     )
     parser.add_argument(
         "--no-resume", action="store_true",
-        help="Disable resumable segmented encoding for long sources "
-             "(by default, interrupted full encodes resume at the last "
-             "finished segment instead of restarting)",
+        help="Encode every file in one piece by one encoder: an "
+             "interrupted encode restarts from the beginning, and no "
+             "encoders run side by side (by default long files, and "
+             "shorter ones when --workers is above 1, are encoded in "
+             "pieces, and an interrupted encode keeps its finished ones)",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=None,
+        help="Encoders run side by side, each on its own piece of the "
+             "file (default: one per 16 logical threads, at least 1)",
     )
     parser.add_argument(
         "--force-cq", type=int, default=None,
@@ -216,6 +224,8 @@ def main():
         parser.error("--film-grain must be 0-50")
     if args.samples < 1:
         parser.error("--samples must be >= 1")
+    if args.workers is not None and args.workers < 1:
+        parser.error("--workers must be >= 1")
     # `0 <` also rejects nan; without this a --vmaf 0 would silently fall
     # through to the automatic per-resolution target.
     if args.vmaf is not None and not 0 < args.vmaf <= 100:
@@ -257,6 +267,7 @@ def main():
         "seed_cq": args.seed_cq,
         "force_q": args.force_cq,
         "resume_encodes": not args.no_resume,
+        "workers": args.workers or default_workers(),
         "sample_count": args.samples,
         "sample_duration": SAMPLE_DURATION,
         "min_scene_duration": MIN_SCENE_DURATION,

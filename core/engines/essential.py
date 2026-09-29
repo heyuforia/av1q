@@ -1,6 +1,7 @@
 """SVT-AV1-Essential engine: ffmpeg decodes (applying crop) and pipes
-10-bit Y4M into the standalone fork binary, then audio/subs/chapters
-are remuxed back from the source. Quarter-step CRF grid; color and
+10-bit Y4M into the standalone fork binary, a full picture in pieces
+through core.chunks, then audio/subs/chapters are remuxed back from the
+source. Quarter-step CRF grid; color and
 HDR10 static metadata re-stated as encoder flags (Y4M carries none);
 VFR sources gated out (the Y4M pipe is CFR-only)."""
 
@@ -9,19 +10,16 @@ import math
 import os
 import re
 import subprocess
-import sys
-import time
 
-from .. import ssimu2
+from .. import chunks, segments, ssimu2
 from ..crop import crop_token
 from ..probe import (
     content_light_str, is_vfr, picture_timing, svt_mastering_display,
 )
 from ..sampling import clean_sample_source
-from ..segments import mux_with_source_streams
 from ..tools import ffmpeg_exe, find_encoder, find_ffvship_optional
-from ..ui import BOLD, DIM, GREEN, MIDDOT, RESET, fmt_time, label
-from ..util import _temp_files, ascii_dir, make_temp_log
+from ..ui import DIM, MIDDOT, RESET
+from ..util import _temp_files, ascii_dir, make_temp_log, own_process_group
 from .base import Engine, Grid
 
 
@@ -181,69 +179,123 @@ def _proc_tail(text, n=40):
     return "\n".join((text or "").splitlines()[-n:])
 
 
-def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
-                     expected_frames=0, full=False):
-    """Encode `source` to AV1 at `crf` via SVT-AV1-Essential.
+def _rate(meta):
+    """The feed's frame rate (EssentialEngine.prepare_meta) as (num, den),
+    or None when ffmpeg has no guess for the stream."""
+    rate = meta.get("picture_rate")
+    if not rate:
+        return None
+    num, den = (int(v) for v in rate.split("/"))
+    return num, den
 
-    ffmpeg decodes (applying crop) and pipes 10-bit Y4M — Essential
-    rejects 8-bit input by design — into the encoder, which writes a
-    video-only IVF. A sample probe (full False) is that picture, renamed
-    to dest. A full-file output (full True) runs the feed at ffmpeg's own
-    frame rate and gets audio/subs/chapters remuxed back from the source.
-    meta["picture_start"] and meta["picture_rate"] come from
-    EssentialEngine.prepare_meta.
 
-    Hardware decode is deliberately not used on this path: a mid-stream
-    hwaccel failure can't be retried without restarting the encoder, and
-    CPU decode comfortably outpaces SVT-AV1 at these presets.
+def _slot(meta, t_us):
+    """The feed's first output frame of a piece whose source span starts
+    at t_us (µs on read_packets' timeline), 0 for the first piece.
+
+    The fps filter places each input frame on the slot its pts rounds to
+    and shows every slot the latest frame placed at or before it
+    (vf_fps.c), so what a slot shows depends only on the frames up to it.
+    The keyframe at t_us rounds to floor(x) or floor(x) + 1, x being its
+    exact position in slots; float error is far under half a slot.
+    Opening the piece at floor(x) + 1 therefore never needs a frame
+    before its keyframe, which a piece that seeks there may not decode,
+    and every slot it shows is the one the continuous feed shows. The
+    keyframe's own slot, when it is floor(x), goes to the piece before,
+    which decodes on past its end to fill it.
     """
-    # The standalone encoder reads its output path as ANSI on Windows, and
-    # a full-encode dest carries the source's (possibly non-Latin) stem,
-    # so every encode writes a hash-named scratch file in the ASCII
-    # spelling of the cache root (EssentialEngine.setup) and is renamed or
-    # remuxed to dest by Python and ffmpeg, which take Unicode paths.
-    tag = hashlib.sha256(str(dest).encode("utf-8")).hexdigest()[:16]
-    enc_out = cfg["e_scratch"] / f"_enc_{tag}.tmp.ivf"
-    _temp_files.add(enc_out)
-    try:
-        if enc_out.exists():
-            enc_out.unlink()
-    except OSError:
-        pass
+    if t_us is None:
+        return 0
+    num, den = _rate(meta)
+    x = (t_us / 1_000_000 - meta["picture_start"]) * num / den
+    return math.floor(x) + 1
 
-    ff_cmd = [ffmpeg_exe(), "-y", "-hide_banner", "-v", "error", "-nostats",
-              "-i", str(source), "-map", "0:v:0"]
-    # Full encodes normalize the feed's timeline: setpts zeroes any start
-    # offset / edit-list delay and fps re-times onto a clean CFR grid at
-    # ffmpeg's own frame rate for the stream (probe.picture_timing), the
-    # rate its CFR outputs run at. This is a no-op for well-formed
-    # CFR sources, but for irregular ones (e.g. stream-copy concatenations
-    # with a per-join timing gap) it is what keeps the full encode
-    # frame-aligned with the VMAF reference, which applies the identical
-    # setpts+fps normalization on its side at the encode's own rate.
-    # Without it the encoder's own CFR conversion fills the gaps
-    # differently than the reference's fps filter and the two drift out of
-    # phase, collapsing full VMAF. r_frame_rate is not that rate: on an
-    # interlaced H.264 source it is the field rate, and the feed would
-    # double every frame. Samples skip this: their search source is
-    # already a clean CFR re-encode (clean_sample_source) and they pair by
-    # index.
+
+def _feed_cmd(source, meta, piece, full):
+    """ffmpeg's Y4M feed of `source`: the whole search source for a
+    sample probe (full False), else the whole picture (piece None) or
+    one piece of it.
+
+    A full feed normalizes the timeline: setpts zeroes the picture's
+    start offset / edit-list delay and fps re-times onto a clean CFR grid
+    at ffmpeg's own frame rate for the stream (probe.picture_timing), the
+    rate its CFR outputs run at. This is a no-op for well-formed CFR
+    sources, but for irregular ones (e.g. stream-copy concatenations with
+    a per-join timing gap) it is what keeps the full encode frame-aligned
+    with the VMAF reference, which applies the identical setpts+fps
+    normalization on its side at the encode's own rate. Without it the
+    encoder's own CFR conversion fills the gaps differently than the
+    reference's fps filter and the two drift out of phase, collapsing
+    full VMAF. r_frame_rate is not that rate: on an interlaced H.264
+    source it is the field rate, and the feed would double every frame.
+    Samples skip this: their search source is already a clean CFR
+    re-encode (clean_sample_source) and they pair by index.
+
+    A piece keeps that exact grid. It subtracts the picture's first pts
+    as a constant (STARTPTS would be the piece's own first frame, and
+    each piece would round onto a grid of its own), decodes from its
+    seek under -copyts -start_at_zero, the timeline the constant was read
+    on, and keeps the output slots from _slot(start) up to, not
+    including, _slot(end): a trim on the fps filter's own 1/rate ticks
+    at both ends, exact. The pieces then hold every slot of the
+    continuous feed once, and a piece with fewer frames than its slots
+    (a keyframe that did not decode) is short, never shifted.
+
+    -nostdin: a piece is trusted on exit 0, and ffmpeg's interactive
+    'q' would end the feed early at exit 0.
+    """
+    cmd = [ffmpeg_exe(), "-y", "-hide_banner", "-v", "error", "-nostats",
+           "-nostdin"]
+    if piece is not None and piece.seek is not None:
+        cmd += ["-ss", segments.us_ts(piece.seek)]
+    cmd += ["-i", str(source), "-map", "0:v:0"]
     vf = []
     if meta.get("crop"):
         vf.append(f"crop={meta['crop']}")
     rate = meta["picture_rate"] if full else None
-    if rate:
+    if rate and piece is None:
         vf += ["setpts=PTS-STARTPTS", f"fps={rate}"]
+    elif rate:
+        vf += [f"setpts=PTS-({meta['picture_start_pts']})", f"fps={rate}"]
+        bounds = []
+        if _slot(meta, piece.start):
+            bounds.append(f"start_pts={_slot(meta, piece.start)}")
+        if piece.end is not None:
+            bounds.append(f"end_pts={_slot(meta, piece.end)}")
+        if bounds:
+            vf.append("trim=" + ":".join(bounds))
     if vf:
-        ff_cmd += ["-vf", ",".join(vf)]
+        cmd += ["-vf", ",".join(vf)]
+    if piece is not None:
+        cmd += ["-copyts", "-start_at_zero"]
     if rate:
         # Pass the fps filter's CFR frames through untouched; without this
         # the yuv4mpegpipe muxer re-runs its own CFR conversion on top,
         # which can diverge from the reference's fps filter at the same
         # rate and reintroduce the drift.
-        ff_cmd += ["-fps_mode", "passthrough"]
-    ff_cmd += ["-pix_fmt", "yuv420p10le", "-strict", "-1",
-               "-f", "yuv4mpegpipe", "-"]
+        cmd += ["-fps_mode", "passthrough"]
+    return cmd + ["-pix_fmt", "yuv420p10le", "-strict", "-1",
+                  "-f", "yuv4mpegpipe", "-"]
+
+
+def _encode_y4m(ff_cmd, meta, crf, cfg, enc_out, job=None, frame_s=0.0):
+    """Pipe ff_cmd's Y4M into SvtAv1EncApp at `crf`, which writes the
+    picture to enc_out, a path in the cache root's ASCII spelling.
+    Raises when either process fails or nothing was written.
+
+    job, when given, is a core.chunks Job: both processes go to it, and
+    each progress line is reported as seconds encoded (frames times
+    frame_s), frames per second and bytes.
+
+    Hardware decode is deliberately not used on this path: a mid-stream
+    hwaccel failure can't be retried without restarting the encoder, and
+    CPU decode comfortably outpaces SVT-AV1 at these presets.
+    """
+    try:
+        if enc_out.exists():
+            enc_out.unlink()
+    except OSError:
+        pass
 
     # --webm 0 pins IVF: release builds are compiled without WebM output,
     # a build with it defaults to WebM, and the two must not differ.
@@ -261,51 +313,7 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
     enc_cmd += list(cfg.get("enc_args") or [])
 
     ff_log = make_temp_log(cfg["cache_dir"], "y4mfeed", "log")
-    bar_w = 20
-    last_render = 0.0
-    rendered = False
     tail = []  # last stderr lines for error reporting
-    # Real-time speed multiplier = encode fps / source fps, matching the
-    # "1.4x" field ffmpeg's own -progress output gives av1q's bar. The
-    # encoder reports encode fps but no speed, so derive source fps from
-    # the known frame count over the source duration.
-    source_fps = (
-        expected_frames / meta["duration"]
-        if expected_frames and meta.get("duration", 0) > 0 else 0
-    )
-
-    def render(frames, total, fps_val, kbps, final=False):
-        nonlocal last_render, rendered
-        last_render = time.time()
-        total_known = total or expected_frames
-        pct = (
-            max(0.0, min(100.0, frames / total_known * 100))
-            if total_known else 0.0
-        )
-        if final:
-            pct = 100.0
-        filled = int(bar_w * pct / 100)
-        bar = (
-            f"{DIM}[{RESET}{GREEN}{'█' * filled}{RESET}"
-            f"{DIM}{'░' * (bar_w - filled)}]{RESET}"
-        )
-        parts = [f"{BOLD}{pct:5.1f}%{RESET}"]
-        if not final and fps_val and fps_val > 0 and total_known:
-            remaining = max(0, (total_known - frames) / fps_val)
-            parts.append(f"{fmt_time(remaining)} left")
-            if source_fps > 0:
-                parts.append(f"{fps_val / source_fps:.2f}x")
-            parts.append(f"{fps_val:.1f}fps")
-        if not final and kbps:
-            parts.append(f"{kbps:.0f}kbps")
-        sys.stdout.write(
-            f"\r\033[K{label('encode')}CRF {BOLD}{crf_str(crf)}{RESET}"
-            f" {bar} {'  '.join(parts)}"
-        )
-        sys.stdout.flush()
-        rendered = True
-
-    show = show_progress and sys.stdout.isatty()
     # --progress 2's line. Under 1 frame per second the encoder states
     # frames per MINUTE ("fpm"), which a 4K encode at a slow preset
     # reaches. NO_COLOR below keeps ANSI colors out of the line (Windows
@@ -318,23 +326,21 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
     ffp = enc = None
     try:
         with open(ff_log, "wb") as ferr:
-            ffp = subprocess.Popen(ff_cmd, stdout=subprocess.PIPE, stderr=ferr)
+            ffp = subprocess.Popen(ff_cmd, stdout=subprocess.PIPE, stderr=ferr,
+                                   **own_process_group())
+            if job:
+                job.track(ffp)
             enc = subprocess.Popen(
                 enc_cmd, stdin=ffp.stdout,
                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                env={**os.environ, "NO_COLOR": "1"},
+                env={**os.environ, "NO_COLOR": "1"}, **own_process_group(),
             )
+            if job:
+                job.track(enc)
             ffp.stdout.close()  # let EPIPE reach ffmpeg if the encoder dies
 
-            # Render the 0% bar immediately: the encoder emits no progress
-            # until its lookahead fills, and decoding 4K ProRes into the
-            # pipe can take tens of seconds — a blank console reads as a
-            # hang.
-            if show:
-                render(0, 0, 0, 0)
-
             # Drain encoder stderr continuously (it floods \r progress
-            # lines); render at most ~5 bars/sec.
+            # lines).
             buf = b""
             while True:
                 chunk = enc.stderr.read(4096)
@@ -350,12 +356,12 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
                         continue
                     pm = prog_re.search(line)
                     if pm:
-                        if show and time.time() - last_render >= 0.2:
+                        if job:
                             per = 60 if pm.group(4) == b"m" else 1
-                            render(
-                                int(pm.group(1)),
-                                int(pm.group(2)) if pm.group(2) else 0,
-                                float(pm.group(3)) / per, float(pm.group(5)),
+                            done = int(pm.group(1)) * frame_s
+                            job.report(
+                                done, float(pm.group(3)) / per,
+                                int(float(pm.group(5)) * 125 * done),
                             )
                     else:
                         tail.append(line.decode("utf-8", "replace"))
@@ -363,11 +369,6 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
                             tail.pop(0)
             enc.wait()
             ffp.wait()
-            # The encoder's last progress line lands mid-GOP and its final
-            # summary lines don't match prog_re, so a successful encode
-            # would otherwise leave the bar frozen short of 100%.
-            if rendered and enc.returncode == 0 and ffp.returncode == 0:
-                render(0, 0, 0, 0, final=True)
     except BaseException:
         for p in (enc, ffp):
             if p is not None:
@@ -377,10 +378,6 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
                     pass
                 p.wait()
         raise
-    finally:
-        if rendered:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
 
     ff_err = ""
     try:
@@ -405,31 +402,54 @@ def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
     if not enc_out.exists() or enc_out.stat().st_size == 0:
         raise RuntimeError("Encoder produced no output")
 
-    if not full:
-        enc_out.replace(dest)
-        _temp_files.discard(enc_out)
+
+def _scratch(cfg, dest):
+    """The encoder's output file for dest. The standalone encoder reads
+    its output path as ANSI on Windows, and a full-encode dest carries
+    the source's (possibly non-Latin) stem, so every encode writes a
+    hash-named scratch file in the ASCII spelling of the cache root
+    (EssentialEngine.setup), renamed to dest by Python, which takes
+    Unicode paths."""
+    tag = hashlib.sha256(str(dest).encode("utf-8")).hexdigest()[:16]
+    enc_out = cfg["e_scratch"] / f"_enc_{tag}.tmp.ivf"
+    _temp_files.add(enc_out)
+    return enc_out
+
+
+def encode_essential(source, dest, meta, crf, cfg, show_progress=False,
+                     full=False):
+    """Encode `source` to AV1 at `crf` via SVT-AV1-Essential.
+
+    ffmpeg decodes (applying crop) and pipes 10-bit Y4M — Essential
+    rejects 8-bit input by design — into the encoder, which writes a
+    video-only IVF. A sample probe (full False) is that picture, renamed
+    to dest. A full-file output (full True) goes to core.chunks, which
+    encodes the picture in resumable pieces (encode_chunk_essential) and
+    muxes audio/subs/chapters back from the source.
+    """
+    if full:
+        chunks.encode_full(EssentialEngine(), source, dest, meta, crf, cfg,
+                           show_progress=show_progress)
         return
-
-    # Remux: AV1 video from the encoder + audio/subs/chapters/attachments
-    # from the source (shared with av1q's full encodes — the SRT/drop
-    # subtitle fallback ladder lives in core.segments). The encoder writes
-    # the picture from 0, so its start on the source's timeline comes from
-    # the source itself.
-    tmp_mkv = dest.with_suffix(".tmp.mkv")
-    _temp_files.add(tmp_mkv)
-    mux_with_source_streams(
-        enc_out, source, tmp_mkv,
-        start_ms=round(meta["picture_start"] * 1000),
-        mastering=meta.get("mastering"), cll=meta.get("cll"),
-    )
-
-    try:
-        enc_out.unlink()
-    except OSError:
-        pass
+    enc_out = _scratch(cfg, dest)
+    _encode_y4m(_feed_cmd(source, meta, None, False), meta, crf, cfg, enc_out)
+    enc_out.replace(dest)
     _temp_files.discard(enc_out)
-    tmp_mkv.replace(dest)
-    _temp_files.discard(tmp_mkv)
+
+
+def encode_chunk_essential(source, out, meta, crf, cfg, piece, job):
+    """Encode one piece of a full-file picture to `out` (Engine.
+    encode_chunk); piece None is the whole picture in one feed. The IVF
+    counts its frames from 0 whatever the piece, so chunk_start_us places
+    it on the joined timeline, and the joined picture's start against the
+    audio comes from the source (picture_start) at the mux."""
+    rate = _rate(meta) or _rate({"picture_rate": meta.get("fps")})
+    frame_s = rate[1] / rate[0] if rate else 0.0
+    enc_out = _scratch(cfg, out)
+    _encode_y4m(_feed_cmd(source, meta, piece, True), meta, crf, cfg,
+                enc_out, job, frame_s)
+    enc_out.replace(out)
+    _temp_files.discard(enc_out)
 
 
 class QuarterGrid(Grid):
@@ -481,7 +501,7 @@ class EssentialEngine(Engine):
     seed_key = "seed_crf"
     seed_prompt_hint = "(0.25 steps, Enter = auto)"
     cal_q_key = "at_crf"
-    needs_expected_frames = True
+    chunk_ext = ".ivf"  # the encoder's own output, pinned by --webm 0
     default_decay = ESSENTIAL_BITRATE_DECAY
 
     def cache_root(self, cfg):
@@ -549,6 +569,7 @@ class EssentialEngine(Engine):
         # decodes no frame, which no encode of it could survive either.
         timing = picture_timing(source)
         meta["picture_start"] = timing["start"]
+        meta["picture_start_pts"] = timing["start_pts"]
         meta["picture_rate"] = timing["rate"]
         # The HDR10 static metadata build_color_args restates. A failed
         # read raises too: the pipe carries no copy of its own.
@@ -560,15 +581,46 @@ class EssentialEngine(Engine):
         return clean_sample_source(concat, meta, cfg)
 
     def encode(self, source, dest, meta, q, cfg,
-               show_progress=False, expected_frames=0, resumable=False):
-        # resumable marks a full-file output. Its resume half does not
-        # apply: the standalone encoder writes its own container from a
-        # pipe, so there is no segment muxer to cut the encode at.
-        encode_essential(
-            source, dest, meta, q, cfg,
-            show_progress=show_progress, expected_frames=expected_frames,
-            full=resumable,
-        )
+               show_progress=False, resumable=False):
+        encode_essential(source, dest, meta, q, cfg,
+                         show_progress=show_progress, full=resumable)
+
+    def chunk_identity(self, meta, cfg):
+        # The pieces are cut on the feed's own frame grid, which the rate
+        # and the picture's first pts define (_feed_cmd). Without both
+        # there is no grid to cut on, and the picture stays in one piece.
+        if (not meta.get("picture_rate")
+                or meta.get("picture_start_pts") is None):
+            return None
+        return {"rate": meta["picture_rate"],
+                "start_pts": meta["picture_start_pts"]}
+
+    def encode_chunk(self, source, out, meta, q, cfg, piece, job):
+        encode_chunk_essential(source, out, meta, q, cfg, piece, job)
+
+    def chunk_start_us(self, meta, piece, out):
+        # The IVF counts from 0 and carries no timestamp to read back,
+        # so a piece is checked by its frame count: exactly the slots it
+        # was cut for (the last piece runs to the end, uncounted). The
+        # feed's trim closes at the next piece's first slot, so a
+        # keyframe that did not decode, or a feed or encoder that
+        # stopped early, leaves the piece short. Its start is its first
+        # slot, placed by the rate.
+        if piece is None or piece.start is None:
+            start = 0
+        else:
+            num, den = _rate(meta)
+            start = round(_slot(meta, piece.start) * den * 1_000_000 / num)
+        if piece is not None and piece.end is not None:
+            want = _slot(meta, piece.end) - _slot(meta, piece.start)
+            if segments.probe_packet_count(out) != want:
+                return None
+        return start
+
+    def mux_start_ms(self, meta):
+        # The encoder writes its picture from 0, so its start on the
+        # source's timeline comes from the source itself.
+        return round(meta["picture_start"] * 1000)
 
     def ssimu2_info(self, ref, dist, meta, cfg, ref_index=None):
         return ssimu2.ssimu2_info(ref, dist, meta, cfg, ref_index=ref_index)

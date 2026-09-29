@@ -84,7 +84,7 @@ class Engine:
     seed_key = None         # cfg key holding the user seed quantizer
     seed_prompt_hint = None  # dim hint in the interactive seed prompt
     cal_q_key = None        # quantizer field in the calibration block
-    needs_expected_frames = False  # engine's progress bar needs a frame count
+    chunk_ext = None        # container of a full encode's piece files
     # True when ffmpeg hands the encoder the HDR10 static metadata of
     # the first frame it decodes, so a failed read still leaves the
     # encode that copy. Without it a failed read would ship the encode
@@ -213,15 +213,44 @@ class Engine:
         return concat
 
     def encode(self, source, dest, meta, q, cfg,
-               show_progress=False, expected_frames=0, resumable=False):
+               show_progress=False, resumable=False):
         """Encode source to dest at quantizer q.
 
         resumable=True marks a full-file output encode (sample probes
-        never set it): dest gets the source's audio, subtitles, fonts and
-        chapters beside the picture, and the engine MAY route the encode
-        through an interrupted-encode resume path; engines without one
-        ignore that part."""
+        never set it): the engine hands it to core.chunks.encode_full,
+        which encodes the picture as resumable pieces through the chunk
+        seams below, and dest gets the source's audio, subtitles, fonts
+        and chapters beside it."""
         raise NotImplementedError
+
+    # The chunk seams core.chunks drives. A piece is a core.chunks.Piece,
+    # or None for the whole picture in one piece, which runs exactly the
+    # engine's single-pass encode.
+
+    def chunk_identity(self, meta, cfg):
+        """What this engine's pieces depend on beside its signature, the
+        quantizer and the plan, as a JSON dict for the work dir's
+        identity; None when this source cannot be split, and every full
+        encode of it runs as one piece."""
+        raise NotImplementedError
+
+    def encode_chunk(self, source, out, meta, q, cfg, piece, job):
+        """Encode one piece of the picture to `out` (a chunk_ext file),
+        present only once the encode finished cleanly. Every process it
+        starts goes to job.track, so an abort can stop it, and progress
+        to job.report as it goes. Raises on failure."""
+        raise NotImplementedError
+
+    def chunk_start_us(self, meta, piece, out):
+        """Where a finished piece's picture starts on the joined
+        timeline in µs, or None when `out` does not hold the span it was
+        cut for."""
+        raise NotImplementedError
+
+    def mux_start_ms(self, meta):
+        """The joined picture's start on the source's timeline, for the
+        final mux. Default None: the picture file carries it."""
+        return None
 
     def ssimu2_info(self, ref, dist, meta, cfg, ref_index=None):
         """Display-only SSIMULACRA2 measurement ({'mean','p5'} or None)."""

@@ -235,19 +235,26 @@ FLOOR_BOUND_KBPS_RATIO = 0.80
 # waived: there the extra probe still shrinks the final encode.
 ENDGAME_SNAP_GAIN = 0.03
 
-# Resumable segmented encodes. Full encodes of sources at least this long
-# are written as keyframe-aligned segment files that the muxer finalizes
-# as they complete, so an interrupted encode resumes at the last segment
-# boundary instead of restarting from frame 0. Below the gate the
-# segment/concat/remux overhead isn't worth the ~minutes it could save;
-# above it, a kill costs at most ~2 segments of work (the in-flight one
-# plus the boundary segment re-encoded for an exact seam). Segment length
-# is a policy constant, not a knob: 60s keeps the worst-case loss around
-# one percent of a feature while keeping the segment count (and concat
-# list) small. Cuts land on the first keyframe at/after each multiple, so
-# real segments run a few seconds over (SVT's default keyint is ~5-7s).
+# Chunked full encodes (core/chunks.py). A full encode is split into
+# pieces of about CHUNK_TIME seconds, each encoded by its own encoder
+# process, several at once, then joined. A finished piece survives a kill,
+# so an interrupted encode loses only the pieces in flight. Sources at
+# least RESUMABLE_MIN_DURATION long are always split, for that resume;
+# shorter ones only when more than one encoder runs, for the speed. With
+# one encoder below the gate the split buys nothing a single pass lacks.
+# Cuts land on the first source keyframe at or after each multiple of
+# CHUNK_TIME, so real pieces run a little over. Each seam starts a new
+# encoder keyframe and lookahead, a small size cost that 60s keeps near
+# one keyframe a minute, while a kill loses about a minute per encoder.
 RESUMABLE_MIN_DURATION = 900.0
-SEGMENT_TIME = 60
+CHUNK_TIME = 60
+
+# Logical threads per encoder when the run picks its encoder count
+# (--workers overrides it). SVT-AV1 sizes its own thread pool from the
+# machine's core count and uses about 16 cores well at 1080p on presets
+# 4 to 6 (its own FAQ), so a 32-thread machine runs two encoders at once
+# and a 16-thread one keeps a single encoder.
+WORKER_THREADS = 16
 
 # Scaled-down sampling plan for short files. Files at or under the
 # configured plan's threshold used to fall straight to full-file search,

@@ -121,24 +121,10 @@ def detect_scenes(source, cfg, duration=None, profile=None):
         _temp_files.discard(log)
 
 
-def read_packets(source, duration=None, start_time=0.0):
-    """Every v:0 packet as (time, size, is_key), demux only — no decode,
-    so it runs at I/O speed even on long 4K sources. None when the
-    stream can't be read (the reason is printed).
-
-    time is the packet's pts, or its dts when it has none (a decoder
-    fills in the same way); a packet with neither is skipped. Keyframe
-    packets (ffprobe's K flag) stand in for I-frames.
-
-    ffprobe prints raw stream timestamps, but ffmpeg subtracts the
-    container's start time (probe_video's start_time) from everything it
-    reads: the scene scan's cut times and every -ss seek count from it.
-    Subtracting it here puts every time this module stores on that one
-    timeline. With raw times on a source that starts late (MPEG-TS
-    commonly does), a clip's seek misses its keyframe by start_time, so
-    stream copy keeps up to a GOP of pre-roll, and each scene is ranked
-    by the complexity of the window start_time before it.
-    """
+def _packet_rows(source, duration):
+    """Every v:0 packet in file (decode) order as (pts, dts, size,
+    is_key), demux only, with None for a timestamp ffprobe prints as
+    N/A. None when the stream can't be read (the reason is printed)."""
     timeout = scan_budget(duration)
     try:
         r = subprocess.run(
@@ -159,26 +145,98 @@ def read_packets(source, duration=None, start_time=0.0):
         _fail("packet scan", r)
         return None
 
-    packets = []
+    def num(v):
+        try:
+            return float(v)
+        except ValueError:
+            return None  # N/A: no timestamp of this kind
+
+    rows = []
     for line in (r.stdout or "").splitlines():
         fields = line.split(",")
         if len(fields) < 4:
             continue
         pts, dts, size, flags = fields[:4]
-        t = None
-        for v in (pts, dts):
-            try:
-                t = float(v)
-                break
-            except ValueError:
-                continue  # N/A: no timestamp of this kind
         try:
             size = int(size)
         except ValueError:
             continue
-        if t is not None:
-            packets.append((t - start_time, size, "K" in flags))
-    return packets
+        rows.append((num(pts), num(dts), size, "K" in flags))
+    return rows
+
+
+def read_packets(source, duration=None, start_time=0.0):
+    """Every v:0 packet as (time, size, is_key), demux only — no decode,
+    so it runs at I/O speed even on long 4K sources. None when the
+    stream can't be read (the reason is printed).
+
+    time is the packet's pts, or its dts when it has none (a decoder
+    fills in the same way); a packet with neither is skipped. Keyframe
+    packets (ffprobe's K flag) stand in for I-frames.
+
+    ffprobe prints raw stream timestamps, but ffmpeg subtracts the
+    container's start time (probe_video's start_time) from everything it
+    reads: the scene scan's cut times and every -ss seek count from it.
+    Subtracting it here puts every time this module stores on that one
+    timeline. With raw times on a source that starts late (MPEG-TS
+    commonly does), a clip's seek misses its keyframe by start_time, so
+    stream copy keeps up to a GOP of pre-roll, and each scene is ranked
+    by the complexity of the window start_time before it.
+    """
+    rows = _packet_rows(source, duration)
+    if rows is None:
+        return None
+    return [
+        ((pts if pts is not None else dts) - start_time, size, key)
+        for pts, dts, size, key in rows
+        if pts is not None or dts is not None
+    ]
+
+
+# A step between packets in decode order that ffmpeg treats as a
+# timestamp discontinuity and repairs, when -copyts does not stop it: a
+# decode time more than 10s past the last one (its dts_delta_threshold)
+# or more than 0.1s before it (fftools/ffmpeg_demux.c). A packet with no
+# decode time is placed by its presentation time, which legitimately
+# steps back by the reorder delay, so a step back there counts only past
+# one second, longer than any B-frame pyramid holds a frame.
+TS_JUMP_FORWARD = 10.0
+TS_JUMP_BACK = 0.1
+TS_JUMP_BACK_PTS = 1.0
+
+
+def read_timeline(source, duration=None, start_time=0.0):
+    """The v:0 timeline a split encode cuts on, as (keyframes, jump):
+    the sorted keyframe times on read_packets' timeline, and the time of
+    the first timestamp discontinuity, None when there is none. None
+    when the stream can't be read (the reason is printed).
+
+    A split encode cuts the picture by presentation time with -copyts,
+    which switches ffmpeg's discontinuity repair off, while the audio is
+    muxed without it and repaired. A timeline that jumps therefore cannot
+    be split: a piece's picture would sit on the raw timeline the audio
+    no longer follows, and a jump back would put frames inside a span
+    another piece already closed.
+    """
+    rows = _packet_rows(source, duration)
+    if rows is None:
+        return None
+    keyframes = []
+    jump = None
+    prev = prev_is_dts = None
+    for pts, dts, _, key in rows:
+        t = dts if dts is not None else pts
+        if t is None:
+            continue
+        if key:
+            keyframes.append((pts if pts is not None else dts) - start_time)
+        if jump is None and prev is not None:
+            back = (TS_JUMP_BACK if dts is not None and prev_is_dts
+                    else TS_JUMP_BACK_PTS)
+            if t - prev > TS_JUMP_FORWARD or t - prev < -back:
+                jump = t - start_time
+        prev, prev_is_dts = t, dts is not None
+    return sorted(keyframes), jump
 
 
 def window_of(t):

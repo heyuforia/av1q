@@ -28,7 +28,7 @@ For every file:
 - **Hardware-accelerated decoding.** CUDA, D3D11VA (Windows), VideoToolbox (macOS), and VAAPI (Linux) speed up quality measurement and scene detection. Encoding itself is always CPU.
 - **Optional auto-crop.** `--auto-crop` detects letterbox and pillarbox bars before each encode, or use the standalone `av1q-crop.py` to pre-scan a library. Confidence-gated, so ambiguous detections are never silently applied.
 - **File-based caching.** Analysis and measurements are reused on later runs, and interrupted searches resume where they left off.
-- **Resumable encodes.** Full encodes of sources 15 minutes and longer are written as finalized segments, so an interrupted encode picks up at the last finished segment instead of restarting from frame 0 (disable with `--no-resume`).
+- **Parallel, resumable encodes.** Full encodes are split at source keyframes into pieces of about a minute, and several SVT-AV1 encoders work on one file at once on a machine with the threads for it (`--workers`), since one encoder stops scaling at about 16 cores. Sources 15 minutes and longer are always split, so an interrupted encode keeps its finished pieces instead of restarting from frame 0 (disable with `--no-resume`).
 - **Batch processing** with recursive subdirectory support.
 - **Cross-platform.** Windows, macOS, Linux.
 
@@ -121,16 +121,17 @@ python av1q.py
 | `--dry-run` | | Find optimal CQ but skip final encoding |
 | `--auto-crop` | | Detect letterbox/pillarbox inline before each encode |
 | `--no-crops` | | Ignore crop sidecars (auto-applied by default) |
-| `--no-resume` | | Disable resumable segmented encoding for long sources |
+| `--workers` | One per 16 logical threads | Encoders run side by side, each on its own piece of the file |
+| `--no-resume` | | Encode every file in one piece by one encoder, with no resume after an interruption |
 
 ## How it works
 
 The search is adaptive, similar to Newton's method: it converges on the right CQ in 2 to 4 iterations instead of testing every value.
 
 1. **Analyze.** Scene detection finds visually distinct segments, and packet-size analysis ranks them by complexity. The scene scan decodes at a reduced resolution, and the ranking reads the container without decoding, so this stays fast on long 4K sources. The analysis is stored once per source and reused by every later run.
-2. **Sample.** The most complex scenes are cut out and concatenated into one short clip. A clip can only start on a keyframe, so a scene with no keyframe near its start is cut from the keyframe before it, and its clip opens with a few seconds of the shot before. The number of scenes sampled grows with duration, so a feature-length film is represented as well as a short one. Files roughly 15 to 60 seconds long get a smaller plan of 3 scenes at 2 seconds each. Files at 15 seconds and under skip sampling and search on the full file, where a probe would cover most of the file anyway.
+2. **Sample.** The runtime is split into equal slots, and the most complex scene in each slot is cut out, so a long shot gets as many samples as the time it fills. The pieces are concatenated into one short clip. A clip can only start on a keyframe, so a scene with no keyframe near its start is cut from the keyframe before it, and its clip opens with a few seconds of the shot before. The number of scenes sampled grows with duration, so a feature-length film is represented as well as a short one. Files roughly 15 to 60 seconds long get a smaller plan of 3 scenes at 2 seconds each. Files at 15 seconds and under skip sampling and search on the full file, where a probe would cover most of the file anyway.
 3. **Search.** The sample is encoded at a seed CQ derived from the source's bitrate headroom over the floor, VMAF is measured, and the next CQ is estimated from the slope of quality against CQ. The search also tracks the bitrate floor and estimates a ceiling from the measured data, so it never jumps past it. When the floor is the binding constraint rather than VMAF, the search switches to bitrate targeting: it measures the exact bitrate decay rate for the content and interpolates to the CQ that lands on the floor.
-4. **Encode.** The full video is encoded at the best CQ found.
+4. **Encode.** The full video is encoded at the best CQ found, in pieces cut at source keyframes and joined with their original timestamps, several encoders at once when the machine has the threads.
 5. **Verify and refine.** Full-file VMAF and bitrate are checked against their targets. P5 is measured and reported but is not a gate. A miss in either direction triggers a corrective re-encode: a shortfall lowers the CQ, while VMAF landing well above target with bitrate headroom to spare raises it to reclaim wasted bitrate. Each jump is sized from the measured slopes and converges in 1 or 2 passes. A re-encode predicted to trim less than about 3% of bitrate is skipped as costing more than it saves.
 6. **Calibrate.** Sample-to-full deltas (bitrate ratio, VMAF offset, quality slope, bitrate decay) are cached per file and rolled into cross-file averages. Re-runs of the same file, and new files once a few have been processed, aim at the right CQ on the first probe. The cross-file averages live in the `_learned` folder next to the script, apart from `_cache`, so clearing the cache keeps what past encodes taught. Delete `_learned` to start fresh.
 

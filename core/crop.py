@@ -359,7 +359,14 @@ def _scan_windows(source, meta, cfg, file_hash):
         scenes, complexity, keyframes = scene_analysis(
             source, meta, cfg, file_hash
         )
-        scoped = [s for s in scenes if safe_start <= s["time"] <= safe_end]
+        # Each scene ends at the safe range's end too: a slot with no
+        # scene opening scans inside the scene running through it, and a
+        # last scene running to the end of the file would put that
+        # window in the credits.
+        scoped = [
+            {**s, "duration": min(s["duration"], safe_end - s["time"])}
+            for s in scenes if safe_start <= s["time"] <= safe_end
+        ]
         if scoped:
             samples = select_samples(
                 scoped, complexity, duration, cfg["sample_count"], keyframes,

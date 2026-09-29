@@ -9,9 +9,9 @@ import time
 
 from .analyze import span_complexity, window_of
 from .constants import (
-    MIN_SCENE_DURATION, MINI_SAMPLE_COUNT, MINI_SAMPLE_DURATION,
-    MINI_SAMPLE_MIN_RATIO, SAMPLE_COUNT_MAX, SAMPLE_MIN_RATIO, SAMPLE_SCALE_K,
-    SAMPLE_SCALE_REF,
+    COMPLEXITY_WINDOW, MIN_SCENE_DURATION, MINI_SAMPLE_COUNT,
+    MINI_SAMPLE_DURATION, MINI_SAMPLE_MIN_RATIO, SAMPLE_COUNT_MAX,
+    SAMPLE_MIN_RATIO, SAMPLE_SCALE_K, SAMPLE_SCALE_REF,
 )
 from .probe import high_bit_depth
 from .tools import ffmpeg_exe
@@ -100,11 +100,12 @@ def choose_samples(plan, scenes, complexity, keyframes, duration, cfg):
             candidates, complexity, duration, count, keyframes, select_cfg,
         )
         even = not candidates
-        # A degenerate scene list can't fill the plan: select_samples
-        # picks each distinct scene at most once, so a source with a lone
-        # detected cut yields a single clip, and betting the whole search
-        # on it is how one near-static scene misreads a high-bitrate
-        # source as floor-bound. Too few scene samples → re-select evenly
+        # A degenerate scene list can't fill the plan: a slot whose
+        # picture is all scenes too short to sample borrows an opening
+        # from elsewhere, so a fast-cut source with one or two sampleable
+        # scenes runs out of them, and betting the whole search on one is
+        # how a near-static scene misreads a high-bitrate source as
+        # floor-bound. Too few scene samples → re-select evenly
         # spaced (mirrors the count//2 guard on select_samples' keyframe
         # path; the max(2, ·) stops mini plans from riding on a single
         # clip, min(count, ·) keeps 1-sample plans valid). The even picks
@@ -154,7 +155,13 @@ def sampleable(scenes, cfg):
 
 
 def select_samples(scenes, complexity, duration, count, keyframes, cfg):
-    """Select representative sample segments for quality estimation."""
+    """Select representative sample segments for quality estimation.
+
+    The runtime is cut into `count` equal slots and each slot gives one
+    stretch of its own picture, so the sample follows screen time: the
+    hottest scene opening in the slot, else the hottest stretch of the
+    scene running through it. Only a slot holding nothing sampleable
+    borrows an unused opening from elsewhere."""
     if duration < cfg["short_threshold"]:
         return None
 
@@ -202,6 +209,35 @@ def select_samples(scenes, complexity, duration, count, keyframes, cfg):
     if not scored:
         return select_samples([], complexity, duration, count, keyframes, cfg)
 
+    def running_through(start, end):
+        """Stretches of [start, end) inside a scene that opened before
+        it: from the slot's start, from each complexity window boundary,
+        and from the last start that still ends inside the slot (or the
+        slot's start, when the slot is too narrow to hold one).
+        Borrowing an opening from elsewhere instead drains every such
+        slot into the file's short scenes: a 430s shot, 93% of one file,
+        got one 6s clip and its intro and outro got the other seven."""
+        out = []
+        for sc in sampleable(scenes, cfg):
+            sc_end = sc["time"] + sc["duration"]
+            if (sc["time"] >= start
+                    or sc_end - start < cfg["min_scene_duration"]):
+                continue
+            dur = min(sample_dur, sc_end - start)
+            last = max(start, min(end, sc_end) - dur)
+            times = {start, last}
+            w = window_of(start) + COMPLEXITY_WINDOW
+            while w < last:
+                times.add(w)
+                w += COMPLEXITY_WINDOW
+            for t in sorted(times):
+                value, _ = span_complexity(comp_map, t, t + dur)
+                out.append({
+                    "time": t, "duration": dur,
+                    "complexity": neutral if value is None else value,
+                })
+        return out
+
     seg = duration / count
     selected = []
     used = set()
@@ -209,6 +245,7 @@ def select_samples(scenes, complexity, duration, count, keyframes, cfg):
         start, end = i * seg, (i + 1) * seg
         cands = (
             [s for s in scored if start <= s["time"] < end and s["time"] not in used]
+            or running_through(start, end)
             or [s for s in scored if s["time"] not in used]
         )
         if cands:
@@ -357,6 +394,19 @@ def plan_clips(scenes, keyframes):
 PRE_SEEK = 1.0
 
 
+def keyframe_seek(start, keyframes):
+    """An input -ss that lands at or before the keyframe `start` on every
+    container, as (seek, mid), or None when `start` is the first
+    keyframe, which reading from the start reaches. mid is the point
+    halfway back to the previous keyframe; see cut_window for why the
+    seek aims there."""
+    j = bisect.bisect_left(keyframes, start)
+    if j == 0:
+        return None
+    mid = (keyframes[j - 1] + start) / 2
+    return max(0.0, math.floor((mid - PRE_SEEK) * 1000) / 1000), mid
+
+
 def cut_window(start, stop, keyframes):
     """Where ffmpeg seeks, gates and stops to stream-copy the picture in
     [start, stop), start being a keyframe (clip_span): (seek, gate,
@@ -386,13 +436,12 @@ def cut_window(start, stop, keyframes):
         # No keyframe list (the packet scan failed): seek at the scene
         # time and accept whatever pre-roll the landing brings.
         return math.ceil(start * 1000 + 1e-3) / 1000, None, stop - start
-    j = bisect.bisect_left(keyframes, start)
-    if j == 0:
+    landing = keyframe_seek(start, keyframes)
+    if landing is None:
         # The first keyframe is the first packet: reading from the start
         # lands on it in every container, and nothing precedes it.
         return 0.0, None, stop
-    mid = (keyframes[j - 1] + start) / 2
-    seek = max(0.0, math.floor((mid - PRE_SEEK) * 1000) / 1000)
+    seek, mid = landing
     gate = math.floor((mid - seek) * 1000) / 1000
     return seek, gate, stop - (seek + gate)
 

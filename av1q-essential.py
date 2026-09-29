@@ -53,6 +53,7 @@ from av1q import (
     load_crop_sidecar, detect_crop_for_file,
 )
 from core import search as core_search
+from core.chunks import default_workers
 from core import pipeline as core_pipeline
 from core import vmaf as core_vmaf
 from core.engines.essential import (
@@ -218,6 +219,19 @@ def main():
         help="Find optimal CRF but skip final encoding",
     )
     parser.add_argument(
+        "--no-resume", action="store_true",
+        help="Encode every file in one piece by one encoder: an "
+             "interrupted encode restarts from the beginning, and no "
+             "encoders run side by side (by default long files, and "
+             "shorter ones when --workers is above 1, are encoded in "
+             "pieces, and an interrupted encode keeps its finished ones)",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=None,
+        help="Encoders run side by side, each on its own piece of the "
+             "file (default: one per 16 logical threads, at least 1)",
+    )
+    parser.add_argument(
         "--no-crops", action="store_true",
         help="Ignore crop sidecars in _cache/_crop (otherwise auto-applied "
              "when present and confidence=high)",
@@ -281,6 +295,8 @@ def main():
         parser.error("--metric-every must be >= 1")
     if args.samples < 1:
         parser.error("--samples must be >= 1")
+    if args.workers is not None and args.workers < 1:
+        parser.error("--workers must be >= 1")
     # `0 <` also rejects nan; without this a --vmaf 0 would silently fall
     # through to the automatic per-resolution target.
     if args.vmaf is not None and not 0 < args.vmaf <= 100:
@@ -350,6 +366,8 @@ def main():
         "force_q": force_crf,
         "enc_args": enc_args,
         "enc_args_sig": enc_args_sig,
+        "resume_encodes": not args.no_resume,
+        "workers": args.workers or default_workers(),
         "sample_count": args.samples,
         "sample_duration": SAMPLE_DURATION,
         "min_scene_duration": MIN_SCENE_DURATION,

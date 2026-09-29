@@ -48,7 +48,7 @@ from .crop import (
     crop_scan_cfg, crop_token, detect_crop_for_file, load_crop_sidecar,
     read_crop_sidecar, sidecar_crop, sidecar_path,
 )
-from .probe import parse_rate, probe_video, res_tier
+from .probe import probe_video, res_tier
 from .sampling import (
     choose_samples, complexity_bias, complexity_bias_margin, extract_samples,
     sampling_plan,
@@ -136,6 +136,10 @@ def process_videos(cfg, engine):
     local_ff = local_ffmpeg_dir()
     notes = [f"ffmpeg: {local_ff}"] if local_ff else []
     notes += engine.launch_notes(cfg)
+    # More than one encoder at once is a choice of this machine's size
+    # (or --workers), invisible otherwise.
+    if cfg["resume_encodes"] and cfg["workers"] > 1:
+        notes.append(f"encoders: {cfg['workers']} at once")
     if notes:
         for note in notes:
             print(f"{DIM}{note}{RESET}")
@@ -497,12 +501,6 @@ def process_videos(cfg, engine):
             if hdr_note:
                 print(f"{label('hdr')}{DIM}{hdr_note}{RESET}")
 
-            expected_frames = 0
-            if engine.needs_expected_frames:
-                fps_f = parse_rate(meta.get("fps"))
-                if fps_f and meta["duration"] > 0:
-                    expected_frames = int(meta["duration"] * fps_f)
-
             # Which settings made the file at each output name. A name
             # carries only the quantizer and the crop, so a file another
             # run left under other settings (film grain, preset, tune)
@@ -554,8 +552,7 @@ def process_videos(cfg, engine):
                 t0 = time.time()
                 engine.encode(
                     filepath, d, meta, q, cfg,
-                    show_progress=True, expected_frames=expected_frames,
-                    resumable=True,
+                    show_progress=True, resumable=True,
                 )
                 t_enc += time.time() - t0
                 record_output(q)
@@ -564,7 +561,7 @@ def process_videos(cfg, engine):
 
             # Forced mode: one full encode at the user's quantizer and
             # done. Probe/crop/gate/meta prep above still apply (they are
-            # source facts, not search machinery); segments still resume;
+            # source facts, not search machinery); pieces still resume;
             # nothing downstream runs — no sampling, search, VMAF, SSIMU2,
             # calibration, or refine. Deliberate differences from the
             # searched path: `recommended` is neither read nor written
