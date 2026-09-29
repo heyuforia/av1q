@@ -10,11 +10,9 @@ from .constants import (
 from .util import atomic_write_json, clamp
 
 
-def load_global_calibration(root):
-    """Load cross-file rolling averages used as defaults for new files,
-    from an engine's calibration root (Engine.calibration_root). A
-    missing, unreadable or malformed file is an empty cohort."""
-    path = root / "_global_calibration.json"
+def _read_object(path):
+    """A JSON file's object; {} when the file is missing, unreadable or
+    holds anything but an object."""
     if not path.exists():
         return {}
     try:
@@ -22,6 +20,34 @@ def load_global_calibration(root):
     except (ValueError, OSError):
         return {}
     return g if isinstance(g, dict) else {}
+
+
+def load_global_calibration(root):
+    """Load cross-file rolling averages used as defaults for new files,
+    from an engine's calibration root (Engine.calibration_root). A
+    missing, unreadable or malformed file is an empty cohort."""
+    return _read_object(root / "_global_calibration.json")
+
+
+def record_sample_pair(root, key, fields):
+    """Add one file's sample→full pair to the engine's pair log, beside
+    the cohort: `fields` join the entry under `key` (the file and its
+    encode settings), replacing the values it already holds.
+
+    The cohort keeps running averages only, and the per-file cache that
+    holds a file's own reading goes when the cache is deleted, so this
+    log is the one place a file's measured selection bias sits beside
+    the offset and ratio its verify read and the aim the search took.
+    It is the evidence the cold-start laws (scene_offset_center, the
+    shrink target of ratio_prior) can be checked against. Nothing reads
+    it at run time. A missing, unreadable or malformed log starts empty;
+    an entry that is not an object is replaced."""
+    path = root / "_sample_pairs.json"
+    log = _read_object(path)
+    prev = log.get(key)
+    log[key] = {**(prev if isinstance(prev, dict) else {}), **fields}
+    root.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, log)
 
 
 def file_calibration(cache, enc_tag):
@@ -108,30 +134,39 @@ def cohort_keys(quantity, even, mini=False):
     return (_EVEN_KEYS if even else _SCENE_KEYS)[quantity]
 
 
-def pair_sampled_as(per_file_cal, even, mini):
+def pair_sampled_as(per_file_cal, even, mini, sample):
     """True when the block's sample→full pair (its ratio and offset) was
-    measured under this sampling mode and plan.
+    measured under this sampling mode and plan, on these clips (`sample`,
+    sampling.sample_identity).
 
     The pair is the file's own reading of the population its cohort
     keys name, so it answers only a search that samples the same way: a
     scene pair read on a run that sampled evenly (a scene scan that
     failed once) charges that run the selection bias its sample does not
-    carry. A block that never recorded its mode matches none."""
+    carry. It is also a reading of one picture: after the picks change
+    (--samples, the scene threshold, the selection rule) its offset
+    belongs to clips no longer in the sample, and a real file's +1.30,
+    read off clips that missed its one long shot, would have aimed the
+    sample that holds that shot high. A block that never recorded its
+    mode or its clips matches none."""
     return (
         isinstance(per_file_cal, dict)
         and per_file_cal.get("even") is bool(even)
         and per_file_cal.get("mini") is bool(mini)
+        and isinstance(sample, str)
+        and per_file_cal.get("sample") == sample
     )
 
 
 def calibration_offset(per_file_cal, global_cal, prior_center=0.0, even=False,
-                       mini=False):
+                       mini=False, sample=None):
     """Pick the sample→full VMAF offset used to aim the sample search.
 
     Per-file calibration is a direct measurement of this exact file and is
-    trusted as-is when its pair was sampled the same way (pair_sampled_as).
-    The cohort average is indirect evidence (other files' offsets), so
-    it's shrunk toward prior_center by n/(n+COHORT_SHRINK_K).
+    trusted as-is when its pair was sampled the same way, on the same
+    clips (pair_sampled_as). The cohort average is indirect evidence
+    (other files' offsets), so it's shrunk toward prior_center by
+    n/(n+COHORT_SHRINK_K).
 
     prior_center is the structural expectation for the sampling mode:
     complexity-selected samples are the file's hardest scenes and read
@@ -142,16 +177,18 @@ def calibration_offset(per_file_cal, global_cal, prior_center=0.0, even=False,
     each; with no cohort at all the center itself is the best estimate
     and is returned directly.
 
-    `even` and `mini` are how this search sampled. They pick which cohort
-    to read (see cohort_keys) and which per-file pair counts: the
+    `even` and `mini` are how this search sampled, and `sample` the clips
+    it sampled (sampling.sample_identity; None for unknown, which no
+    per-file pair answers). The mode and plan pick which cohort to read
+    (see cohort_keys), and all three which per-file pair counts: the
     sampling modes and plans measure different populations and never
-    share a value.
+    share a value, and a pair of other clips measured another picture.
 
     Returns (offset, source_label); (None, None) when neither source has
     a usable value and the center is 0. Values outside ±OFFSET_MAX are
     treated as corrupt and skipped.
     """
-    if pair_sampled_as(per_file_cal, even, mini):
+    if pair_sampled_as(per_file_cal, even, mini, sample):
         o = per_file_cal.get("vmaf_offset")
         if isinstance(o, (int, float)) and -OFFSET_MAX <= o <= OFFSET_MAX:
             return float(o), "per-file"
@@ -278,15 +315,17 @@ def vmaf_slope_prior(per_file_cal):
 RATIO_MIN, RATIO_MAX = 0.5, 1.3
 
 
-def ratio_prior(per_file_cal, global_cal, margin, even=False, mini=False):
+def ratio_prior(per_file_cal, global_cal, margin, even=False, mini=False,
+                sample=None):
     """Pick the sample→full bitrate ratio for the search's floor threshold,
     the one ratio effective_sample_floor divides the floor by.
 
     Mirrors calibration_offset: a per-file measured ratio is a direct
     measurement of this file and trusted as-is when its pair was sampled
-    the same way (pair_sampled_as); the cohort average is shrunk toward
-    the margin-implied ratio (1/margin — what effective_sample_floor
-    would otherwise assume) by n/(n+COHORT_SHRINK_K).
+    the same way, on the same clips (pair_sampled_as); the cohort
+    average is shrunk toward the margin-implied ratio (1/margin — what
+    effective_sample_floor would otherwise assume) by
+    n/(n+COHORT_SHRINK_K).
 
     This is the cross-file half of the sample→full bitrate calibration. The
     cohort already learns the ratio after every file
@@ -306,12 +345,13 @@ def ratio_prior(per_file_cal, global_cal, margin, even=False, mini=False):
     shrinking toward it would hold every even-sampled file's threshold
     ~5% above the truth no matter how much evidence accumulated. `mini`
     picks the mini-plan cohort of the same mode; the centers are the same.
-    Both also pick which per-file pair counts.
+    Both also pick which per-file pair counts, with `sample`, the clips
+    this search sampled (as in calibration_offset).
 
     Returns (ratio, source_label); (None, None) when neither source has a
     usable value (the search then falls back to the raw margin).
     """
-    if pair_sampled_as(per_file_cal, even, mini):
+    if pair_sampled_as(per_file_cal, even, mini, sample):
         r = per_file_cal.get("ratio")
         if isinstance(r, (int, float)) and RATIO_MIN <= r <= RATIO_MAX:
             return float(r), "per-file"

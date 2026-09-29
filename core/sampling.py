@@ -631,3 +631,21 @@ def clean_sample_source(concat, meta, cfg):
             pass
         _temp_files.discard(tmp)
         return None
+
+
+def sample_identity(sample_src):
+    """Which clips a search source holds, as a short stable tag: a digest
+    of its file name, which extract_samples keys by the source's hash and
+    the scene signature of its picks (a partial clip set by a per-run
+    name), and which clean_sample_source derives from the concat's.
+
+    A sample probe's name carries it, so a probe a stopped search made
+    from other clips is never taken for one of these, and so does the
+    calibration pair, which answers only a search on the same clips.
+    The name, never the size: a finished file deletes its sample, and
+    the next cut of the same picks can differ by container bytes across
+    ffmpeg builds while holding the same picture. A digest because the
+    full name would push a probe's path toward Windows' 260-character
+    limit.
+    """
+    return hashlib.sha256(sample_src.name.encode("utf-8")).hexdigest()[:10]

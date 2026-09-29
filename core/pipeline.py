@@ -34,8 +34,8 @@ from .cache import load_cache, recommended_matches
 from .calibrate import (
     DECAY_MAX, DECAY_MIN, OFFSET_MAX, RATIO_MAX, RATIO_MIN,
     calibration_offset, decay_prior, file_calibration, ratio_prior,
-    load_global_calibration, pair_sampled_as, scene_offset_center,
-    update_global_calibration, vmaf_slope_prior,
+    load_global_calibration, pair_sampled_as, record_sample_pair,
+    scene_offset_center, update_global_calibration, vmaf_slope_prior,
 )
 from .constants import (
     BITRATE_BAND, COMPLEXITY_MARGIN_FLOOR, DEFAULT_VMAF_SLOPE,
@@ -51,7 +51,7 @@ from .crop import (
 from .probe import probe_video, res_tier
 from .sampling import (
     choose_samples, complexity_bias, complexity_bias_margin, extract_samples,
-    sampling_plan,
+    sample_identity, sampling_plan,
 )
 from .tools import have_ffmpeg, local_ffmpeg_dir, missing_ffmpeg_components
 from .ui import (
@@ -678,7 +678,10 @@ def process_videos(cfg, engine):
                     f" from previous search{seed_note}"
                 )
 
-            sample_clips = sample_src = sample_at_best = None
+            sample_clips = sample_src = sample_id = sample_at_best = None
+            # What the sample search aimed with, kept for the pair log
+            # (record_sample_pair): a resume never sees these.
+            sample_aim = {}
             # Evenly spaced samples (intra-only sources, no detected
             # scenes, a thin scene list) are representative, not
             # complexity-biased: the sample→full bitrate ratio is ~1.0, so
@@ -730,6 +733,7 @@ def process_videos(cfg, engine):
                         # Named while the file exists (the name carries
                         # its size); deleted with it below.
                         sample_idx = engine.sample_ref_index(cfg, sample_src)
+                        sample_id = sample_identity(sample_src)
             elif existing_q is None:
                 print(f"{label('short')}≤{mini_min:.0f}s, full VMAF")
 
@@ -744,9 +748,13 @@ def process_videos(cfg, engine):
                     return sample_enc_cache[q]
                 if not sample_src or not sample_src.exists():
                     raise RuntimeError("Sample source missing")
+                # The name carries the clips (sample_identity): a probe a
+                # stopped search made from other picks is another
+                # picture, and measured as this sample's it would steer
+                # the search by a score of clips no longer in it.
                 d = sample_enc_dir / (
-                    f"sample_enc_{file_hash[:8]}_{enc_tag}_{grid.fmt(q)}"
-                    f"{engine.sample_ext}"
+                    f"sample_enc_{file_hash[:8]}_{sample_id}_{enc_tag}"
+                    f"_{grid.fmt(q)}{engine.sample_ext}"
                 )
                 # A probe a stopped search left on disk is reused, except
                 # under --overwrite: it is an earlier run's encode, like
@@ -805,14 +813,15 @@ def process_videos(cfg, engine):
                 # full VMAF) so the sample search aims at the quantizer
                 # that will hit `target` on the full video. The file's own
                 # offset takes precedence when its pair was sampled the
-                # same way as this search; otherwise we fall back to the
-                # cohort average, blended toward this file's structural
-                # center — for complexity-selected samples that is
-                # SCENE_OFFSET_PRIOR scaled by the bias actually measured
-                # above (scene_offset_center), for evenly-spaced ones it
-                # is 0. Each mode reads its OWN cohort: the scene
-                # cohort's whole content is scene-selection bias, which
-                # doesn't apply to an evenly-spaced sample.
+                # same way as this search, on the same clips; otherwise we
+                # fall back to the cohort average, blended toward this
+                # file's structural center — for complexity-selected
+                # samples that is SCENE_OFFSET_PRIOR scaled by the bias
+                # actually measured above (scene_offset_center), for
+                # evenly-spaced ones it is 0. Each mode reads its OWN
+                # cohort: the scene cohort's whole content is
+                # scene-selection bias, which doesn't apply to an
+                # evenly-spaced sample.
                 sample_target = target
                 off, off_src = calibration_offset(
                     file_cal, global_cal,
@@ -820,7 +829,7 @@ def process_videos(cfg, engine):
                         0.0 if even_sampling
                         else scene_offset_center(bias, cfg["bitrate_margin"])
                     ),
-                    even=even_sampling, mini=mini_sampling,
+                    even=even_sampling, mini=mini_sampling, sample=sample_id,
                 )
                 if off is not None and abs(off) >= cfg["vmaf_tolerance"]:
                     sample_target = clamp(target + off, 0.0, 100.0)
@@ -863,17 +872,18 @@ def process_videos(cfg, engine):
 
                 # Sample→full ratio for the floor search, the only one it
                 # uses: the file's own when its pair was sampled the same
-                # way as this search, else the cohort's, so a fresh file
-                # aims at the learned floor instead of paying the
-                # conservative-margin tax. Each sampling mode reads its own
-                # cohort: evenly-spaced files used to be denied a cohort
-                # entirely and stayed pinned to EVEN_SAMPLE_MARGIN's implied
-                # ratio however many of them had been measured — a fixed 5%
-                # cushion that on a real file sat 9% off the truth, capped
-                # the search a step early and cost a second full encode.
+                # way as this search, on the same clips, else the cohort's,
+                # so a fresh file aims at the learned floor instead of
+                # paying the conservative-margin tax. Each sampling mode
+                # reads its own cohort: evenly-spaced files used to be
+                # denied a cohort entirely and stayed pinned to
+                # EVEN_SAMPLE_MARGIN's implied ratio however many of them
+                # had been measured — a fixed 5% cushion that on a real
+                # file sat 9% off the truth, capped the search a step
+                # early and cost a second full encode.
                 rat_prior, rat_src = ratio_prior(
                     file_cal, global_cal, search_margin,
-                    even=even_sampling, mini=mini_sampling,
+                    even=even_sampling, mini=mini_sampling, sample=sample_id,
                 )
                 if (min_kbps and rat_prior is not None and rat_src != "per-file"
                         and abs(rat_prior - 1.0 / search_margin) >= 0.01):
@@ -889,6 +899,11 @@ def process_videos(cfg, engine):
                 center_floor = rat_prior is not None and (
                     even_sampling or rat_src == "per-file"
                 )
+                sample_aim = {
+                    "bias": bias, "margin": search_margin,
+                    "offset_aim": off, "offset_src": off_src,
+                    "ratio_aim": rat_prior, "ratio_src": rat_src,
+                }
 
                 best_q, sample_at_best, _, vt, search_state = core_search.search(
                     sample_src, meta, sample_target, do_enc_sample,
@@ -903,11 +918,6 @@ def process_videos(cfg, engine):
                     s2_ref_index=sample_idx,
                 )
                 t_vmaf += vt
-                for p in sample_enc_cache.values():
-                    try:
-                        p.unlink()
-                    except OSError:
-                        pass
             else:
                 best_q, best_vmaf, _, vt, search_state = core_search.search(
                     filepath, meta, target, full_encode, cfg, engine,
@@ -919,6 +929,17 @@ def process_videos(cfg, engine):
                     s2_ref_index=full_idx,
                 )
                 t_vmaf += vt
+
+            # A finished search, on either path, leaves no sample probe of
+            # this file: its own, and those a stopped search left from
+            # other clips, quantizers or settings, which nothing else
+            # deletes.
+            if existing_q is None:
+                for p in sample_enc_dir.glob(f"sample_enc_{file_hash[:8]}_*"):
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
 
             # The search returns nothing only when its first probe could
             # not be measured.
@@ -942,11 +963,13 @@ def process_videos(cfg, engine):
                 }
                 # The sample half of the calibration pair, which the
                 # verify completes: what the search measured at its
-                # answer, the quantizer it measured it at, and the cohort
-                # the pair rolls into, since a resumed run skips the
-                # sampling that decides it. Kept here, not read back from
-                # the entries, where a later search can measure the same
-                # quantizer under other settings or another sample.
+                # answer, the quantizer it measured it at, the clips it
+                # measured, and the cohort the pair rolls into, since a
+                # resumed run skips the sampling that decides the last
+                # two. Kept here, not read back from the entries, where a
+                # later search can measure the same quantizer under other
+                # settings or another sample. What the search aimed with
+                # rides along (sample_aim), for the pair log only.
                 # Absent when there is no pair: a full-file search, or a
                 # sample search whose answer was chosen without a probe.
                 if (sample_at_best
@@ -954,6 +977,7 @@ def process_videos(cfg, engine):
                     pair = {
                         "q": grid.fmt(best_q), "vmaf": sample_at_best["mean"],
                         "even": even_sampling, "mini": mini_sampling,
+                        "sample": sample_id, **sample_aim,
                     }
                     kbps = search_state.get("kbps", {}).get(best_q)
                     if kbps:
@@ -1048,16 +1072,17 @@ def process_videos(cfg, engine):
             # half the search recorded there (sample_pair), the full half
             # this verify, at the same quantizer only. The block holds
             # one pair, stamped with its quantizer and with the sampling
-            # mode and plan from the search's own record (a resume never
-            # sampled, so this run's mode says nothing). Each half is
-            # measured once per block; a later pass that verifies again
-            # (a resume, an --overwrite rerun) already holds it, and after
-            # refine moved the file its quantizer is not the pair's any
-            # more, so a half that failed to measure the first time is
+            # mode, plan and clips from the search's own record (a resume
+            # never sampled, so this run says nothing about them). Each
+            # half is measured once per block; a later pass that verifies
+            # again (a resume, an --overwrite rerun) already holds it, and
+            # after refine moved the file its quantizer is not the pair's
+            # any more, so a half that failed to measure the first time is
             # never taken from another quantizer. A pair drawn another
-            # way (a new search at another quantizer, or sampled evenly
-            # after a scene scan failed) adds nothing: its half would be
-            # read beside the other pair's as one file's measurement.
+            # way (a new search at another quantizer, sampled evenly
+            # after a scene scan failed, or on other clips after the
+            # picks changed) adds nothing: its half would be read beside
+            # the other pair's as one file's measurement.
             # The isinstance guards: these come straight from the JSON
             # cache, and a corrupt value must be ignored like every other
             # calibration read, not crash the file on the arithmetic.
@@ -1065,16 +1090,26 @@ def process_videos(cfg, engine):
             if not (isinstance(pair, dict) and pair.get("q") == grid.fmt(best_q)):
                 pair = None
             pair_mode = {}
+            pair_sample = None
             if pair:
                 pair_mode = {
                     "even": bool(pair.get("even")),
                     "mini": bool(pair.get("mini")),
                 }
+                pair_sample = pair.get("sample")
                 holds_pair = "ratio" in cal_now or "vmaf_offset" in cal_now
                 if holds_pair and not (
                         cal_now.get(engine.cal_q_key) == best_q
-                        and pair_sampled_as(cal_now, **pair_mode)):
+                        and pair_sampled_as(
+                            cal_now, **pair_mode, sample=pair_sample)):
                     pair, pair_mode = None, {}
+            # The pair log's row for this file under these settings
+            # (record_sample_pair): every half the verify read, raw, so
+            # a reading the sanity ranges refuse for the block and the
+            # cohort still shows there. Keyed like the block: a pair
+            # read again on a resume or a rerun adds no row.
+            pair_key = f"{file_hash}_{enc_tag}"
+            pair_row = {}
             if pair:
                 sample_kbps = pair.get("kbps")
                 sample_vmaf = pair.get("vmaf")
@@ -1082,6 +1117,7 @@ def process_videos(cfg, engine):
                         and isinstance(sample_kbps, (int, float))
                         and sample_kbps > 0):
                     ratio = actual_kbps_now / sample_kbps
+                    pair_row.update(kbps=actual_kbps_now, ratio=ratio)
                     if RATIO_MIN <= ratio <= RATIO_MAX:
                         new["ratio"] = ratio
                         print(
@@ -1093,12 +1129,25 @@ def process_videos(cfg, engine):
                         and math.isfinite(sample_vmaf)
                         and math.isfinite(best_vmaf.get("mean", float("nan")))):
                     offset = sample_vmaf - best_vmaf["mean"]
+                    pair_row.update(vmaf=best_vmaf["mean"], offset=offset)
                     if -OFFSET_MAX <= offset <= OFFSET_MAX:
                         new["vmaf_offset"] = offset
                 if "ratio" in new or "vmaf_offset" in new:
                     cal_now[engine.cal_q_key] = best_q
-                    cal_now.update(pair_mode)
+                    cal_now.update(pair_mode, sample=pair_sample)
             cal_now.update(new)
+
+            if pair_row:
+                record_sample_pair(cal_root, pair_key, {
+                    "duration": meta["duration"], "tier": tier,
+                    "floor": min_kbps, "target": target,
+                    **{k: pair.get(k) for k in (
+                        "q", "even", "mini", "sample", "bias", "margin",
+                        "offset_aim", "offset_src", "ratio_aim", "ratio_src",
+                    )},
+                    "sample_vmaf": sample_vmaf, "sample_kbps": sample_kbps,
+                    **pair_row, "t": time.time(),
+                })
 
             if cal_now != (file_cal or {}):
                 cal_now["enc_tag"] = enc_tag
@@ -1377,6 +1426,14 @@ def process_videos(cfg, engine):
                 if pick != best_q and dst_path(pick).exists():
                     best_q = pick
                     best_vmaf = full_points[pick]["vmaf"]
+
+            # Where the file settled, beside the pair it was aimed by:
+            # the distance from the pair's quantizer is what a missed aim
+            # cost. Only on the pass that wrote the row.
+            if pair_row:
+                record_sample_pair(
+                    cal_root, pair_key, {"final_q": grid.fmt(best_q)}
+                )
 
             final = dst_path(best_q)
             if not final.exists():
