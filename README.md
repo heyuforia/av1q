@@ -22,7 +22,7 @@ For every file:
 - **Bitrate floors.** Per-resolution minimums (1 Mbps at 720p, 1.8 at 1080p, 2.5 at 1440p, 4.5 at 2160p, 8 at 4320p) prevent VMAF-misleading low-bitrate encodes. They're starvation backstops, not targets. A file's resolution is the 16:9 screen its picture fills in width or height, so a widescreen film stored without its black bars (1920x800) counts as 1080p, and a portrait clip counts like its landscape twin.
 - **Scene-based sampling.** Fast quality estimation, so the search never encodes the whole file.
 - **P5 quality reporting.** The 5th-percentile worst-frame VMAF is reported next to the mean, so you can spot files whose worst moments lag.
-- **SSIMULACRA2 reporting.** Every VMAF score is shown next to a GPU-computed [SSIMULACRA2](https://github.com/cloudinary/ssimulacra2) score as a second opinion. Informational only, it never influences the encode.
+- **SSIMULACRA2 reporting.** With sharpening off (`--sharpen 0`), every VMAF score is shown next to a GPU-computed [SSIMULACRA2](https://github.com/cloudinary/ssimulacra2) score as a second opinion. Informational only, it never influences the encode.
 - **HDR and color preservation.** Carries over color primaries, transfer, matrix, and range, plus the HDR10 mastering display and content light level metadata.
 - **10-bit output** by default, with film grain synthesis.
 - **Hardware-accelerated decoding.** CUDA, D3D11VA (Windows), VideoToolbox (macOS), and VAAPI (Linux) speed up quality measurement and scene detection. Encoding itself is always CPU.
@@ -101,6 +101,15 @@ python av1q-crop.py
 python av1q.py
 ```
 
+**Sharpening.** By default ffmpeg's CAS (Contrast Adaptive Sharpening) filter sharpens the picture at strength 0.5 before the encoder sees it, for a crisper look. Pick another strength from 0 to 1, or turn it off:
+
+```
+python av1q.py --sharpen 0.3
+python av1q.py --sharpen 0
+```
+
+ VMAF is measured against the source sharpened the same way, so the quality target still means what it says. Measured against the original, the standard VMAF model would score the sharpening itself as a quality gain, and the search would spend that gain on a lower quality setting. The encoder has to keep the added edge detail, so expect larger files at the same target wherever VMAF sets the size; where the bitrate floor sets it, the size stays the same. Sharpened outputs carry `_sharp0.5` in their name and sit beside unsharpened ones, so the two are easy to compare by eye. The SSIMULACRA2 column is off on a sharpened run, and one line at the top of the run says so: FFVship reads both files as they are and cannot sharpen the source side, so it would count the sharpening as damage.
+
 ### Options
 
 | Flag | Default | Description |
@@ -112,6 +121,7 @@ python av1q.py
 | `--min-cq` | `18` | Minimum CQ (highest quality bound) |
 | `--max-cq` | `38` | Maximum CQ (lowest quality bound) |
 | `--film-grain` | `24` | Film grain synthesis level (0-50) |
+| `--sharpen` | `0.5` | Sharpen the picture before encoding with ffmpeg's CAS filter at this strength (0-1, 0 = off) |
 | `--samples` | `8` | Base number of sample segments, scales up with duration |
 | `--seed-cq` | Prompted / auto | Starting CQ for the search (skips the interactive prompt) |
 | `--force-cq` | | Encode at exactly this CQ, skipping sampling, search, VMAF, and refinement |

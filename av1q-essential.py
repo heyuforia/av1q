@@ -40,7 +40,7 @@ from av1q import (
     VIDEO_EXTENSIONS, INTRA_ONLY_CODECS, MIN_BITRATE_KBPS,
     TARGET_VMAF_BY_RES, VMAF_OVERSHOOT,
     OUTPUT_CONTAINER, VMAF_TOLERANCE, BITRATE_MARGIN, SAMPLE_DURATION,
-    MIN_SCENE_DURATION, SHORT_THRESHOLD, SCENE_THRESHOLD,
+    MIN_SCENE_DURATION, SHORT_THRESHOLD, SCENE_THRESHOLD, SHARPEN_STRENGTH,
     GREEN, ORANGE, PURPLE, RED, RESET, BOLD, DIM, CHECK, CROSS, SEP, MIDDOT,
     run_cmd, cleanup_temp, atomic_write_json, make_temp_log, run_launcher,
     partial_hash, res_tier, calc_kbps, video_kbps, measured_kbps,
@@ -64,6 +64,7 @@ from core.engines.essential import (
 )
 from core.probe import _ratval, is_vfr, probe_hdr_metadata
 from core.sampling import clean_sample_source
+from core.sharpen import parse_strength
 from core.ssimu2 import ffvship_crop_args, parse_ssimu2_json, ssimu2_info
 from core.tools import find_encoder
 
@@ -197,6 +198,14 @@ def main():
              "2=SSIM, 3=IQ, 4=MS-SSIM)",
     )
     parser.add_argument(
+        "--sharpen", type=float, default=SHARPEN_STRENGTH,
+        help="Sharpen the picture before encoding with ffmpeg's CAS filter "
+             f"at this strength, 0-1 (default: {SHARPEN_STRENGTH:g}; 0 = "
+             "off). VMAF is measured against the source sharpened the "
+             "same way, so the target still holds. Not the encoder's own "
+             "--sharpness",
+    )
+    parser.add_argument(
         "--metric-every", type=int, default=1,
         help="Measure every Nth frame in the FFVship SSIMU2 info column "
              "(default: 1 = all frames)",
@@ -293,6 +302,10 @@ def main():
         parser.error("--film-grain must be 0-50")
     if args.metric_every < 1:
         parser.error("--metric-every must be >= 1")
+    try:
+        sharpen = parse_strength(args.sharpen)
+    except ValueError:
+        parser.error("--sharpen must be within 0-1")
     if args.samples < 1:
         parser.error("--samples must be >= 1")
     if args.workers is not None and args.workers < 1:
@@ -355,6 +368,7 @@ def main():
         "max_crf": max_crf,
         "film_grain": args.film_grain,
         "tune": args.tune,
+        "sharpen": sharpen,
         "target_vmaf": args.vmaf,
         "vmaf_tolerance": VMAF_TOLERANCE,
         "bitrate_margin": BITRATE_MARGIN,

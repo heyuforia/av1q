@@ -15,6 +15,7 @@ from ..crop import crop_token
 from ..probe import (
     content_light_str, high_bit_depth, res_tier, svt_mastering_display,
 )
+from ..sharpen import sharpen_filter, sharpen_token
 from ..tools import ffmpeg_exe, find_ffvship_optional
 from ..util import _temp_files, fmt_cmd, own_process_group, run_cmd
 from .base import Engine, Grid
@@ -27,8 +28,9 @@ SVT_MAX_BITRATE = 100_000_000
 
 def enc_signature(cfg, crop=None):
     """Tag covering the settings that change encoder output for one source
-    at a given CQ: preset, film grain, and crop. Used in cache keys and
-    sample-encode filenames so stale variants are never reused.
+    at a given CQ: preset, film grain, crop, and sharpening (cfg['sharpen'],
+    None when off, which leaves the tag as it always was). Used in cache
+    keys and sample-encode filenames so stale variants are never reused.
 
     --no-10bit stays out on purpose. It changes the pixel format of 8-bit
     SDR sources only, but the skip check runs before the probe and sees
@@ -36,7 +38,10 @@ def enc_signature(cfg, crop=None):
     10-bit source again for an identical file. A --no-10bit rerun may
     therefore reuse a 10-bit encode.
     """
-    return f"p{cfg['preset']}g{cfg['film_grain']}{crop_token(crop)}"
+    return (
+        f"p{cfg['preset']}g{cfg['film_grain']}{crop_token(crop)}"
+        f"{sharpen_token(cfg.get('sharpen'))}"
+    )
 
 
 def _pix(meta, cfg):
@@ -51,7 +56,8 @@ def _pix(meta, cfg):
 
 def _video_args(meta, cq, cfg, trim=None):
     """The encode's output options for the picture at `cq`: map, filters
-    (trim first, then crop), pixel format and the encoder's settings.
+    (trim first, then crop, then any sharpening), pixel format and the
+    encoder's settings.
     trim is a trim filter keeping one piece's span, or None."""
     color_args = []
     if meta["cp"] and meta["ct"]:
@@ -107,6 +113,8 @@ def _video_args(meta, cq, cfg, trim=None):
     vf = [trim] if trim else []
     if meta.get("crop"):
         vf.append(f"crop={meta['crop']}")
+    if sharpen_filter(meta):
+        vf.append(sharpen_filter(meta))
     vf_args = ["-vf", ",".join(vf)] if vf else []
 
     # No tiles: ffmpeg's wrapper has no tile option of its own (only
@@ -325,7 +333,9 @@ class SvtAv1FfmpegEngine(Engine):
     ffmpeg_filters = ("libvmaf",)
     rec_q_key = "cq"
     rec_bound_keys = ("min_cq", "max_cq")
-    rec_extra_keys = ()
+    # sharpen is None for a plain run, so a recommended block written
+    # before the field existed (missing -> .get() None) still matches it.
+    rec_extra_keys = ("sharpen",)
     seed_key = "seed_cq"
     seed_prompt_hint = "(Enter = auto)"
     cal_q_key = "at_cq"

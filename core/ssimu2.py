@@ -211,6 +211,11 @@ def _run_ffvship(ref, dist, meta, cache_dir, exe, ref_index=None, every=1):
     refine) is only indexed once; the distorted index is per-encode.
     Index files live under <cache_dir>/_ffindex, never next to videos.
     """
+    # A sharpened encode has no fair score: FFVship reads both files as
+    # they are and has no filter to sharpen the source side, so it would
+    # count the sharpening as error. The run says so once, at launch.
+    if meta.get("sharpen"):
+        return None
     if not ref.exists() or not dist.exists():
         return None
     # Every skip prints its reason once per file, deliberate or not: a

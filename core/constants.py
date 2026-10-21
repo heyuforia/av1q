@@ -115,6 +115,12 @@ FALLBACK_MAXRATE = {
     1440: 35_000_000, 2160: 45_000_000, 4320: 60_000_000,
 }
 
+# Default --sharpen strength (cas, 0-1) in both pipelines, chosen by eye
+# on an A/B. The crisper look costs bitrate wherever VMAF sets the size
+# (about 48% on a 4K HDR clip at equal VMAF) and nothing where the floor
+# does. --sharpen 0 encodes the unsharpened picture.
+SHARPEN_STRENGTH = 0.5
+
 # Starvation backstops, not targets.
 MIN_BITRATE_KBPS = {0: 0, 720: 1000, 1080: 1800, 1440: 2500, 2160: 4500, 4320: 8000}
 

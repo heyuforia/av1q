@@ -23,7 +23,7 @@ from core.constants import (
     VIDEO_EXTENSIONS, INTRA_ONLY_CODECS, TARGET_VMAF_BY_RES,
     FALLBACK_MAXRATE, MIN_BITRATE_KBPS, VMAF_OVERSHOOT,
     OUTPUT_CONTAINER, VMAF_TOLERANCE, BITRATE_MARGIN, SAMPLE_DURATION,
-    MIN_SCENE_DURATION, SHORT_THRESHOLD, SCENE_THRESHOLD,
+    MIN_SCENE_DURATION, SHORT_THRESHOLD, SCENE_THRESHOLD, SHARPEN_STRENGTH,
 )
 from core.util import (
     _temp_files, run_cmd, cleanup_temp, atomic_write_json, make_temp_log,
@@ -56,6 +56,7 @@ from core import pipeline as core_pipeline
 from core import vmaf as core_vmaf
 from core.engines.svt_ffmpeg import SvtAv1FfmpegEngine, enc_signature, encode_av1
 from core.search import initial_cq_seed
+from core.sharpen import parse_strength
 
 _ENGINE = SvtAv1FfmpegEngine()
 
@@ -152,6 +153,13 @@ def main():
         help="Film grain synthesis level 0-50 (default: 24)",
     )
     parser.add_argument(
+        "--sharpen", type=float, default=SHARPEN_STRENGTH,
+        help="Sharpen the picture before encoding with ffmpeg's CAS filter "
+             f"at this strength, 0-1 (default: {SHARPEN_STRENGTH:g}; 0 = "
+             "off). VMAF is measured against the source sharpened the "
+             "same way, so the target still holds",
+    )
+    parser.add_argument(
         "--no-10bit", action="store_true",
         help="Disable forced 10-bit encoding",
     )
@@ -222,6 +230,10 @@ def main():
         parser.error("--preset must be 0-10 (SVT-AV1 4.0 capped presets at 10)")
     if not 0 <= args.film_grain <= 50:
         parser.error("--film-grain must be 0-50")
+    try:
+        sharpen = parse_strength(args.sharpen)
+    except ValueError:
+        parser.error("--sharpen must be within 0-1")
     if args.samples < 1:
         parser.error("--samples must be >= 1")
     if args.workers is not None and args.workers < 1:
@@ -257,6 +269,7 @@ def main():
         "min_cq": args.min_cq,
         "max_cq": args.max_cq,
         "film_grain": args.film_grain,
+        "sharpen": sharpen,
         "force_10bit": not args.no_10bit,
         "target_vmaf": args.vmaf,
         "vmaf_tolerance": VMAF_TOLERANCE,

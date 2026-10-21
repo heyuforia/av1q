@@ -9,6 +9,7 @@ import time
 from .probe import (
     UNTAGGED, detect_hwaccel, get_fps, hw_decode_unsafe, res_tier,
 )
+from .sharpen import sharpen_filter
 from .tools import ffmpeg_exe, ffprobe_exe
 from .ui import RED, RESET
 from .util import (
@@ -52,10 +53,10 @@ def measure_vmaf(ref, dist, meta, subsample, threads, cache_dir):
     index_pair = meta.get("vmaf_pair") == "index"
     fps = None if index_pair else get_fps(dist)
 
-    def build_chain(with_crop):
-        # Crop only applies to the ref chain: dist was already encoded with
-        # crop applied, so its frames are pre-cropped. Cropping it again here
-        # would shave off real picture content and silently tank VMAF.
+    def build_chain(is_ref):
+        # Crop and sharpening apply only to the ref chain: dist was encoded
+        # from the cropped, sharpened picture. Cropping it again here would
+        # shave off real picture content and silently tank VMAF.
         if index_pair:
             # Identical re-stamp on both chains -> framesync pairs 1:1
             # by index. The rate constant is arbitrary (VMAF scores
@@ -65,8 +66,12 @@ def measure_vmaf(ref, dist, meta, subsample, threads, cache_dir):
             f = ["setpts=PTS-STARTPTS"]  # normalize MP4 edit lists
             if fps:
                 f.append(f"fps={fps}")
-        if with_crop and meta.get("crop"):
+        if is_ref and meta.get("crop"):
             f.append(f"crop={meta['crop']}")
+        # Before the tonemap: the encoder sharpened the source's own
+        # signal (PQ on HDR), so the reference must be sharpened there too.
+        if is_ref and sharpen_filter(meta):
+            f.append(sharpen_filter(meta))
         if meta["hdr"]:
             # Gate on HDR signaling, not bit depth: SDR 10-bit needs no
             # tonemap, and untagged SDR (common in screen-recording ProRes)
@@ -97,8 +102,8 @@ def measure_vmaf(ref, dist, meta, subsample, threads, cache_dir):
         f.append("format=yuv420p")
         return ",".join(f)
 
-    pf_ref = build_chain(with_crop=True)
-    pf_dist = build_chain(with_crop=False)
+    pf_ref = build_chain(is_ref=True)
+    pf_dist = build_chain(is_ref=False)
     log = make_temp_log(cache_dir, "vmaf", "json")
 
     th = f":n_threads={threads}" if threads > 1 else ""

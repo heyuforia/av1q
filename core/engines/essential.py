@@ -1,7 +1,7 @@
-"""SVT-AV1-Essential engine: ffmpeg decodes (applying crop) and pipes
-10-bit Y4M into the standalone fork binary, a full picture in pieces
-through core.chunks, then audio/subs/chapters are remuxed back from the
-source. Quarter-step CRF grid; color and
+"""SVT-AV1-Essential engine: ffmpeg decodes (applying crop and any
+sharpening) and pipes 10-bit Y4M into the standalone fork binary, a full
+picture in pieces through core.chunks, then audio/subs/chapters are
+remuxed back from the source. Quarter-step CRF grid; color and
 HDR10 static metadata re-stated as encoder flags (Y4M carries none);
 VFR sources gated out (the Y4M pipe is CFR-only)."""
 
@@ -17,6 +17,7 @@ from ..probe import (
     content_light_str, is_vfr, picture_timing, svt_mastering_display,
 )
 from ..sampling import clean_sample_source
+from ..sharpen import sharpen_filter, sharpen_token
 from ..tools import ffmpeg_exe, find_encoder, find_ffvship_optional
 from ..ui import DIM, MIDDOT, RESET
 from ..util import _temp_files, ascii_dir, make_temp_log, own_process_group
@@ -103,15 +104,19 @@ def filter_enc_args(tokens):
 
 def enc_signature_e(cfg, crop=None):
     """Tag covering everything that changes Essential's output for one
-    source at a given CRF: preset, film grain, tune, crop, and any extra
-    raw encoder flags. The tune knob is new vs av1q's signature —
-    Essential exposes it per-encode. The enc-args hash (cfg['enc_args_sig'],
-    None when no --enc-args) only widens the tag when extra flags are
-    present, so a plain run produces the exact same signature as before.
+    source at a given CRF: preset, film grain, tune, crop, sharpening,
+    and any extra raw encoder flags. The tune knob is new vs av1q's
+    signature — Essential exposes it per-encode. The enc-args hash
+    (cfg['enc_args_sig'], None when no --enc-args) and the sharpening
+    strength (cfg['sharpen'], None when off) only widen the tag when set,
+    so a plain run produces the exact same signature as before.
     """
     xa = cfg.get("enc_args_sig")
     extra = f"x{xa}" if xa else ""
-    return f"p{cfg['preset']}g{cfg['film_grain']}t{cfg['tune']}{extra}{crop_token(crop)}"
+    return (
+        f"p{cfg['preset']}g{cfg['film_grain']}t{cfg['tune']}{extra}"
+        f"{crop_token(crop)}{sharpen_token(cfg.get('sharpen'))}"
+    )
 
 
 # ffprobe names -> SvtAv1EncApp names (Appendix A.2). Identical names are
@@ -252,6 +257,8 @@ def _feed_cmd(source, meta, piece, full):
     vf = []
     if meta.get("crop"):
         vf.append(f"crop={meta['crop']}")
+    if sharpen_filter(meta):
+        vf.append(sharpen_filter(meta))
     rate = meta["picture_rate"] if full else None
     if rate and piece is None:
         vf += ["setpts=PTS-STARTPTS", f"fps={rate}"]
@@ -493,11 +500,12 @@ class EssentialEngine(Engine):
     ffmpeg_filters = ("libvmaf",)
     rec_q_key = "crf"
     rec_bound_keys = ("min_crf", "max_crf")
-    # enc_args_sig is None for a plain run, so a recommended block written
-    # before this field existed (missing -> .get() None) still matches a
-    # plain rerun; a value present means --enc-args changed the output, so
-    # the search is correctly re-run instead of resumed at the old CRF.
-    rec_extra_keys = ("tune", "enc_args_sig")
+    # enc_args_sig and sharpen are None for a plain run, so a recommended
+    # block written before either field existed (missing -> .get() None)
+    # still matches a plain rerun; a value present means --enc-args or
+    # --sharpen changed the output, so the search is correctly re-run
+    # instead of resumed at the old CRF.
+    rec_extra_keys = ("tune", "enc_args_sig", "sharpen")
     seed_key = "seed_crf"
     seed_prompt_hint = "(0.25 steps, Enter = auto)"
     cal_q_key = "at_crf"

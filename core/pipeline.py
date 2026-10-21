@@ -53,7 +53,11 @@ from .sampling import (
     choose_samples, complexity_bias, complexity_bias_margin, extract_samples,
     sample_identity, sampling_plan,
 )
-from .tools import have_ffmpeg, local_ffmpeg_dir, missing_ffmpeg_components
+from .sharpen import sharpen_token
+from .tools import (
+    find_ffvship_optional, have_ffmpeg, local_ffmpeg_dir,
+    missing_ffmpeg_components,
+)
 from .ui import (
     BOLD, CHECK, CROSS, DIM, GREEN, LABEL_W, MIDDOT, ORANGE, PURPLE, RED,
     RESET, SEP, fmt_s2, fmt_size, fmt_time, fmt_vmaf, label,
@@ -96,16 +100,19 @@ def process_videos(cfg, engine):
     # build missing libvmaf otherwise reads as a broken install.
     try:
         missing = missing_ffmpeg_components(
-            engine.ffmpeg_encoders, engine.ffmpeg_filters
+            engine.ffmpeg_encoders,
+            engine.ffmpeg_filters + (("cas",) if cfg.get("sharpen") else ()),
         )
     except (OSError, RuntimeError) as e:
         print(f"{CROSS} ffmpeg failed to run: {e}")
         return 1
     if missing:
         where = local_ffmpeg_dir() or "PATH"
+        # cas is needed only because sharpening is on, which is a choice.
+        hint = " (--sharpen 0 runs without it)" if "cas" in missing else ""
         print(
             f"{CROSS} ffmpeg ({where}) was built without"
-            f" {', '.join(missing)}"
+            f" {', '.join(missing)}{hint}"
         )
         return 1
     try:
@@ -136,6 +143,10 @@ def process_videos(cfg, engine):
     local_ff = local_ffmpeg_dir()
     notes = [f"ffmpeg: {local_ff}"] if local_ff else []
     notes += engine.launch_notes(cfg)
+    # Said once here, never per file: FFVship cannot sharpen the source
+    # side, so every file of a sharpened run goes without the column.
+    if cfg.get("sharpen") and find_ffvship_optional():
+        notes.append("ssimu2: off, FFVship cannot sharpen the source to match")
     # More than one encoder at once is a choice of this machine's size
     # (or --workers), invisible otherwise.
     if cfg["resume_encodes"] and cfg["workers"] > 1:
@@ -300,11 +311,13 @@ def process_videos(cfg, engine):
             # Output names carry the crop token so cropped and uncropped
             # encodes of the same source never collide (flipping
             # --no-crops between runs used to confuse the skip-existing
-            # check). Before probing, the sidecar is the best crop
-            # expectation; rebound after crop resolution (--auto-crop may
-            # just have written one).
+            # check), and the sharpening token for the same reason: both
+            # change the picture itself, so a sharpened and a plain
+            # encode sit side by side for an A/B. Before probing, the
+            # sidecar is the best crop expectation; rebound after crop
+            # resolution (--auto-crop may just have written one).
             def make_dst_path(crop):
-                token = crop_token(crop)
+                token = crop_token(crop) + sharpen_token(cfg.get("sharpen"))
                 return lambda q: out_dir / engine.dst_name(
                     filepath.stem, q, token, ext
                 )
@@ -494,6 +507,11 @@ def process_videos(cfg, engine):
                 elif note:
                     print(f"{label('crop')}{DIM}{note}{RESET}")
             dst_path = make_dst_path(meta["crop"])
+            # In meta beside the crop: every chain that applies the crop
+            # (the encoders' feeds, the VMAF reference) sharpens after it.
+            meta["sharpen"] = cfg.get("sharpen")
+            if meta["sharpen"]:
+                print(f"{label('sharpen')}CAS {BOLD}{meta['sharpen']:g}{RESET}")
 
             # Source facts the encodes state themselves (HDR10 static
             # metadata, plus whatever the engine adds).
@@ -502,11 +520,11 @@ def process_videos(cfg, engine):
                 print(f"{label('hdr')}{DIM}{hdr_note}{RESET}")
 
             # Which settings made the file at each output name. A name
-            # carries only the quantizer and the crop, so a file another
-            # run left under other settings (film grain, preset, tune)
-            # sits at the exact name this run would write. It is reused
-            # only when this record says these settings made it at its
-            # current size; anything else is encoded again.
+            # carries only the quantizer, the crop and the sharpening, so
+            # a file another run left under other settings (film grain,
+            # preset, tune) sits at the exact name this run would write.
+            # It is reused only when this record says these settings made
+            # it at its current size; anything else is encoded again.
             #
             # --overwrite forgets the record here, on disk, before its
             # first encode: the record cannot tell an encoder upgrade
