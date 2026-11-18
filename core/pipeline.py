@@ -672,9 +672,14 @@ def process_videos(cfg, engine):
             # made, VMAF is cached by size), so re-running the search
             # after an interruption stays cheap.
             existing_q = None
+            # True when an earlier run left this file pending, read before
+            # the outcome is set again below. The pair log's row may then
+            # still be owed where the file settles (row_owed).
+            unfinished = False
             rec = cache.get("recommended")
             if recommended_matches(rec, engine, cfg, meta["crop"], target):
                 existing_q = grid.quantize(rec[engine.rec_q_key])
+                unfinished = rec.get("outcome") == "pending"
                 # The file is being worked on again, so it is pending
                 # until it finishes, whatever an earlier run recorded: a
                 # stop from here on must resume, never skip. A dry run
@@ -697,8 +702,10 @@ def process_videos(cfg, engine):
                 )
 
             sample_clips = sample_src = sample_id = sample_at_best = None
-            # What the sample search aimed with, kept for the pair log
-            # (record_sample_pair): a resume never sees these.
+            # What the sample search aimed with, for the pair log
+            # (record_sample_pair). It rides in the search's sample_pair
+            # record, where a resumed pass, which never sampled, reads it
+            # back.
             sample_aim = {}
             # Evenly spaced samples (intra-only sources, no detected
             # scenes, a thin scene list) are representative, not
@@ -1109,6 +1116,12 @@ def process_videos(cfg, engine):
                 pair = None
             pair_mode = {}
             pair_sample = None
+            # A pass that resumes a pending file whose block holds the pair
+            # reads nothing new, yet the log's row is owed where the file
+            # settles: the pass that logged the pair stopped before refine
+            # did. A rerun or a new search that runs to its end is never
+            # such a pass, so it writes nothing.
+            row_owed = False
             if pair:
                 pair_mode = {
                     "even": bool(pair.get("even")),
@@ -1121,6 +1134,8 @@ def process_videos(cfg, engine):
                         and pair_sampled_as(
                             cal_now, **pair_mode, sample=pair_sample)):
                     pair, pair_mode = None, {}
+                else:
+                    row_owed = holds_pair and unfinished
             # The pair log's row for this file under these settings
             # (record_sample_pair): every half the verify read, raw, so
             # a reading the sanity ranges refuse for the block and the
@@ -1447,8 +1462,9 @@ def process_videos(cfg, engine):
 
             # Where the file settled, beside the pair it was aimed by:
             # the distance from the pair's quantizer is what a missed aim
-            # cost. Only on the pass that wrote the row.
-            if pair_row:
+            # cost. Written by the pass that wrote the row, or by the one
+            # that finishes a file stopped after its row was written.
+            if pair_row or row_owed:
                 record_sample_pair(
                     cal_root, pair_key, {"final_q": grid.fmt(best_q)}
                 )
